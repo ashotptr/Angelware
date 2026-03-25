@@ -29,7 +29,44 @@ botnet_lab/
 
 ## VM Network Setup
 
-### Step 1 — Create 4 VMs in VirtualBox
+### Phase 1 — Host-Only Network Setup
+
+In VirtualBox, go to **File > Tools > Network Manager**.
+
+Click **Create** (generates a network like `vboxnet0`).
+
+- **Adapter tab**: Set IPv4 Address to `192.168.100.1` and Mask to `255.255.255.0`.
+- **DHCP Server tab**: Uncheck "Enable Server".
+
+Click **Apply**.
+
+---
+
+### Phase 2 — Create Base VM
+
+Click **New**. Name it `Ubuntu-Base`. Select your Ubuntu Server ISO. Check **"Skip Unattended Installation"**.
+
+- Hardware: 1024 MB RAM, 2 Processors.
+- Hard Disk: 20 GB. Finish.
+
+Select `Ubuntu-Base`, go to **Settings > Network > Adapter 1**. Change "Attached to" from NAT to **Host-Only Adapter** (select your network from Phase 1).
+
+Start the VM, install Ubuntu Server, and at the final terminal login screen run:
+
+```bash
+sudo shutdown now
+```
+
+---
+
+### Phase 3 — Clone VMs
+
+Right-click `Ubuntu-Base` and select **Clone**.
+
+- **MAC Address Policy**: Select *Generate new MAC addresses for all network adapters*.
+- **Clone Type**: Select *Full Clone*.
+
+Create 4 clones with these **exact names**:
 
 | VM Name         | IP Address       | RAM  | Role                          |
 |----------------|------------------|------|-------------------------------|
@@ -38,56 +75,106 @@ botnet_lab/
 | bot-agent-2     | 192.168.100.12   | 1GB  | Secondary bot, P2P peer       |
 | victim-honeypot | 192.168.100.20   | 1GB  | Attack target + Cowrie        |
 
-### Step 2 — Network Isolation (CRITICAL)
+---
 
-In VirtualBox settings for EVERY VM:
-- Settings → Network → Adapter 1 → **Host-Only Adapter** (vboxnet0)
-- **NOT Bridged, NOT NAT**
+### Phase 4 — Configure & Install (Repeat for EACH of the 4 VMs)
 
-Verify isolation from any VM:
-```bash
-ping 8.8.8.8   # MUST timeout — if this works, your setup is wrong
-ping 192.168.100.10   # MUST work
-```
+#### Step 1 — Temporarily Give Internet Access
 
-### Step 3 — Configure Static IPs (each VM)
+In VirtualBox, go to **VM Settings > Network > Adapter 1**. Change to **NAT**.
+
+Start the VM and log in. Find the interface name (e.g., `enp0s3`) using `ip a`.
+
+#### Step 2 — Set Netplan to DHCP
 
 ```bash
 sudo nano /etc/netplan/00-installer-config.yaml
 ```
+
+Replace contents exactly with:
+
 ```yaml
 network:
   version: 2
   ethernets:
-    eth0:
-      addresses: [192.168.100.XX/24]   # replace XX with VM's IP
-      nameservers:
-        addresses: [192.168.100.1]
+    enp0s3:
+      dhcp4: true
 ```
+
 ```bash
 sudo netplan apply
+ping -c 4 8.8.8.8   # verify internet access
 ```
 
----
-
-## Package Installation (Run on ALL VMs)
+#### Step 3 — Install Packages
 
 ```bash
-sudo apt update && sudo apt install -y \
-    python3 python3-pip gcc make libpcap-dev \
-    nmap wireshark-common tcpdump net-tools apache2
-
+sudo apt update
+sudo apt install -y openssh-server python3 python3-pip gcc make libpcap-dev nmap wireshark-common tcpdump net-tools apache2
 pip3 install flask scapy psutil requests pycryptodome matplotlib
 ```
 
-### Victim/Honeypot VM only:
+**(Victim VM only):**
+
 ```bash
-# Install Cowrie honeypot
 pip3 install cowrie
 # OR follow: https://cowrie.readthedocs.io/en/latest/INSTALL.html
 
 # Cowrie config: /etc/cowrie/cowrie.cfg
 # Set: listen_port = 2222 (fake SSH), listen_endpoints = tcp:2223 (fake Telnet)
+```
+
+#### Step 4 — Set Static IP & Re-isolate
+
+```bash
+sudo nano /etc/netplan/00-installer-config.yaml
+```
+
+Replace with your static IP (use `.10` for c2, `.11` for bot1, `.12` for bot2, `.20` for victim):
+
+```yaml
+network:
+  version: 2
+  ethernets:
+    enp0s3:
+      addresses: [192.168.100.XX/24]
+      nameservers:
+        addresses: [192.168.100.1]
+```
+
+```bash
+sudo netplan apply
+sudo shutdown now
+```
+
+In VirtualBox **VM Settings > Network > Adapter 1**, change back to **Host-Only Adapter**.
+
+Start the VM.
+
+#### Verify Isolation (CRITICAL)
+
+```bash
+ping 8.8.8.8            # MUST timeout — if this works, your setup is wrong
+ping 192.168.100.10     # MUST work
+```
+
+---
+
+### Phase 5 — SSH Connection
+
+Open PowerShell on your Windows host.
+
+```bash
+ssh vboxuser@192.168.100.XX   # replace XX with the VM's specific IP
+```
+
+Type `yes` to accept the fingerprint and enter your password.
+
+*(Optional but recommended)* Set the hostname so you don't get confused between terminal windows:
+
+```bash
+sudo hostnamectl set-hostname <vm-name>
+bash   # reload prompt
 ```
 
 ---
