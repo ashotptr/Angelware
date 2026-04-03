@@ -37,7 +37,7 @@ CV_BOT_THRESHOLD     = 0.15  # CV below this = bot timing detected
 DGA_ENTROPY_THRESH   = 3.8   # Shannon entropy > this = suspicious domain
 NXDOMAIN_BURST       = 10    # NXDOMAIN count per 30s window before alert
 CPU_SPIKE_THRESHOLD  = 85.0  # % CPU per process to flag as cryptojacking
-MONITOR_INTERFACE    = "eth0"
+MONITOR_INTERFACE    = "enp0s3"
 
 # ── Shared alert state ──────────────────────────────────────────
 alert_count = 0
