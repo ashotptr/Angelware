@@ -127,6 +127,90 @@ VCEI exceptions\t\t: not available
 FAKE_UNAME = "Linux DVR-HD2322 3.10.14 #1 Mon Nov 2 18:48:56 CST 2020 mips GNU/Linux"
 
 
+# ── SSH host key generation ───────────────────────────────────
+
+def _generate_ssh_host_keys(etc_dir: Path):
+    """
+    Generate RSA and DSA SSH host keys for Cowrie.
+
+    cowrie.cfg references:
+      rsa_private_key = etc/ssh_host_rsa_key
+      dsa_private_key = etc/ssh_host_dsa_key
+
+    Tries three methods in order:
+      1. ssh-keygen  (fastest, no Python deps)
+      2. cryptography library (pip install cryptography)
+      3. paramiko    (pip install paramiko)
+
+    If all three fail, prints an actionable manual command and continues —
+    Cowrie will report a missing-key error at startup which is easy to fix.
+    """
+    rsa_path = etc_dir / "ssh_host_rsa_key"
+    dsa_path = etc_dir / "ssh_host_dsa_key"
+
+    def _via_ssh_keygen():
+        for keytype, path in [("rsa", rsa_path), ("dsa", dsa_path)]:
+            result = subprocess.run(
+                ["ssh-keygen", "-t", keytype, "-b",
+                 "2048" if keytype == "rsa" else "1024",
+                 "-N", "", "-f", str(path)],
+                capture_output=True, text=True
+            )
+            if result.returncode != 0:
+                raise RuntimeError(result.stderr.strip())
+        print("  ✓ SSH host keys generated via ssh-keygen")
+
+    def _via_cryptography():
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric import rsa, dsa
+
+        # RSA 2048
+        rsa_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        rsa_path.write_bytes(rsa_key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.TraditionalOpenSSL,
+            serialization.NoEncryption()
+        ))
+
+        # DSA 1024 (cowrie default; 2048 requires OpenSSL patch on some distros)
+        dsa_key = dsa.generate_private_key(key_size=1024)
+        dsa_path.write_bytes(dsa_key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.TraditionalOpenSSL,
+            serialization.NoEncryption()
+        ))
+        print("  ✓ SSH host keys generated via cryptography library")
+
+    def _via_paramiko():
+        import paramiko
+        rsa_key = paramiko.RSAKey.generate(2048)
+        rsa_key.write_private_key_file(str(rsa_path))
+        dsa_key = paramiko.DSSKey.generate(1024)
+        dsa_key.write_private_key_file(str(dsa_path))
+        print("  ✓ SSH host keys generated via paramiko")
+
+    # Skip if keys already exist (idempotent re-runs)
+    if rsa_path.exists() and dsa_path.exists():
+        print("  ✓ SSH host keys already present — skipping generation")
+        return
+
+    for attempt in (_via_ssh_keygen, _via_cryptography, _via_paramiko):
+        try:
+            attempt()
+            # Cowrie requires private-key-only permissions
+            rsa_path.chmod(0o600)
+            dsa_path.chmod(0o600)
+            return
+        except Exception:
+            continue
+
+    # All methods failed — print manual fallback
+    print(f"  ! Could not auto-generate SSH host keys.")
+    print(f"    Run manually inside the Cowrie directory:")
+    print(f"      ssh-keygen -t rsa -b 2048 -N '' -f {rsa_path}")
+    print(f"      ssh-keygen -t dsa -b 1024 -N '' -f {dsa_path}")
+
+
 # ── iptables port forwarding ──────────────────────────────────
 
 def setup_iptables():
@@ -205,6 +289,10 @@ def setup_cowrie():
         print(f"  ✓ cowrie.cfg installed")
     else:
         print(f"  ! cowrie.cfg not found — copy it manually to {etc_dir}/cowrie.cfg")
+
+    # Generate SSH host keys (cowrie.cfg references these at startup)
+    # cowrie needs etc/ssh_host_rsa_key and etc/ssh_host_dsa_key
+    _generate_ssh_host_keys(etc_dir)
 
     # Set up iptables
     setup_iptables()

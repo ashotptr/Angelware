@@ -344,11 +344,26 @@ def _portal_reachable(host: str, port: int) -> bool:
 
 def _reset_portal_attempts(host: str, port: int):
     """
-    The portal has no reset endpoint, but we can note the current count
-    and compare after the run. (A future enhancement would be to add
-    POST /attempts/reset to fake_portal.py.)
+    Reset the portal's in-memory attempt log via POST /attempts/reset.
+    Also clears the tarpit state so flagged IPs from a previous run
+    don't carry over and distort the next jitter level's measurement.
+
+    Requires fake_portal.py to be running with the /attempts/reset endpoint.
     """
-    pass   # Comparison is done by counting alerts in IDS log, not portal state
+    try:
+        url = f"http://{host}:{port}/attempts/reset"
+        data = json.dumps({"clear_tarpit": True}).encode()
+        req = urllib.request.Request(
+            url, data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            result = json.loads(resp.read().decode())
+            if result.get("status") == "reset":
+                return   # success, no output needed
+    except Exception as e:
+        print(f"  WARNING: could not reset portal attempts: {e}")
 
 
 def _count_ids_alerts(log_path: str) -> int:

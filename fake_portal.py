@@ -175,6 +175,32 @@ def view_attempts():
     })
 
 
+@app.route("/attempts/reset", methods=["POST"])
+def reset_attempts():
+    """
+    Reset the in-memory attempt log and tarpit stats.
+
+    Used by collect_graph23_data.py between jitter-level sweeps so that
+    each measurement window starts from a clean baseline.
+
+    Optional JSON body:
+      {"clear_tarpit": true}  — also wipe tarpit_state.json (default false)
+    """
+    data = request.get_json(silent=True) or {}
+    with _stats_lock:
+        attempt_log.clear()
+        tarpit_stats["total_delayed"]      = 0
+        tarpit_stats["total_delay_seconds"] = 0.0
+
+    if data.get("clear_tarpit", False) and TARPIT_ENABLED:
+        tarpit_state.clear_all()
+        logging.info("RESET    | attempt log, tarpit stats, and tarpit flags cleared")
+    else:
+        logging.info("RESET    | attempt log and tarpit stats cleared")
+
+    return jsonify({"status": "reset", "cleared_tarpit": data.get("clear_tarpit", False)})
+
+
 @app.route("/tarpit/flag", methods=["POST"])
 def tarpit_flag():
     """

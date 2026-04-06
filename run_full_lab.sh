@@ -230,17 +230,19 @@ run_cryptojack() {
 
 run_cred_stuffing() {
     scenario_pause "ATTACK 5/7: Credential Stuffing"
-    log "Running credential stuffing — bot mode (rigid timing, easily detected)..."
-    python3 cred_stuffing.py --mode bot --host "$VICTIM_IP" --port 80 \
-        --interval 300 --jitter 0 &
-    CS_PID=$!
+    # Run from bot1 VM so login attempts arrive from 192.168.100.11,
+    # matching the real threat model (C2 VM should not make login attempts).
+    log "Running credential stuffing from bot1 — bot mode (rigid timing, easily detected)..."
+    bot_ssh_bg "$BOT1_IP" "cd ~/lab && python3 cred_stuffing.py \
+        --mode bot --host $VICTIM_IP --port 80 --interval 300 --jitter 0"
+    CS_BG=1
     sleep 15
-    log "Running credential stuffing — jitter mode (harder to detect, CV evasion test)..."
-    python3 cred_stuffing.py --mode jitter --host "$VICTIM_IP" --port 80 \
-        --interval 500 --jitter 300 &
-    CS_JITTER_PID=$!
+    log "Running credential stuffing from bot1 — jitter mode (CV evasion test)..."
+    bot_ssh_bg "$BOT1_IP" "cd ~/lab && python3 cred_stuffing.py \
+        --mode jitter --host $VICTIM_IP --port 80 --interval 500 --jitter 300"
     sleep 20
-    kill $CS_PID $CS_JITTER_PID 2>/dev/null || true
+    # Terminate any lingering cred_stuffing processes on bot1
+    bot_ssh "$BOT1_IP" "sudo pkill -f cred_stuffing.py" 2>/dev/null || true
     ok "Credential stuffing complete"
 }
 
@@ -412,6 +414,10 @@ cleanup_all() {
     bot_ssh_bg "$BOT1_IP" "sudo pkill -f bot_agent; sudo pkill -f mirai_scanner; sudo pkill -f kademlia_p2p; sudo pkill -f covert_bot"
     bot_ssh_bg "$BOT2_IP" "sudo pkill -f bot_agent; sudo pkill -f kademlia_p2p"
     bot_ssh_bg "$VICTIM_IP" "sudo pkill -f ids_detector; sudo pkill -f fake_portal; cowrie stop"
+    # Clear tarpit state so stale flags don't bleed into the next session
+    bot_ssh "$VICTIM_IP" "cd ~/lab && python3 tarpit_state.py clear" 2>/dev/null || true
+    # Remove iptables rules if they were applied
+    sudo python3 firewall_dpi.py --teardown 2>/dev/null || true
     sleep 2
     ok "Cleanup complete"
 }
@@ -447,6 +453,7 @@ case "$PHASE" in
         start_c2_server
         start_fake_portal
         start_ids
+        start_cowrie
         start_bots_phase1
         run_syn_flood
         run_udp_flood
@@ -454,6 +461,7 @@ case "$PHASE" in
         run_cryptojack
         run_cred_stuffing
         run_dga
+        run_mirai_propagation
         run_cowrie_analysis
         generate_all_graphs
         ;;

