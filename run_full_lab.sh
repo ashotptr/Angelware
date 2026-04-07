@@ -427,11 +427,12 @@ cleanup_all() {
 # ────────────────────────────────────────────────────────────────
 
 PHASE="all"
-for arg in "$@"; do
-    case "$arg" in
-        --phase) shift; PHASE="$1"; shift;;
-        --phase=*) PHASE="${arg#--phase=}";;
-        --clean) cleanup_all; exit 0;;
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --phase)   PHASE="$2"; shift 2 ;;
+        --phase=*) PHASE="${1#--phase=}"; shift ;;
+        --clean)   cleanup_all; exit 0 ;;
+        *)         shift ;;
     esac
 done
 
@@ -462,6 +463,7 @@ case "$PHASE" in
         run_cred_stuffing
         run_dga
         run_mirai_propagation
+        run_dpi_measurement
         run_cowrie_analysis
         generate_all_graphs
         ;;

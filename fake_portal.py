@@ -139,7 +139,8 @@ def login():
         "tarpit_delay":  round(tarpit_delay_s, 2),
         "dt":            datetime.now().isoformat(),
     }
-    attempt_log.append(entry)
+    with _stats_lock:
+        attempt_log.append(entry)
 
     logging.info(
         f"LOGIN   | src={src_ip} | email={email} | "

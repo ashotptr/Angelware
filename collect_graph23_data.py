@@ -211,16 +211,37 @@ def collect_graph3(victim_host: str = "192.168.100.20", victim_port: int = 80,
     Automated jitter sweep for Graph 3.
 
     For each jitter level:
-      1. Clear the portal's attempt log baseline.
+      1. Reset the portal's attempt log and tarpit state.
       2. Run cred_stuffing.py in jitter mode for RUN_DURATION_SEC.
-      3. Check whether IDS fired a 'CREDENTIAL STUFFING' alert.
+      3. Check whether the IDS fired (Engine 2 tarpit flag count increased).
       4. Run the human baseline to check FPR.
       5. Record TPR/FPR.
+
+    Detection proxy
+    ---------------
+    ids_detector.py writes alerts to /tmp/ids.log on the VICTIM VM.
+    This script typically runs on the BOT VM, so /tmp/ids.log is not
+    locally accessible.
+
+    Primary method  — portal tarpit counter (no SSH needed):
+      When IDS Engine 2 fires it calls tarpit_state.flag(src_ip).
+      fake_portal.py exposes GET /tarpit/status which returns
+      {"flagged": [...], "stats": {"total_delayed": N, ...}}.
+      An increase in len(flagged) between baseline and post-run means
+      the IDS detected bot traffic.
+
+    Fallback method — local IDS log file (--ids-log flag):
+      If this script IS running on the victim VM (or the log is bind-
+      mounted), pass --ids-log /tmp/ids.log to use the file directly.
+      The _count_ids_alerts() function handles both cases: it tries the
+      HTTP tarpit endpoint first; if that returns no data it falls back
+      to the local file path.
     """
     print("=" * 60)
     print(" Graph 3 Data Collection — IDS Accuracy vs. Jitter")
     print(f" Target portal: {victim_host}:{victim_port}")
-    print(f" IDS log: {ids_log}")
+    print(f" Detection: portal tarpit counter (HTTP) + local log fallback")
+    print(f" IDS log fallback path: {ids_log}")
     print(f" Jitter levels (ms std dev): {JITTER_LEVELS_MS}")
     print(f" Run duration per level: {RUN_DURATION_SEC}s")
     print("=" * 60)
@@ -232,6 +253,18 @@ def collect_graph3(victim_host: str = "192.168.100.20", victim_port: int = 80,
         print("Make sure fake_portal.py is running on the victim VM.")
         sys.exit(1)
 
+    # Choose detection method
+    use_http = _tarpit_status_available(victim_host, victim_port)
+    if use_http:
+        print("  Detection method: portal /tarpit/status (HTTP) ✓")
+    else:
+        print("  Detection method: local IDS log file (HTTP not available)")
+        local_ids = Path(ids_log)
+        if not local_ids.exists():
+            print(f"  WARNING: {ids_log} not found.")
+            print("  Run ids_detector.py on the victim VM first, or pass")
+            print("  --ids-log pointing to a mounted/synced copy of the log.")
+
     tpr_results  = []
     fpr_results  = []
     run_details  = []
@@ -240,7 +273,8 @@ def collect_graph3(victim_host: str = "192.168.100.20", victim_port: int = 80,
         print(f"\n─── Jitter = {jitter_ms}ms ─────────────────────────────")
 
         # ── BOT RUN (TPR measurement) ──────────────────────────
-        ids_alert_count_before = _count_ids_alerts(ids_log)
+        baseline_before = _get_alert_baseline(victim_host, victim_port,
+                                              ids_log, use_http)
         _reset_portal_attempts(victim_host, victim_port)
 
         print(f"  Running bot (jitter={jitter_ms}ms, {RUN_DURATION_SEC}s)...")
@@ -252,13 +286,15 @@ def collect_graph3(victim_host: str = "192.168.100.20", victim_port: int = 80,
 
         # Give IDS 5s to process the traffic and fire alert
         time.sleep(5)
-        ids_alert_count_after = _count_ids_alerts(ids_log)
-        bot_detected = ids_alert_count_after > ids_alert_count_before
+        baseline_after = _get_alert_baseline(victim_host, victim_port,
+                                             ids_log, use_http)
+        bot_detected = baseline_after > baseline_before
         tpr = 100.0 if bot_detected else 0.0
         tpr_results.append(tpr)
 
         # ── HUMAN BASELINE RUN (FPR measurement) ────────────────
-        ids_before_human = _count_ids_alerts(ids_log)
+        human_before = _get_alert_baseline(victim_host, victim_port,
+                                           ids_log, use_http)
         _reset_portal_attempts(victim_host, victim_port)
 
         print(f"  Running human baseline (random delays, {RUN_DURATION_SEC}s)...")
@@ -268,8 +304,9 @@ def collect_graph3(victim_host: str = "192.168.100.20", victim_port: int = 80,
             duration=RUN_DURATION_SEC
         )
         time.sleep(5)
-        ids_after_human = _count_ids_alerts(ids_log)
-        human_flagged = ids_after_human > ids_before_human
+        human_after = _get_alert_baseline(victim_host, victim_port,
+                                          ids_log, use_http)
+        human_flagged = human_after > human_before
         fpr = 100.0 if human_flagged else 0.0
         fpr_results.append(fpr)
 
@@ -367,12 +404,57 @@ def _reset_portal_attempts(host: str, port: int):
 
 
 def _count_ids_alerts(log_path: str) -> int:
-    """Count 'ALERT' lines in the IDS log."""
+    """
+    Count 'CREDENTIAL STUFFING' lines in a local IDS log file.
+    Returns 0 if the file does not exist (e.g. running on bot VM where
+    the log lives on the victim VM — use _get_alert_baseline() instead,
+    which tries the HTTP tarpit endpoint first).
+    """
     try:
         with open(log_path) as f:
             return sum(1 for line in f if "CREDENTIAL STUFFING" in line)
     except FileNotFoundError:
         return 0
+
+
+def _tarpit_status_available(host: str, port: int) -> bool:
+    """Return True if the portal's /tarpit/status endpoint is reachable."""
+    try:
+        url = f"http://{host}:{port}/tarpit/status"
+        with urllib.request.urlopen(url, timeout=3) as resp:
+            data = json.loads(resp.read().decode())
+            return data.get("enabled", False)
+    except Exception:
+        return False
+
+
+def _get_alert_baseline(host: str, port: int,
+                         ids_log: str, use_http: bool) -> int:
+    """
+    Return a monotonically-increasing alert counter.
+
+    Primary (use_http=True):
+      Query GET /tarpit/status on the victim portal.
+      Returns len(flagged) — the number of IPs currently in the tarpit.
+      An increase means IDS Engine 2 fired and flagged a new IP.
+
+    Fallback (use_http=False):
+      Read the local IDS log file and count CREDENTIAL STUFFING lines.
+      Works only when running on the victim VM or when the log is
+      bind-mounted / synced to this host.
+    """
+    if use_http:
+        try:
+            url = f"http://{host}:{port}/tarpit/status"
+            with urllib.request.urlopen(url, timeout=5) as resp:
+                data = json.loads(resp.read().decode())
+                # Use total_delayed as a strictly increasing counter;
+                # len(flagged) resets after TTL expiry which could fool us.
+                stats = data.get("stats", {})
+                return int(stats.get("total_delayed", 0))
+        except Exception:
+            pass   # fall through to file method
+    return _count_ids_alerts(ids_log)
 
 
 def _run_cred_stuffing(host: str, port: int, mode: str,

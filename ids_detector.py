@@ -29,6 +29,7 @@ TARPIT INTEGRATION:
 import threading
 import time
 import math
+import os
 import statistics
 import subprocess
 import psutil
@@ -477,8 +478,6 @@ def process_covert_channel(pkt):
 # ══════════════════════════════════════════════════════════════
 #  MAIN — DISPATCHER
 # ══════════════════════════════════════════════════════════════
-
-import os   # needed for comm/exe checks above
 
 def packet_handler(pkt):
     """Route each captured packet to all relevant engines."""

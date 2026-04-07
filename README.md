@@ -347,12 +347,12 @@ chmod +x run_full_lab.sh
 # Run the full lab (all phases)
 sudo ./run_full_lab.sh
 
-# Or run a single phase:
-sudo ./run_full_lab.sh --phase 1    # Phase 1: star C2 + all payloads
-sudo ./run_full_lab.sh --phase 2    # Phase 2: covert channel only
-sudo ./run_full_lab.sh --phase 3    # Phase 3: P2P Kademlia only
+# Or run a single phase (both space and = forms work):
+sudo ./run_full_lab.sh --phase 1     # Phase 1: star C2 + all payloads + DPI
+sudo ./run_full_lab.sh --phase=2     # Phase 2: covert channel only
+sudo ./run_full_lab.sh --phase 3     # Phase 3: P2P Kademlia only
 
-# Clean up all running processes:
+# Clean up all running processes, tarpit state and iptables rules:
 sudo ./run_full_lab.sh --clean
 ```
 
@@ -910,41 +910,48 @@ If Cowrie is not running, the script falls back to manual entry: it prompts you 
 **How to collect real data** (run on the bot VM while portal + IDS are running on victim VM):
 
 ```bash
-# Victim VM: make sure these are running first
-sudo python3 ids_detector.py   # writes alerts to /tmp/ids.log
-sudo python3 fake_portal.py    # provides /login and /attempts/reset
+# Victim VM — start these first:
+sudo python3 ids_detector.py   # Engine 2 triggers tarpit_state.flag() on detection
+sudo python3 fake_portal.py    # exposes /tarpit/status used for alert counting
 
 # Bot VM — automated 8-level jitter sweep:
 python3 collect_graph23_data.py --graph3 --host 192.168.100.20
 # Outputs: graph3_measured_data.json
 ```
 
-The script runs `cred_stuffing.py` at 8 jitter levels (0, 50, 100, 200, 350, 500, 750, 1000 ms) for 30 seconds each. Between each level it calls `POST /attempts/reset` on the portal to clear the baseline, then checks `/tmp/ids.log` on the **victim VM** to count `CREDENTIAL STUFFING` alerts fired during that window (TPR). It then runs a human-baseline pass at the same jitter level to measure false positives (FPR).
+**How alert detection works across VMs:**
+`ids_detector.py` runs on the victim VM and writes its alerts to `/tmp/ids.log` there — a file the bot VM cannot access directly. The script therefore uses the portal's `GET /tarpit/status` endpoint as its detection proxy: when Engine 2 fires it calls `tarpit_state.flag(src_ip)`, which increments the `total_delayed` counter visible via HTTP. An increase in that counter between the start and end of a jitter sweep means the IDS fired.
 
-> **Important:** the IDS log is on the **victim VM** at `/tmp/ids.log`. The `--ids-log` flag lets you override this path if you have the log mounted or synced elsewhere:
-> ```bash
-> python3 collect_graph23_data.py --graph3 --host 192.168.100.20 \
->     --ids-log /path/to/ids.log
-> ```
+If you run `collect_graph23_data.py` directly on the victim VM (or have the log bind-mounted), the local file is also read as a fallback:
+
+```bash
+# Running on the victim VM itself — file is local, use it directly:
+python3 collect_graph23_data.py --graph3 --host 192.168.100.20 \
+    --ids-log /tmp/ids.log
+```
 
 > **Note:** single-run binary results are noisy at intermediate jitter levels. Run the sweep multiple times and average for smoother curves — the script prints a reminder at the end.
 
 Manual sweep (if you prefer to control each level):
 
 ```bash
-# On victim VM — start IDS (creates /tmp/ids.log automatically):
+# On victim VM — start IDS first:
 sudo python3 ids_detector.py &
 
 for JITTER in 0 50 100 200 350 500 750 1000; do
     # Reset portal baseline before each run
     curl -s -X POST http://192.168.100.20/attempts/reset \
          -H "Content-Type: application/json" -d '{"clear_tarpit":true}'
+    # Snapshot tarpit counter before run
+    BEFORE=$(curl -s http://192.168.100.20/tarpit/status | python3 -c \
+             "import sys,json; d=json.load(sys.stdin); print(d['stats']['total_delayed'])")
     # Run bot traffic from bot VM for 30s
     python3 cred_stuffing.py --mode jitter --interval 500 --jitter $JITTER &
-    sleep 30
-    kill %1
-    # Count alerts fired during this run
-    echo "Jitter ${JITTER}ms — alerts: $(grep -c 'CREDENTIAL STUFFING' /tmp/ids.log)"
+    sleep 30; kill %1; sleep 5
+    # Snapshot counter after run
+    AFTER=$(curl -s http://192.168.100.20/tarpit/status | python3 -c \
+            "import sys,json; d=json.load(sys.stdin); print(d['stats']['total_delayed'])")
+    echo "Jitter ${JITTER}ms — IDS fired: $([[ $AFTER -gt $BEFORE ]] && echo YES || echo NO)"
 done
 ```
 
@@ -1043,11 +1050,15 @@ Post-session:
 
 **P2P demo size:** Both `kademlia_p2p.c --demo` and `p2p_node.py --demo` run a **5-node** local mesh and kill 2 of them (40%) to demonstrate resilience. Earlier documentation referred to a "3-node demo" — that was the original design; the final implementation was upgraded to 5 nodes for a more convincing resilience test.
 
-**`cred_stuffing` command parity:** The `cred_stuffing` P2P command is implemented in both `kademlia_p2p.c` (spawns `cred_stuffing.py` via `system()`) and `p2p_node.py` (inline loop with urllib). Both implementations accept the same six JSON fields — `target`, `port`, `duration`, `mode` (`"bot"` / `"jitter"` / `"distributed"`), `jitter`, `workers` — with identical defaults. The Phase 1 C2 server (`c2_server.py`) also forwards all these fields through the AES-encrypted task payload, so the operator's full parameterisation is preserved end-to-end.
+**`cred_stuffing` command parity:** The `cred_stuffing` P2P command is implemented in both `kademlia_p2p.c` (spawns `cred_stuffing.py` via `system()`) and `p2p_node.py` (inline loop with urllib). Both implementations accept the same six JSON fields — `target`, `port`, `duration`, `mode` (`"bot"` / `"jitter"` / `"distributed"`), `jitter`, `workers` — with identical defaults. The Phase 1 C2 server (`c2_server.py`) also forwards all these fields through the AES-encrypted task payload, so the operator's full parameterisation is preserved end-to-end across all three botnet phases.
 
-**IDS log file:** `ids_detector.py` writes every alert to `/tmp/ids.log` on the victim VM, in addition to stdout. The file is opened at startup so it exists before any attack begins. `collect_graph23_data.py --graph3` reads this file directly, meaning Graph 3 data collection works correctly whether the IDS is running standalone or via the orchestrator.
+**IDS log file:** `ids_detector.py` writes every alert to `/tmp/ids.log` on the victim VM (in addition to stdout). The file is opened at startup so it exists before any attack begins. `collect_graph23_data.py --graph3` uses the portal's `GET /tarpit/status` endpoint as its primary detection proxy (HTTP-accessible from any VM), and falls back to reading the local log file path when run directly on the victim VM or when `--ids-log` is passed.
 
-**Portal reset endpoint:** `fake_portal.py` now exposes `POST /attempts/reset` which clears the in-memory attempt log, tarpit stats, and optionally tarpit flags. `collect_graph23_data.py --graph3` calls this between jitter levels to ensure a clean measurement baseline for each sweep.
+**Portal reset endpoint:** `fake_portal.py` exposes `POST /attempts/reset` which clears the in-memory attempt log, tarpit stats, and optionally tarpit flags. `collect_graph23_data.py --graph3` calls this between jitter levels to ensure a clean measurement baseline for each sweep. The `attempt_log` list is now protected by `_stats_lock` in both the append (login handler) and clear (reset handler) paths.
+
+**`--phase` argument parsing:** `run_full_lab.sh` previously used `shift` inside a `for arg in "$@"` loop, which is a bash no-op — `$@` is snapshotted at loop start and `shift` does not advance the iterator. This meant `--phase 1` (space form) was silently ignored and the full lab always ran. The parser now uses `while [[ $# -gt 0 ]]; do ... shift; done` and both `--phase 1` and `--phase=1` forms work correctly. `--phase 1` also now runs `run_dpi_measurement` to collect Graph 1 data.
+
+**`update_secret` key rotation:** `covert_bot.py`'s `decode_command()` and `encode_command()` previously used `secret: bytes = SHARED_SECRET` as a default argument — Python evaluates default args once at function definition, so later reassignment of the global was silently ignored. Both functions now use `secret: bytes = None` and resolve `SHARED_SECRET` inside the function body, meaning key rotation via `update_secret` takes effect immediately on the next poll cycle.
 
 **Bot agent v3:** `bot_agent.c` dispatches all five payload types. SYN flood and UDP flood are implemented natively in C with raw sockets; Slowloris is a pure C implementation maintaining a 150-socket pool with dead-socket refill; cryptojacking uses a duty-cycle SHA-256 burn loop with `/proc/self/comm` name spoofing via `prctl(PR_SET_NAME)`; credential stuffing and DGA search spawn the Python modules via `system()`.
 
