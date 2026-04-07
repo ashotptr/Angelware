@@ -1070,12 +1070,6 @@ Post-session:
 
 ---
 
-
-1.  Advanced Botnet Research Project Proposal.pdf 
-2.  The Mirai Botnet – Threats and Mitigations - CIS Center for Internet Security, 
-accessed March 12, 2026, 
-https://www.cisecurity.org/insights/blog/the-mirai-botnet-threats-and-mitigation
-s 
 3.  Peer-to-Peer Botnets - Computer Science, accessed March 12, 2026, 
 https://cs.ucf.edu/~czou/research/P2PBotnets-bookChapter.pdf 
 4.  Analyzing The Mirai IoT Botnet and Its Recent Variants: Satori, Mukashi, Moobot, 
