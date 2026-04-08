@@ -453,7 +453,12 @@ curl -X POST http://192.168.100.10:5000/task \
           "target_port":80,"duration":120,"mode":"distributed","workers":3}'
 
 # Note: tasks are AES-128-CBC encrypted on delivery to bots that registered
-# with "enc":1. Legacy bots without encryption receive plaintext.
+# with "enc":1 (set by bot_agent.c at registration time). The C2 server
+# tracks this per-bot via the supports_enc flag — bots registered without
+# it receive plaintext for backward compatibility with legacy agents.
+# bot_agent.c also handles the update_secret command, re-deriving its AES
+# key from the new secret so Phase 1 C bots fully participate in key
+# rotation alongside Phase 2 and Phase 3 bots.
 
 # View registered bots
 curl http://192.168.100.10:5000/bots
@@ -574,6 +579,7 @@ python3 covert_bot.py
 # Utility commands:
 python3 covert_bot.py encode '{"type":"syn_flood","target":"192.168.100.20"}'
 python3 covert_bot.py decode '<paste_blob>'
+python3 covert_bot.py rotate NEW_KEY_2026_XYZ  # rotate key via dead-drop /push_key
 
 # Wipe command from dead drop (bot goes idle next poll):
 curl -X POST http://192.168.100.10:5001/clear_command
@@ -624,7 +630,13 @@ curl -X POST http://192.168.100.10:5001/push_key \
 python3 covert_bot.py rotate NEW_KEY_2026_XYZ
 ```
 
-> **Rotation sequence:** call `/rotate_key` and `/push_key` with the *same* new secret → wait ≥ one heartbeat/poll cycle (5–75 s) for all bots to pick up the `update_secret` command and switch their local key → restart both servers with the new secret set (or they will revert to old key on next restart). The `update_secret` command is always encrypted with the **current** (old) key so in-flight bots can decrypt it.
+> **Rotation sequence (all phases):**
+> 1. Call `POST /rotate_key` on the C2 server (Phase 1) and `POST /push_key` on the dead-drop server (Phase 2) with the **same** new secret.
+> 2. Phase 3 P2P nodes receive `update_secret` through the DHT on their next `POLL_SEC` cycle — inject it via `--inject '{"type":"update_secret","secret":"…"}'` on the C2 node if needed.
+> 3. Wait ≥ one full poll cycle (up to 75 s for Phase 2 bots) for all bots to pick up the command and switch their local key.
+> 4. Restart both servers so their in-process key state matches (they revert to `SHARED_SECRET` / `AUA_LAB_2026_KEY` on restart unless the constant is updated).
+> 
+> The `update_secret` command is always encrypted with the **current** (old) key so in-flight bots can still decrypt it. Bots that miss the rotation window (e.g. offline during step 3) will be unable to decrypt subsequent tasks until manually re-keyed.
 
 **All supported command types for the Phase 2 covert bot:**
 
@@ -640,6 +652,18 @@ python3 covert_bot.py rotate NEW_KEY_2026_XYZ
 | `dga_search` | Trigger DGA NXDOMAIN sweep (fallback demo) | — |
 | `update_secret` | Rotate the shared AES key at runtime | `secret` (≥8 chars) |
 | `idle` | No-op | — |
+
+**`covert_bot.py` CLI mode reference:**
+
+| Mode | Invocation | Purpose |
+|---|---|---|
+| *(default)* | `python3 covert_bot.py` | Run as bot agent — poll dead drop, execute commands |
+| `server` | `python3 covert_bot.py server` | Run dead-drop Flask server on port 5001 (C2 VM) |
+| `encode` | `python3 covert_bot.py encode '{"type":…}'` | AES-encode a command dict and print the `<!-- CMD:…:CMD -->` marker |
+| `decode` | `python3 covert_bot.py decode <blob>` | Decode and print a base64 blob from a dead drop |
+| `gist` | `python3 covert_bot.py gist '{"type":…}'` | Push encoded command to a GitHub Gist via API (requires `GIST_ID` + `GITHUB_TOKEN`) |
+| `rotate` | `python3 covert_bot.py rotate <new_secret>` | Rotate shared AES key via dead-drop server `POST /push_key`; also forwards to Phase 1 C2 |
+
 
 ### 8.9 Phase 3 — Kademlia P2P (C)
 
@@ -680,6 +704,7 @@ python3 p2p_node.py --demo
 | `stop_all` | ✅ | ✅ | Cancel all active attacks |
 | `shutdown` | ✅ | ✅ | Gracefully exit the node process |
 | `dga_search` | ✅ via `system()` | ✅ inline+fallback | DGA NXDOMAIN burst — IDS Engine 3 trigger |
+| `update_secret` | ✅ `rotate_p2p_key()` | ✅ module-level `SHARED_SECRET` | Rotate the XOR mesh keystream; all nodes that receive it adopt the new key on the same poll cycle |
 | `idle` | ✅ | ✅ | No-op |
 
 > **`cred_stuffing` via P2P example:**
@@ -691,6 +716,22 @@ python3 p2p_node.py --demo
 > ```
 > Supported `mode` values: `"bot"` (rigid timing), `"jitter"` (randomized), `"distributed"` (multi-worker spoofed IPs).
 > The C node spawns `cred_stuffing.py` via `system()`. The Python node uses an inline `requests` loop.
+
+> **Key rotation via P2P inject:**
+> ```bash
+> # Rotate the XOR mesh key across all P2P nodes in one step:
+> ./kademlia_p2p --host 192.168.100.10 --port 7401 \
+>     --bootstrap 192.168.100.10:7400 \
+>     --inject '{"type":"update_secret","secret":"NEW_KEY_2026_XYZ"}'
+> # Equivalently with the Python node:
+> python3 p2p_node.py --host 192.168.100.10 --port 7401 \
+>     --bootstrap 192.168.100.10:7400 \
+>     --inject '{"type":"update_secret","secret":"NEW_KEY_2026_XYZ"}'
+> ```
+> Nodes that receive this command call `rotate_p2p_key()` (C) or reassign `SHARED_SECRET`
+> (Python), adopting the new XOR keystream for all subsequent wire messages. Combine with
+> `POST /rotate_key` and `POST /push_key` for a simultaneous all-phase rotation (see the
+> rotation sequence callout in Section 8.8).
 
 **Wire message types (shared between C and Python):**
 
@@ -706,7 +747,10 @@ python3 p2p_node.py --demo
 | `0x08` | STOP_ALL | Broadcast: halt all active attacks |
 | `0x09` | SHUTDOWN | Broadcast: exit the node process |
 
-All messages are XOR-encrypted with `SHA-256("AUA_P2P_MESH_KEY")` as keystream.
+All messages are XOR-encrypted with `SHA-256("AUA_P2P_MESH_KEY")` as keystream (the
+initial value). After a successful `update_secret` command the keystream changes to
+`SHA-256(new_secret)` on every node that processes it — nodes still using the old key
+will fail to decrypt subsequent messages and drop out of the mesh.
 
 ---
 
@@ -778,6 +822,15 @@ sudo python3 firewall_dpi.py --teardown
 - **Slowloris:** TCP connection to port 80 that stays open for > 30 seconds — the half-open header drip pattern.
 
 The two-threshold design means the alert sensitivity depends on destination: aggressive against unknown IPs, tolerant of normal developer cadence to trusted domains.
+
+| Detection rule | Threshold | Rationale |
+|---|---|---|
+| HTTPS SYNs → any unknown IP | ≥ 10 in 60 s | A bot polling its own dead-drop VM every 60 s hits this on the second poll cycle |
+| TLS sessions → `github.com` / `raw.githubusercontent.com` / `reddit.com` / `pastebin.com` | ≥ 20 in 60 s | Legitimate developers visit these frequently; the higher bar prevents false positives during normal work |
+| HTTP connection open duration (Slowloris) | > 30 s | Half-open header drip; any genuine HTTP request completes within a few seconds |
+
+The thresholds are defined as class constants in `DPIEngine` and can be tuned without
+restarting the engine by editing `firewall_dpi.py` and re-running `--dpi`.
 
 ### 9.3 Tarpitting (Credential Stuffing Response)
 
@@ -873,6 +926,8 @@ sudo python3 honeypot_setup.py --teardown
 
 **SSH host key generation:** `--setup` automatically generates `etc/ssh_host_rsa_key` and `etc/ssh_host_dsa_key` (required by `cowrie.cfg`). It tries `ssh-keygen` first, then falls back to the `cryptography` library, then `paramiko`. If all three fail it prints the exact manual commands to run. Keys are skipped if they already exist, so `--setup` is safe to re-run.
 
+**Cowrie working-directory requirement:** All paths in `cowrie.cfg` are relative to Cowrie's root directory. Always start Cowrie with `cd ~/cowrie && bin/cowrie start` — launching it from any other directory causes "No such file" errors for the key files (`etc/ssh_host_rsa_key`) and honeyfs entries at startup. `honeypot_setup.py --setup` prints the correct start command for reference after completing setup.
+
 Cowrie accepts **all credentials** (configured in `userdb.txt` with `*` wildcard) so every brute-force attempt logs in successfully and the scanner's post-login commands are captured.
 
 ---
@@ -900,6 +955,24 @@ Natural English domain names have low entropy (e.g., `google.com` label = 0 repe
 Inter-arrival times for a bot with programmed interval T follow a near-zero-variance distribution (CV ≈ 0.01). Even with jitter, bots rarely exceed CV = 0.3. Human typing has CV > 0.5 due to natural reading/thinking pauses. Threshold of 0.15 provides a clean separation in practice.
 
 The **Graph 3 research finding:** as jitter ±range increases from 0 ms to 1000 ms (uniform distribution; effective std dev = range / √3 ≈ 0.577 × range), the bot's CV climbs from ~0.01 toward human-like values, and the TPR drops from ~98% to ~44%. The evasion threshold is around 500 ms ±range (≈ 289 ms effective std dev) — the exact jitter level at which the cost of running the attack (slow credential testing) starts to outweigh the detection risk.
+
+### Graph 1 Detection-Rate Formula
+
+`generate_graphs.py` converts raw Time-to-Detect (TTD) values from `firewall_dpi.py --measure`
+into the percentage bars shown in Graph 1 using `ttd_to_rate(ttd)`:
+
+```
+TTD = 0         →  100 %   (blocked instantly — port-blocking result for SYN/UDP flood)
+TTD = ∞ / "inf" →    0 %   (never detected  — port-blocking result for GitHub polling)
+TTD = N seconds →  max(0, (1 − N / 120) × 100) %
+```
+
+The 120 s denominator is the `--duration` window used during live measurement. A DPI engine
+that fires at t = 60 s therefore scores 50 %. This normalisation means Graph 1 bars are
+sensitive to the measurement window length — if you re-run `--measure --duration 60` the
+DPI detection rates will appear higher because the same absolute TTD is a larger fraction
+of the shorter window. Keep the window at 120 s for comparability with the simulated
+reference data.
 
 ---
 
@@ -1103,15 +1176,34 @@ Post-session:
 
 **`--phase` argument parsing:** `run_full_lab.sh` previously used `shift` inside a `for arg in "$@"` loop, which is a bash no-op — `$@` is snapshotted at loop start and `shift` does not advance the iterator. This meant `--phase 1` (space form) was silently ignored and the full lab always ran. The parser now uses `while [[ $# -gt 0 ]]; do ... shift; done` and both `--phase 1` and `--phase=1` forms work correctly. `--phase 1` also now runs `run_dpi_measurement` to collect Graph 1 data.
 
-**`update_secret` key rotation:** `covert_bot.py`'s `decode_command()` and `encode_command()` previously used `secret: bytes = SHARED_SECRET` as a default argument — Python evaluates default args once at function definition, so later reassignment of the global was silently ignored. Both functions now use `secret: bytes = None` and resolve `SHARED_SECRET` inside the function body, meaning key rotation via `update_secret` takes effect immediately on the next poll cycle.
+**`run_full_lab.sh` graph status:** The stale "replace simulate_*()" completion banner has been removed. The script now calls `python3 generate_graphs.py --status` after generating graphs so you immediately see which of the three measurement JSON files are present and which still need to be collected. The `generate_all_graphs()` function also includes inline comments explaining that real data files are auto-loaded when present and that the `--status` flag shows the collection commands for any missing files.
+
+**`update_secret` key rotation (all phases):** Key rotation now propagates correctly through all three botnet phases in the same operator workflow:
+1. Call `POST /rotate_key` on the C2 server **and** `POST /push_key` on the dead-drop server with the same new secret.
+2. The C2 server encrypts an `update_secret` task with the *current* key and queues it for every registered Phase 1 bot. `bot_agent.c` decrypts it, calls `derive_key_from_secret()`, and posts `"key_rotated"` back to `/result`.
+3. The dead-drop server encodes an `update_secret` command with the current key and sets it as the active payload. `covert_bot.py` polls, decodes it, and reassigns the module-level `SHARED_SECRET` global. `decode_command()` resolves this at call time (not at definition time — that was the prior bug) so the change takes effect immediately on the next poll cycle.
+4. Any Phase 3 DHT node that polls for commands during the window will receive `update_secret` via FIND_VALUE, call `rotate_p2p_key()`, and adopt the new XOR keystream for all subsequent wire messages. Nodes offline at rotation time are evicted from peer routing tables after `REFRESH_SEC` because their messages will fail to decrypt — this mirrors real key-rotation eviction semantics.
+5. After one full heartbeat/poll cycle (≥75 s) restart both servers so their in-process `_current_key` / `SHARED_SECRET` is updated for the next session.
+
+**Key rotation — all three phases:** All three bot implementations now handle `update_secret` consistently.
+- `bot_agent.c` — calls `derive_key_from_secret(new_secret)`, which re-runs SHA-256 on the provided string and stores the result in the shared `g_aes_key` buffer. All subsequent task decryptions use the new key. The old `derive_key()` wrapper is retained for startup and calls `derive_key_from_secret(SHARED_SECRET)`.
+- `kademlia_p2p.c` — calls `rotate_p2p_key(new_secret)`, which acquires a write lock on `g_key_rwlock`, SHA-256s the new secret into `g_key_hash`, then releases the lock. All concurrent `xor_cipher()` calls hold a read lock, so there is no window where a message is encrypted with a partially-written key.
+- `p2p_node.py` — reassigns the module-level `SHARED_SECRET` global; `decode_command()` and `encode_command()` resolve `SHARED_SECRET` at call time (not at definition time) so the change takes effect on the next poll cycle.
 
 **Bot agent v3:** `bot_agent.c` dispatches all five payload types. SYN flood and UDP flood are implemented natively in C with raw sockets; Slowloris is a pure C implementation maintaining a 150-socket pool with dead-socket refill; cryptojacking uses a duty-cycle SHA-256 burn loop with `/proc/self/comm` name spoofing via `prctl(PR_SET_NAME)`; credential stuffing and DGA search spawn the Python modules via `system()`.
+
+**`/result` reporting — Phase 1 C bots:** `bot_agent.c` now posts task outcomes back to `POST /result` on the C2 server after each command completes. Synchronous attacks (`syn_flood`, `udp_flood`) post `"status":"completed"` after the blocking call returns. Asynchronous attacks that run in detached threads (`slowloris`, `cryptojack`) and subprocess-delegated commands (`cred_stuffing`, `dga_search`) post `"status":"started"` immediately after the thread or process is launched. Key-rotation responses report `"status":"key_rotated"` or `"status":"rejected_too_short"`. The C2 server's `/result` endpoint logs the payload and returns `{"status":"received"}`; the operator can `tail /tmp/c2_server.log` to monitor task outcomes across all registered bots.
 
 **Dead drop — lab vs real GitHub Gist:** `covert_bot.py` ships with `DEAD_DROP_URL` pointing to the local Flask server (`http://192.168.100.10:5001/dead_drop`). To use a real GitHub Gist (the production threat model), set `DEAD_DROP_URL` to the raw Gist URL and use `python3 covert_bot.py gist '<json>'` to push commands via the GitHub API. The bot's parsing and AES decryption are identical in both modes. The `gist` CLI mode requires `GIST_ID` and `GITHUB_TOKEN` environment variables; credentials must never be committed to the repository.
 
 **AES key rotation:** `c2_server.py` now exposes `POST /rotate_key` (requires `X-Auth-Token`). It encrypts an `update_secret` task with the current key, queues it for every registered bot, then switches the server to the new key atomically. The dead-drop server exposes the equivalent `POST /push_key` and the `python3 covert_bot.py rotate <secret>` shortcut. Both must be called with the same new secret; after one heartbeat/poll cycle all bots have switched. Servers must be restarted (or the `_current_secret` updated in process) to persist the new key across restarts.
 
 **Payload binaries:** `mirai_scanner.c` sends the full Mirai infection sequence (`wget`, `chmod +x`, `execute`, `rm -f`) to the Cowrie honeypot, which logs each command as a separate ATT&CK event. There are no actual `payload.mips` / `payload.arm` / `payload.x86_64` binaries in this repo — the wget URL is logged by Cowrie but the download is never fulfilled. This is intentional: the research question concerns the infection lifecycle and detection thereof, not the payload itself.
+
+**`dga_search` dispatch chain:** The three bot implementations dispatch `dga_search` differently, but produce identical observable IDS signals (a burst of NXDOMAIN responses).
+- `bot_agent.c` — `system("python3 dga.py &")` unconditionally; posts `"started"` result.
+- `kademlia_p2p.c` — same `system("python3 dga.py &")` call.
+- `p2p_node.py` — `_attack_dga_search()` first tries `from dga import bot_c2_search, generate_daily_domains` (direct in-process call, cleanest); if the module is not importable from the current working directory it falls back to `subprocess.Popen(["python3", "dga.py"])`. The stop-event is checked between domain resolution attempts so a subsequent `stop_all` command cancels the sweep cleanly.
 
 **Graph output directory:** `generate_graphs.py` saves PNGs to `./graphs/` by default (relative to the script). `run_full_lab.sh` overrides this to `/tmp/botnet_graphs/` via the inline Python call. Use `--out <path>` to set a custom directory when calling the script directly.
 

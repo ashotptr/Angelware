@@ -393,8 +393,10 @@ generate_graphs.graph3_ids_accuracy('/tmp/botnet_graphs/graph3_ids_accuracy.png'
 print('Graphs saved to /tmp/botnet_graphs/')
 " 2>/dev/null || python3 generate_graphs.py
     ok "All 3 research graphs generated in /tmp/botnet_graphs/"
-    log "NOTE: These use TEMPLATE data. Replace simulate_*() in generate_graphs.py with"
-    log "      REAL MEASURED values from your attack runs before final submission."
+    # Real measurement files (graph1/2/3_measured_data.json) are auto-loaded
+    # by generate_graphs.py when present; graphs are annotated [REAL DATA].
+    # Check what is still missing before final submission:
+    python3 generate_graphs.py --status 2>/dev/null || true
 }
 
 # ────────────────────────────────────────────────────────────────
@@ -523,8 +525,8 @@ case "$PHASE" in
         echo -e "${GRN}║     IDS log:   /tmp/ids.log (on victim VM)          ║${NC}"
         echo -e "${GRN}║     Cowrie:    ~/.cowrie/var/log/cowrie/cowrie.json  ║${NC}"
         echo -e "${GRN}║                                                      ║${NC}"
-        echo -e "${GRN}║   Remember: replace simulate_*() in                 ║${NC}"
-        echo -e "${GRN}║   generate_graphs.py with real measured data!       ║${NC}"
+        echo -e "${GRN}║   Real data auto-loaded when JSON files are present  ║${NC}"
+        echo -e "${GRN}║   Run: python3 generate_graphs.py --status           ║${NC}"
         echo -e "${GRN}╚══════════════════════════════════════════════════════╝${NC}"
         echo ""
         ;;

