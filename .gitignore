@@ -1,3 +1,7 @@
 /graph1_dpi_vs_portblocking.png
 /graph2_persistence_paradox.png
 /graph3_ids_accuracy.png
+/graphs/
+graph1_measured_data.json
+graph2_measured_data.json
+graph3_measured_data.json

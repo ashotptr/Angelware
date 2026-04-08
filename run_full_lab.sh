@@ -329,7 +329,7 @@ run_phase3_p2p() {
     log "P2P nodes on bot1 and bot2 should still communicate..."
     bot_ssh "$BOT1_IP" "tail -10 /tmp/p2p_bot1.log" 2>/dev/null || true
 
-    log "Running local 3-node demo to show P2P resilience..."
+    log "Running local 5-node demo with 40% node kill to show P2P resilience..."
     ./kademlia_p2p --demo
     ok "Phase 3 P2P demonstration complete"
 }

@@ -459,7 +459,11 @@ curl -X POST http://192.168.100.10:5000/task \
 curl http://192.168.100.10:5000/bots
 
 # Receive a result from a bot (bots POST here after task completion)
-curl http://192.168.100.10:5000/result
+# Note: /result is POST-only; GET returns 405
+curl -X POST http://192.168.100.10:5000/result \\
+     -H "Content-Type: application/json" \\
+     -H "X-Auth-Token: LAB_RESEARCH_TOKEN_2026" \\
+     -d '{"bot_id":"bot_hostname_1234","result":"task complete"}'
 
 # Debug endpoint: test AES round-trip on any JSON payload
 curl -X POST http://192.168.100.10:5000/encrypt_test \
@@ -893,7 +897,7 @@ Natural English domain names have low entropy (e.g., `google.com` label = 0 repe
 
 Inter-arrival times for a bot with programmed interval T follow a near-zero-variance distribution (CV ≈ 0.01). Even with jitter, bots rarely exceed CV = 0.3. Human typing has CV > 0.5 due to natural reading/thinking pauses. Threshold of 0.15 provides a clean separation in practice.
 
-The **Graph 3 research finding:** as jitter standard deviation increases from 0 ms to 1000 ms, the bot's CV climbs from ~0.01 toward human-like values, and the TPR drops from ~98% to ~44%. The evasion threshold is around 500 ms std dev — the exact jitter level at which the cost of running the attack (slow credential testing) starts to outweigh the detection risk.
+The **Graph 3 research finding:** as jitter ±range increases from 0 ms to 1000 ms (uniform distribution; effective std dev = range / √3 ≈ 0.577 × range), the bot's CV climbs from ~0.01 toward human-like values, and the TPR drops from ~98% to ~44%. The evasion threshold is around 500 ms ±range (≈ 289 ms effective std dev) — the exact jitter level at which the cost of running the attack (slow credential testing) starts to outweigh the detection risk.
 
 ---
 
@@ -990,7 +994,7 @@ for JITTER in 0 50 100 200 350 500 750 1000; do
     # Snapshot counter after run
     AFTER=$(curl -s http://192.168.100.20/tarpit/status | python3 -c \
             "import sys,json; d=json.load(sys.stdin); print(d['stats']['total_delayed'])")
-    echo "Jitter ${JITTER}ms — IDS fired: $([[ $AFTER -gt $BEFORE ]] && echo YES || echo NO)"
+    echo "Jitter ±${JITTER}ms range (~$((JITTER * 577 / 1000))ms eff-stddev) — IDS fired: $([[ $AFTER -gt $BEFORE ]] && echo YES || echo NO)"
 done
 ```
 
