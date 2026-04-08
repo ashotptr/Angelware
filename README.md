@@ -88,7 +88,7 @@ seed = f"{date}-{i}"
 domain = sha256(seed)[:10 chars mapped to a-z] + tld_rotation
 ```
 
-The IDS detects this via: (1) burst of NXDOMAIN responses (≥10 in 30s), (2) Shannon entropy scoring (H > 4.0 bits/char triggers alert).
+The IDS detects this via: (1) burst of NXDOMAIN responses (≥10 in 30s), (2) Shannon entropy scoring (H > 3.8 bits/char triggers alert).
 
 ### Payload Suite
 
@@ -387,7 +387,7 @@ sudo ./run_full_lab.sh --clean
 /tmp/botnet_graphs/graph1_dpi_vs_portblocking.png
 /tmp/botnet_graphs/graph2_persistence_paradox.png
 /tmp/botnet_graphs/graph3_ids_accuracy.png
-/tmp/incident_report.md              (NIST SP 800-61r3 IR report)
+./incident_report.md                 (NIST SP 800-61r3 IR report — written to current directory)
 ./graph1_measured_data.json          (real TTD measurements from DPI engine)
 /tmp/c2_server.log                   (C2 activity log)
 /tmp/ids.log                         (IDS alerts — on victim VM)
@@ -634,6 +634,7 @@ python3 covert_bot.py rotate NEW_KEY_2026_XYZ
 | `udp_flood` | Raw UDP flood via Scapy | `target`, `duration` |
 | `slowloris` | 150-socket HTTP exhaustion | `target`, `port`, `duration` |
 | `cryptojack` | CPU burn loop | `duration`, `cpu` (0.0–1.0) |
+| `cred_stuffing` | Credential stuffing against `/login` | `target`, `port`, `duration`, `mode` (`"bot"`/`"jitter"`/`"distributed"`), `jitter` (ms), `workers` |
 | `stop_all` | Cancel all active attacks | — |
 | `shutdown` | Gracefully exit the bot process | — |
 | `dga_search` | Trigger DGA NXDOMAIN sweep (fallback demo) | — |
@@ -678,6 +679,7 @@ python3 p2p_node.py --demo
 | `cred_stuffing` | ✅ via `system()` | ✅ via `requests` | Credential stuffing against `/login` |
 | `stop_all` | ✅ | ✅ | Cancel all active attacks |
 | `shutdown` | ✅ | ✅ | Gracefully exit the node process |
+| `dga_search` | ✅ via `system()` | ✅ inline+fallback | DGA NXDOMAIN burst — IDS Engine 3 trigger |
 | `idle` | ✅ | ✅ | No-op |
 
 > **`cred_stuffing` via P2P example:**

