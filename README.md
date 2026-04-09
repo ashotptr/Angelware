@@ -1220,8 +1220,6 @@ c2-server-in-python-a-fresh-take-on-offensive-security-e3d8c09bc2ab
 7.  abd3lgh4f0r/C2_Server - GitHub, accessed March 12, 2026, 
 https://github.com/abd3lgh4f0r/C2_Server 
 8.  https://github.com/Rjkumarkumawat/Advanced-Botnet-Implementation
-9.  c2 · GitHub Topics, accessed March 12, 2026, 
-https://github.com/topics/c2?o=asc&s=stars 
 10. ahmedkhlief/Ninja: Open source C2 server created for stealth red team 
 operations - GitHub, accessed March 12, 2026, 
 https://github.com/ahmedkhlief/Ninja 
