@@ -1217,35 +1217,6 @@ Post-session:
 
 ---
 
-3.  Peer-to-Peer Botnets - Computer Science, accessed March 12, 2026, 
-https://cs.ucf.edu/~czou/research/P2PBotnets-bookChapter.pdf 
-4.  Analyzing The Mirai IoT Botnet and Its Recent Variants: Satori, Mukashi, Moobot, 
-and Sonic - arXiv.org, accessed March 12, 2026, https://arxiv.org/pdf/2508.01909 
-5.  Building a Custom C2 Server in Python: A Fresh Take on Offensive Security - 
-Medium, accessed March 12, 2026, 
-https://medium.com/maxwell-cross-python-for-red-teaming/building-a-custom-
-c2-server-in-python-a-fresh-take-on-offensive-security-e3d8c09bc2ab
-7.  abd3lgh4f0r/C2_Server - GitHub, accessed March 12, 2026, 
-https://github.com/abd3lgh4f0r/C2_Server 
-8.  https://github.com/Rjkumarkumawat/Advanced-Botnet-Implementation
-10. ahmedkhlief/Ninja: Open source C2 server created for stealth red team 
-operations - GitHub, accessed March 12, 2026, 
-https://github.com/ahmedkhlief/Ninja
-13. martinkubecka/C2Detective: :mag: Application for detecting command and 
-control (C2) communication through network traffic analysis. - GitHub, accessed 
-March 12, 2026, https://github.com/martinkubecka/C2Detective 
-14. specs/kad-dht/README.md at master · libp2p/specs - GitHub, accessed March 
-12, 2026, https://github.com/libp2p/specs/blob/master/kad-dht/README.md 
-15. Silence of the hops: The KadNap botnet - Lumen Blog, accessed March 12, 2026, 
-https://blog.lumen.com/silence-of-the-hops-the-kadnap-botnet/ 
-16. Kademlia - Wikipedia, accessed March 12, 2026, 
-https://en.wikipedia.org/wiki/Kademlia 
-18. jontab/kademlia-c: Implementation of Kademlia DHT in C. - GitHub, accessed 
-March 12, 2026, https://github.com/jontab/kademlia-c 
-19. Distributed Hash Tables with Kademlia - GeeksforGeeks, accessed March 12, 
-2026, 
-https://www.geeksforgeeks.org/system-design/distributed-hash-tables-with-kad
-emlia/ 
 20. Domain Generation Algorithms (DGA): Definition and Impact - Hunt.io, accessed 
 March 12, 2026, https://hunt.io/glossary/dga-domain-generation-algorithms 
 21. What is Domain Generation Algorithm: 8 Real World DGA Variants - Cybereason, 
