@@ -1217,9 +1217,7 @@ Post-session:
 
 ---
 
-21. What is Domain Generation Algorithm: 8 Real World DGA Variants - Cybereason, 
-accessed March 12, 2026, 
-https://www.cybereason.com/blog/what-are-domain-generation-algorithms-dga 
+ 
 22. What is Domain Generation Algorithm? - GeeksforGeeks, accessed March 12, 
 2026, 
 https://www.geeksforgeeks.org/computer-networks/what-is-domain-generation
