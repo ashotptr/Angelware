@@ -1240,8 +1240,6 @@ March 12, 2026, https://github.com/martinkubecka/C2Detective
 https://blog.lumen.com/silence-of-the-hops-the-kadnap-botnet/ 
 16. Kademlia - Wikipedia, accessed March 12, 2026, 
 https://en.wikipedia.org/wiki/Kademlia 
-17. Kademlia DHT - libp2p, accessed March 12, 2026, 
-https://libp2p.io/docs/kademlia-dht/ 
 18. jontab/kademlia-c: Implementation of Kademlia DHT in C. - GitHub, accessed 
 March 12, 2026, https://github.com/jontab/kademlia-c 
 19. Distributed Hash Tables with Kademlia - GeeksforGeeks, accessed March 12, 
