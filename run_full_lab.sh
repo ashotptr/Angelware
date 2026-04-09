@@ -343,12 +343,15 @@ run_dpi_measurement() {
     log "Setting up iptables egress filtering..."
     sudo python3 firewall_dpi.py --setup || true
     sleep 2
-    log "Running DPI engine for 60s to collect TTD data..."
-    python3 firewall_dpi.py --measure --duration 60 &
+    # --duration 120 matches generate_graphs.py WINDOW = 120.0
+    # Using 60 s here would make all DPI detection rates appear ~2x higher
+    # than they really are because the TTD-to-rate formula divides by 120.
+    log "Running DPI engine for 120s to collect TTD data..."
+    python3 firewall_dpi.py --measure --duration 120 &
     DPI_PID=$!
-    # Simultaneously run GitHub polling to give DPI something to detect
+    # Simultaneously run an attack so DPI has traffic to analyse
     c2_curl "{\"bot_id\":\"all\",\"type\":\"syn_flood\",\"target_ip\":\"$VICTIM_IP\",\"duration\":15}"
-    sleep 65
+    sleep 125   # 120 s measurement + 5 s teardown buffer
     kill $DPI_PID 2>/dev/null || true
     python3 firewall_dpi.py --teardown || true
     ok "DPI measurement complete — see graph1_measured_data.json"
