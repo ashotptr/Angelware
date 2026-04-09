@@ -1217,11 +1217,6 @@ Post-session:
 
 ---
 
- 
-22. What is Domain Generation Algorithm? - GeeksforGeeks, accessed March 12, 
-2026, 
-https://www.geeksforgeeks.org/computer-networks/what-is-domain-generation
--algorithm/ 
 23. Building a DGA Malware Simulator in Python: A Step-by-Step Guide for Ethical 
 Hackers | by Aghede David | Medium, accessed March 12, 2026, 
 https://medium.com/@davidaghede598/building-a-dga-malware-simulator-in-py
