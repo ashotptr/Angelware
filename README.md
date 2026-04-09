@@ -1217,10 +1217,6 @@ Post-session:
 
 ---
 
-23. Building a DGA Malware Simulator in Python: A Step-by-Step Guide for Ethical 
-Hackers | by Aghede David | Medium, accessed March 12, 2026, 
-https://medium.com/@davidaghede598/building-a-dga-malware-simulator-in-py
-thon-a-step-by-step-guide-for-ethical-hackers-f7a36f488241 
 24. ericyoc/gen_dga_regex_and_yara_rules_poc: A demonstration of domain 
 generation algorithm (DGA) and determing regular expression and yara rule for 
 each dga. - GitHub, accessed March 12, 2026, 
