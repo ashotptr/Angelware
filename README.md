@@ -1216,10 +1216,7 @@ and Sonic - arXiv.org, accessed March 12, 2026, https://arxiv.org/pdf/2508.01909
 5.  Building a Custom C2 Server in Python: A Fresh Take on Offensive Security - 
 Medium, accessed March 12, 2026, 
 https://medium.com/maxwell-cross-python-for-red-teaming/building-a-custom-
-c2-server-in-python-a-fresh-take-on-offensive-security-e3d8c09bc2ab 
-6.  Modern C2 Attacks: Detect & Defend Command-and-Control - Splunk, accessed 
-March 12, 2026, 
-https://www.splunk.com/en_us/blog/learn/c2-command-and-control.html 
+c2-server-in-python-a-fresh-take-on-offensive-security-e3d8c09bc2ab
 7.  abd3lgh4f0r/C2_Server - GitHub, accessed March 12, 2026, 
 https://github.com/abd3lgh4f0r/C2_Server 
 8.  Advanced Botnet Implementation — Complete Setup & README Guide | by 
