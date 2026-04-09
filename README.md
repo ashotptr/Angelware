@@ -1217,8 +1217,6 @@ Post-session:
 
 ---
 
-20. Domain Generation Algorithms (DGA): Definition and Impact - Hunt.io, accessed 
-March 12, 2026, https://hunt.io/glossary/dga-domain-generation-algorithms 
 21. What is Domain Generation Algorithm: 8 Real World DGA Variants - Cybereason, 
 accessed March 12, 2026, 
 https://www.cybereason.com/blog/what-are-domain-generation-algorithms-dga 
