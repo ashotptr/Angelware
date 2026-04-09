@@ -1217,10 +1217,6 @@ Post-session:
 
 ---
 
-25. Credential stuffing attacks: anatomy, detection, and defense - The Castle blog, 
-accessed March 12, 2026, 
-https://blog.castle.io/credential-stuffing-attacks-anatomy-detection-and-defens
-e/ 
 26. DGA Botnet Detection Using Supervised Learning Methods - 404 Not Found, 
 accessed March 12, 2026, 
 https://www.4o4notfound.org/pdf/DGA_Botnet_Detection_Using_Supervised_Lea
