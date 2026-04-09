@@ -146,7 +146,11 @@ start_fake_portal() {
 
 start_ids() {
     log "Starting IDS on victim VM ($VICTIM_IP)..."
-    bot_ssh_bg "$VICTIM_IP" "sudo pkill -f ids_detector.py; cd ~/lab && sudo nohup python3 ids_detector.py > /tmp/ids.log 2>&1"
+    # ids_detector.py writes alerts directly to /tmp/ids.log via its own
+    # _open_log_file() handler (opened at startup, line-buffered).
+    # Redirecting stdout to the same path would double every alert line,
+    # inflating collect_graph23_data.py --graph3 TPR measurements by 2x.
+    bot_ssh_bg "$VICTIM_IP" "sudo pkill -f ids_detector.py; cd ~/lab && sudo nohup python3 ids_detector.py > /dev/null 2>&1"
     sleep 3
     ok "IDS started"
 }

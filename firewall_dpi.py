@@ -68,10 +68,14 @@ PORT_BLOCK_RULES = [
     # In real deployment: use IP reputation list. Here: placeholder.
     ("OUTPUT",  "REJECT", "tcp",  "--dport 5000"),   # C2 server Flask port
 
-    # DGA countermeasure: rate-limit DNS queries
-    # Bots iterating DGA domains generate high NXDOMAIN volume
-    ("OUTPUT",  "DROP",   "udp",  "--dport 53 -m limit --limit 30/min --limit-burst 10 -j ACCEPT"),
+    # # DGA countermeasure: rate-limit DNS queries
+    # # Bots iterating DGA domains generate high NXDOMAIN volume
+    # ("OUTPUT",  "DROP",   "udp",  "--dport 53 -m limit --limit 30/min --limit-burst 10 -j ACCEPT"),
 ]
+# NOTE: DNS rate-limiting is handled by dns_rate_cmd in setup_firewall() below.
+# A malformed entry with -j ACCEPT embedded in the options string was removed —
+# it generated an invalid double-action iptables rule that iptables silently
+# rejected, giving a misleading "module unavailable" log message.
 
 # Rules that CANNOT stop Phase 2 (covert channel):
 # Port 443 HTTPS to github.com is indistinguishable from legitimate traffic.

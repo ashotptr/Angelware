@@ -418,7 +418,7 @@ curl -X POST http://192.168.100.10:5000/task \
 # Available task types and their type-specific optional fields:
 #
 #   "syn_flood"     — raw TCP SYN flood
-#   "udp_flood"     — raw UDP flood
+#   "udp_flood"     — raw UDP flood (target_port ignored — all impls randomize dst port)
 #   "slowloris"     — HTTP thread exhaustion
 #   "cryptojack"    — CPU burn simulation
 #                     extra: "cpu" float 0-1 (default 0.25)
@@ -496,7 +496,8 @@ python3 slowloris.py  # targets 192.168.100.20:80, 150 sockets, 60s
 
 # Monitor from victim VM:
 watch -n 1 "sudo ss -tn | grep :80 | wc -l"
-# You should see the count climb toward Apache's MaxRequestWorkers (default 150)
+# Apache 2.4 defaults to MaxRequestWorkers 256; 150 Slowloris sockets will
+# substantially degrade throughput but will not fully exhaust the thread pool
 ```
 
 ### 8.4 Cryptojacking
@@ -769,8 +770,9 @@ sudo PYTHONPATH="/home/vboxuser/.local/lib/python3.12/site-packages" \
 
 **Alert log file:** `ids_detector.py` writes every alert to `/tmp/ids.log` on the victim VM (in addition to stdout). This file is read by `collect_graph23_data.py --graph3` to count `CREDENTIAL STUFFING` detections when measuring TPR/FPR for Graph 3.
 
-- When running via `run_full_lab.sh`, stdout is already redirected to `/tmp/ids.log` by the orchestrator — the file is written twice (once by the direct open, once by the redirect), but both writes are append-only so no data is lost.
-- When running **standalone** for Graph 3 data collection, the log file is created automatically — no manual redirect needed.
+- When running via `run_full_lab.sh`, the orchestrator routes IDS stdout to `/dev/null` — `ids_detector.py` writes to `/tmp/ids.log` directly via its own file handler, so each alert is recorded exactly once. (An earlier design redirected stdout to the same path, writing every alert twice and doubling Graph 3 TPR counts.)
+- When running **standalone** for Graph 3 data collection, the log file is created automatically at startup — no manual redirect needed.
+- To suppress file logging entirely and use stdout only, set `IDS_LOG_FILE = None` at the top of `ids_detector.py`.
 - To tail alerts live: `tail -f /tmp/ids.log`
 - To count credential stuffing alerts fired so far: `grep -c "CREDENTIAL STUFFING" /tmp/ids.log`
 
@@ -1050,6 +1052,8 @@ python3 collect_graph23_data.py --graph3 --host 192.168.100.20 \
 
 > **Note:** single-run binary results are noisy at intermediate jitter levels. Run the sweep multiple times and average for smoother curves — the script prints a reminder at the end.
 
+> **Accuracy tip:** start `ids_detector.py` directly in a terminal on the victim VM (not via `run_full_lab.sh`) when collecting Graph 3 data. This gives live alert output in the terminal alongside the log file and avoids any dependency on the orchestrator's process management.
+
 Manual sweep (if you prefer to control each level):
 
 ```bash
@@ -1170,9 +1174,13 @@ Post-session:
 
 **`cred_stuffing` command parity:** The `cred_stuffing` P2P command is implemented in both `kademlia_p2p.c` (spawns `cred_stuffing.py` via `system()`) and `p2p_node.py` (inline loop with urllib). Both implementations accept the same six JSON fields — `target`, `port`, `duration`, `mode` (`"bot"` / `"jitter"` / `"distributed"`), `jitter`, `workers` — with identical defaults. The Phase 1 C2 server (`c2_server.py`) also forwards all these fields through the AES-encrypted task payload, so the operator's full parameterisation is preserved end-to-end across all three botnet phases.
 
-**IDS log file:** `ids_detector.py` writes every alert to `/tmp/ids.log` on the victim VM (in addition to stdout). The file is opened at startup so it exists before any attack begins. `collect_graph23_data.py --graph3` uses the portal's `GET /tarpit/status` endpoint as its primary detection proxy (HTTP-accessible from any VM), and falls back to reading the local log file path when run directly on the victim VM or when `--ids-log` is passed.
+**IDS log file:** `ids_detector.py` writes every alert to `/tmp/ids.log` on the victim VM (in addition to stdout). The file is opened at startup so it exists before any attack begins. `run_full_lab.sh` routes IDS stdout to `/dev/null` rather than to `/tmp/ids.log`, so each alert is written exactly once — an earlier design redirected stdout to the same path, doubling every entry and inflating Graph 3 TPR measurements by 2×. `collect_graph23_data.py --graph3` uses the portal's `GET /tarpit/status` endpoint as its primary detection proxy (HTTP-accessible from any VM), and falls back to reading the local log file path when run directly on the victim VM or when `--ids-log` is passed.
 
 **Portal reset endpoint:** `fake_portal.py` exposes `POST /attempts/reset` which clears the in-memory attempt log, tarpit stats, and optionally tarpit flags. `collect_graph23_data.py --graph3` calls this between jitter levels to ensure a clean measurement baseline for each sweep. The `attempt_log` list is now protected by `_stats_lock` in both the append (login handler) and clear (reset handler) paths.
+
+**`firewall_dpi.py` PORT_BLOCK_RULES:** A malformed entry that embedded `-j ACCEPT` inside the options string (causing iptables to see a double-action rule it rejected) has been removed. DNS rate-limiting is handled by the `dns_rate_cmd` variable in `setup_firewall()` and is unaffected.
+
+**`fake_portal.py` view_attempts thread safety:** The `/attempts` admin endpoint previously read `attempt_log` and `tarpit_stats` without holding `_stats_lock`, creating a data race with the login and reset handlers. The endpoint now snapshots all mutable state under the lock before building the JSON response.
 
 **`--phase` argument parsing:** `run_full_lab.sh` previously used `shift` inside a `for arg in "$@"` loop, which is a bash no-op — `$@` is snapshotted at loop start and `shift` does not advance the iterator. This meant `--phase 1` (space form) was silently ignored and the full lab always ran. The parser now uses `while [[ $# -gt 0 ]]; do ... shift; done` and both `--phase 1` and `--phase=1` forms work correctly. `--phase 1` also now runs `run_dpi_measurement` to collect Graph 1 data.
 
@@ -1202,7 +1210,7 @@ Post-session:
 
 **`dga_search` dispatch chain:** The three bot implementations dispatch `dga_search` differently, but produce identical observable IDS signals (a burst of NXDOMAIN responses).
 - `bot_agent.c` — `system("python3 dga.py &")` unconditionally; posts `"started"` result.
-- `kademlia_p2p.c` — same `system("python3 dga.py &")` call.
+- `kademlia_p2p.c` — same `system("python3 dga.py &")` call. **Both `bot_agent.c` and `kademlia_p2p.c` require the node process to be started from the lab directory (`~/lab`)** — `system()` inherits the working directory of the calling process, so launching from any other directory causes `python3 dga.py` to fail with "No such file or directory"; there is no visible error and the task silently posts `"started"` while dga.py never actually runs.
 - `p2p_node.py` — `_attack_dga_search()` first tries `from dga import bot_c2_search, generate_daily_domains` (direct in-process call, cleanest); if the module is not importable from the current working directory it falls back to `subprocess.Popen(["python3", "dga.py"])`. The stop-event is checked between domain resolution attempts so a subsequent `stop_all` command cancels the sweep cleanly.
 
 **Graph output directory:** `generate_graphs.py` saves PNGs to `./graphs/` by default (relative to the script). `run_full_lab.sh` overrides this to `/tmp/botnet_graphs/` via the inline Python call. Use `--out <path>` to set a custom directory when calling the script directly.

@@ -157,21 +157,31 @@ def login():
 @app.route("/attempts")
 def view_attempts():
     """Admin endpoint — inspect login log, tarpit stats, and flagged IPs."""
-    recent        = attempt_log[-200:]
-    flagged_ips   = tarpit_state.list_flagged() if TARPIT_ENABLED else []
-    tarpitted_log = [e for e in attempt_log if e.get("tarpitted")]
+    # Snapshot all mutable state under _stats_lock to avoid a data race with
+    # the login() and reset_attempts() handlers that write these structures.
+    with _stats_lock:
+        recent        = list(attempt_log[-200:])
+        tarpitted_log = [e for e in attempt_log if e.get("tarpitted")]
+        total         = len(attempt_log)
+        success_count = sum(1 for a in attempt_log if a["success"])
+        fail_count    = sum(1 for a in attempt_log if not a["success"])
+        ts_delayed    = tarpit_stats["total_delayed"]
+        ts_delay_sec  = round(tarpit_stats["total_delay_seconds"], 1)
+        recent_tp     = tarpitted_log[-50:]
+
+    flagged_ips = tarpit_state.list_flagged() if TARPIT_ENABLED else []
 
     return jsonify({
-        "total_attempts":       len(attempt_log),
+        "total_attempts":       total,
         "recent":               recent,
-        "success_count":        sum(1 for a in attempt_log if a["success"]),
-        "fail_count":           sum(1 for a in attempt_log if not a["success"]),
+        "success_count":        success_count,
+        "fail_count":           fail_count,
         "tarpit": {
-            "enabled":          TARPIT_ENABLED,
+            "enabled":           TARPIT_ENABLED,
             "currently_flagged": flagged_ips,
-            "total_delayed":    tarpit_stats["total_delayed"],
-            "total_delay_sec":  round(tarpit_stats["total_delay_seconds"], 1),
-            "recent_tarpitted": tarpitted_log[-50:],
+            "total_delayed":     ts_delayed,
+            "total_delay_sec":   ts_delay_sec,
+            "recent_tarpitted":  recent_tp,
         }
     })
 
