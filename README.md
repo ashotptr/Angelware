@@ -1217,10 +1217,6 @@ Post-session:
 
 ---
 
-24. ericyoc/gen_dga_regex_and_yara_rules_poc: A demonstration of domain 
-generation algorithm (DGA) and determing regular expression and yara rule for 
-each dga. - GitHub, accessed March 12, 2026, 
-https://github.com/ericyoc/gen_dga_regex_and_yara_rules_poc 
 25. Credential stuffing attacks: anatomy, detection, and defense - The Castle blog, 
 accessed March 12, 2026, 
 https://blog.castle.io/credential-stuffing-attacks-anatomy-detection-and-defens
