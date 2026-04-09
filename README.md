@@ -1222,11 +1222,7 @@ https://github.com/abd3lgh4f0r/C2_Server
 8.  https://github.com/Rjkumarkumawat/Advanced-Botnet-Implementation
 10. ahmedkhlief/Ninja: Open source C2 server created for stealth red team 
 operations - GitHub, accessed March 12, 2026, 
-https://github.com/ahmedkhlief/Ninja 
-12. Tracking Down Malicious Communication with Advanced XDR Detection Tactics - 
-Palo Alto Networks Blog, accessed March 12, 2026, 
-https://www.paloaltonetworks.com/blog/security-operations/tracking-down-mali
-cious-communication-with-advanced-xdr-detection-tactics/ 
+https://github.com/ahmedkhlief/Ninja
 13. martinkubecka/C2Detective: :mag: Application for detecting command and 
 control (C2) communication through network traffic analysis. - GitHub, accessed 
 March 12, 2026, https://github.com/martinkubecka/C2Detective 
