@@ -1217,9 +1217,7 @@ Post-session:
 
 ---
 
-27. faanross/spinnekop: a DNS (check-in) + HTTPS (data) hybrid C2 covert channel 
-inspired by Sunburst + DNS sandwich - GitHub, accessed March 12, 2026, 
-https://github.com/faanross/spinnekop 
+
 28. Understanding the Mirai Botnet - Google Research, accessed March 12, 2026, 
 https://research.google.com/pubs/archive/46301.pdf 
 29. Python Network Programming: Forging and Sniffing Packets with Scapy - 
