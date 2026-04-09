@@ -1219,10 +1219,7 @@ https://medium.com/maxwell-cross-python-for-red-teaming/building-a-custom-
 c2-server-in-python-a-fresh-take-on-offensive-security-e3d8c09bc2ab
 7.  abd3lgh4f0r/C2_Server - GitHub, accessed March 12, 2026, 
 https://github.com/abd3lgh4f0r/C2_Server 
-8.  Advanced Botnet Implementation — Complete Setup & README Guide | by 
-Rajkumar Kumawat | Medium, accessed March 12, 2026, 
-https://medium.com/@rajkumarkumawat/advanced-botnet-implementation-com
-plete-setup-readme-guide-fa7956ddc65d 
+8.  https://github.com/Rjkumarkumawat/Advanced-Botnet-Implementation
 9.  c2 · GitHub Topics, accessed March 12, 2026, 
 https://github.com/topics/c2?o=asc&s=stars 
 10. ahmedkhlief/Ninja: Open source C2 server created for stealth red team 
