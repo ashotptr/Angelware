@@ -1223,10 +1223,6 @@ https://github.com/abd3lgh4f0r/C2_Server
 10. ahmedkhlief/Ninja: Open source C2 server created for stealth red team 
 operations - GitHub, accessed March 12, 2026, 
 https://github.com/ahmedkhlief/Ninja 
-11. Malware leveraging public infrastructure like GitHub on the rise - ReversingLabs, 
-accessed March 12, 2026, 
-https://www.reversinglabs.com/blog/malware-leveraging-public-infrastructure-lik
-e-github-on-the-rise 
 12. Tracking Down Malicious Communication with Advanced XDR Detection Tactics - 
 Palo Alto Networks Blog, accessed March 12, 2026, 
 https://www.paloaltonetworks.com/blog/security-operations/tracking-down-mali
