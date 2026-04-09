@@ -1217,10 +1217,6 @@ Post-session:
 
 ---
 
-26. DGA Botnet Detection Using Supervised Learning Methods - 404 Not Found, 
-accessed March 12, 2026, 
-https://www.4o4notfound.org/pdf/DGA_Botnet_Detection_Using_Supervised_Lea
-rning_Methods.pdf 
 27. faanross/spinnekop: a DNS (check-in) + HTTPS (data) hybrid C2 covert channel 
 inspired by Sunburst + DNS sandwich - GitHub, accessed March 12, 2026, 
 https://github.com/faanross/spinnekop 
