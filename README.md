@@ -1280,10 +1280,6 @@ Post-session:
 
 ---
 
-36. Kimwolf Botnet Risks for Enterprises and Institutions - Infoblox, accessed March 
-12, 2026, 
-https://www.infoblox.com/blog/threat-intelligence/kimwolf-howls-from-inside-th
-e-enterprise/ 
 37. Mirai botnet evolution since its source code is available online | Infosec, accessed 
 March 12, 2026, 
 https://www.infosecinstitute.com/resources/malware-analysis/mirai-botnet-evolu
