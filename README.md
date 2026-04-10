@@ -1280,9 +1280,6 @@ Post-session:
 
 ---
 
-30. Breaking Down Mirai: An IoT DDoS Botnet Analysis - Imperva, Inc., accessed 
-March 12, 2026, 
-https://www.imperva.com/blog/malware-analysis-mirai-ddos-botnet/ 
 31. Understanding the MIRAI botnet: scanning process, infection method and key 
 features - CNR-IRIS, accessed March 12, 2026, 
 https://iris.cnr.it/retrieve/c8af9fa9-4172-4fa2-9a86-18d019eb7f8b/prod_482082-d
