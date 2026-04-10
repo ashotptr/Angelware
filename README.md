@@ -1280,10 +1280,6 @@ Post-session:
 
 ---
 
-38. Slowloris Attack: A Guided Simulation | by Alex Perrakis | Medium, accessed 
-March 12, 2026, 
-https://medium.com/@alexperrakis/slowloris-attack-a-guided-simulation-and-eff
-ective-defense-strategies-7f4ae3660b60 
 39. What is a Slowloris DDoS Attack and How Does it Work? - Indusface, accessed 
 March 12, 2026, https://www.indusface.com/blog/what-is-slowloris/ 
 40. Slowloris DDoS attack - Cloudflare, accessed March 12, 2026, 
