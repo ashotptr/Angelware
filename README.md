@@ -1280,8 +1280,6 @@ Post-session:
 
 ---
 
-33. Mirai (malware) - Wikipedia, accessed March 12, 2026, 
-https://en.wikipedia.org/wiki/Mirai_(malware) 
 34. What is the Aisuru-Kimwolf botnet? - Cloudflare, accessed March 12, 2026, 
 https://www.cloudflare.com/learning/ddos/glossary/aisuru-kimwolf-botnet/ 
 35. Researchers Null-Route Over 550 Kimwolf and Aisuru Botnet Command Servers - 
