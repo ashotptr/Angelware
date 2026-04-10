@@ -1280,10 +1280,6 @@ Post-session:
 
 ---
 
-31. Understanding the MIRAI botnet: scanning process, infection method and key 
-features - CNR-IRIS, accessed March 12, 2026, 
-https://iris.cnr.it/retrieve/c8af9fa9-4172-4fa2-9a86-18d019eb7f8b/prod_482082-d
-oc_198344.pdf 
 32. Measuring the Difficulty and User Experience of Remediating Persistent IoT 
 Malware - arXiv, accessed March 12, 2026, https://arxiv.org/pdf/2203.01683 
 33. Mirai (malware) - Wikipedia, accessed March 12, 2026, 
