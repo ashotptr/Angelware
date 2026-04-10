@@ -1280,8 +1280,6 @@ Post-session:
 
 ---
 
-34. What is the Aisuru-Kimwolf botnet? - Cloudflare, accessed March 12, 2026, 
-https://www.cloudflare.com/learning/ddos/glossary/aisuru-kimwolf-botnet/ 
 35. Researchers Null-Route Over 550 Kimwolf and Aisuru Botnet Command Servers - 
 The Hacker News, accessed March 12, 2026, 
 https://thehackernews.com/2026/01/kimwolf-botnet-infected-over-2-million.html 
