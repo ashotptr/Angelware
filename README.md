@@ -35,7 +35,7 @@
 | Side | What | Language |
 |------|------|----------|
 | Offensive | C2 server, bot agents, DDoS payloads, IoT propagation scanner, P2P mesh | C + Python |
-| Defensive | IDS (3 engines), Cowrie honeypot, DPI engine, host-based monitor | Python (Scapy, psutil) |
+| Defensive | IDS (4 engines + host monitor), Cowrie honeypot, DPI engine, tarpitting | Python (Scapy, psutil) |
 | Research | 3 quantitative graphs, NIST IR report, MITRE ATT&CK mapping | Python (matplotlib) |
 
 ---
@@ -59,7 +59,7 @@ IV      = MD5(nonce_string)             # nonce = "%Y-%m-%d-%H-%M"
 
 ### Phase 2 — Hierarchical Covert Channel
 
-The bot polls a "dead drop" server simulating a GitHub raw file. A bot making HTTPS requests to `192.168.100.10:5001/dead_drop` is indistinguishable from a developer reading a README. Commands are AES-CBC encrypted and embedded in HTML comment markers:
+The bot polls a "dead drop" server. In **lab mode** (default), the bot makes plain HTTP GET requests to `192.168.100.10:5001/dead_drop` — unencrypted, to a local IP. In **production threat-model mode**, `DEAD_DROP_URL` is set to a real GitHub Gist raw URL, at which point the bot makes HTTPS requests to `raw.githubusercontent.com` that are genuinely indistinguishable from a developer reading a README (same port 443, same TLS fingerprint, same domain reputation). Commands are AES-CBC encrypted and embedded in HTML comment markers:
 
 ```
 <!-- CMD:<base64_blob>:CMD -->
@@ -88,7 +88,7 @@ seed = f"{date}-{i}"
 domain = sha256(seed)[:10 chars mapped to a-z] + tld_rotation
 ```
 
-The IDS detects this via: (1) burst of NXDOMAIN responses (≥10 in 30s), (2) Shannon entropy scoring (H > 3.8 bits/char triggers alert).
+The IDS detects this via two independent alert paths: (1) **NXDOMAIN burst** — ≥10 NXDOMAIN responses from one IP in 30s fires Engine 3 HIGH alert; (2) **high-entropy query burst** — ≥5 domain queries with H > 3.8 bits/char from one IP in 30s fires Engine 3 MED alert. Both paths write to the alert log; the entropy path catches DGA before NXDOMAIN responses even arrive (useful when DNS is slow).
 
 ### Payload Suite
 
@@ -130,19 +130,31 @@ botnet_lab/
 ├── c2_server.py         Phase 1 Flask C2: /register, /heartbeat, /task,
 │                        AES-128-CBC task encryption, per-bot task queues
 ├── covert_bot.py        Phase 2 covert bot + dead-drop server simulator.
-│                        JA3 mimicry, AES-CBC commands, DGA fallback
+│                        Lab default: plain HTTP GET to 192.168.100.10:5001/dead_drop.
+│                        Production mode: HTTPS to real GitHub Gist raw URL
+│                        (set DEAD_DROP_URL; HTTPS + JA3 mimicry make it indistinguishable
+│                        from a developer browsing GitHub). AES-CBC commands, DGA fallback.
 ├── p2p_node.py          Phase 3 Kademlia DHT in Python (full implementation,
 │                        command execution, resilience demo)
 ├── dga.py               DGA module: strftime seed, SHA-256 domain generation,
 │                        Shannon entropy analysis, NXDOMAIN burst simulation
-├── slowloris.py         Slowloris: 150-socket pool, drip loop, auto-refill
+├── slowloris.py         Slowloris: 150-socket pool, keep-alive header drip loop,
+│                        auto-refill of dropped connections
 ├── cryptojack_sim.py    Cryptojacking simulator: duty-cycle CPU throttle,
 │                        psutil idle detection, process name spoof
-├── cred_stuffing.py     Credential stuffing: bot/jitter/distributed modes,
+├── cred_stuffing.py     Credential stuffing: bot/jitter/distributed/human modes,
 │                        CV timing analysis, human baseline comparison
 ├── fake_portal.py       Credential stuffing target: Flask /login + /attempts
-├── ids_detector.py      3-engine IDS: volumetric (SYN/UDP), behavioral CV
-│                        timing, DNS/DGA entropy; + host-based ghost/CPU monitor
+│                        + tarpit integration + /tarpit/status (exposes
+│                        total_flag_events counter for race-free Graph 3 measurement)
+├── ids_detector.py      4-engine IDS + host monitor:
+│                        Engine 1 — volumetric (SYN/UDP flood)
+│                        Engine 2 — behavioral CV timing (credential stuffing)
+│                                   + tarpit feedback loop
+│                        Engine 3 — DNS/DGA: NXDOMAIN burst AND high-entropy
+│                                   query burst (both fire IDS alerts)
+│                        Engine 4 — DPI/covert channel (repeated HTTPS polling)
+│                        Host    — ghost process + name spoof + CPU spike
 ├── firewall_dpi.py      iptables egress rules + Scapy DPI: SNI extraction,
 │                        Slowloris detection, TTD measurement for Graph 1
 ├── honeypot_setup.py    Cowrie setup, iptables redirect, MITRE ATT&CK log
@@ -154,11 +166,14 @@ botnet_lab/
 ├── collect_graph23_data.py  Week 7 automated data collection helper.
 │                        --graph2: interactive wipe-cycle MTBI recorder (victim VM).
 │                        --graph3: automated jitter sweep → TPR/FPR (bot VM).
+│                        Uses total_flag_events (race-free) as primary detection proxy.
+│                        Human baseline runs 60s (not 30s) for sufficient CV data.
 │                        Writes graph2_measured_data.json + graph3_measured_data.json.
 ├── tarpit_state.py      IDS → portal shared state for credential-stuffing tarpitting.
 │                        JSON-file IPC (/tmp/tarpit_state.json); TTL = 300s.
+│                        Tracks total_flag_events counter (cumulative, survives TTL expiry).
 │                        CLI: python3 tarpit_state.py [list | flag <ip> |
-│                             unflag <ip> | clear]
+│                             unflag <ip> | clear | count]
 ├── run_full_lab.sh      Master orchestration script — runs everything at once
 └── README.md            This file
 ```
@@ -562,6 +577,11 @@ sudo ./mirai_scanner
 #   6. rm -f /tmp/.x             → T1070.004
 ```
 
+> **Note:** `mirai_scanner.c` hard-skips IPs `.10`, `.11`, and `.12` in the scan loop
+> to avoid scanning the C2 and bot VMs. The scanner targets `.1`–`.30` (excluding those
+> three), so only `192.168.100.20` (the victim) will have Cowrie listening.
+> If you add a third bot VM at a different address (e.g. `.13`), it will be scanned.
+
 ### 8.8 Phase 2 — Covert Channel
 
 ```bash
@@ -757,7 +777,7 @@ will fail to decrypt subsequent messages and drop out of the mesh.
 
 ## 9. Defensive Systems Reference
 
-### 9.1 IDS (3 engines)
+### 9.1 IDS (4 engines + host monitor)
 
 ```bash
 # Victim VM: start IDS (run before any attack)
@@ -776,6 +796,14 @@ sudo PYTHONPATH="/home/vboxuser/.local/lib/python3.12/site-packages" \
 - To tail alerts live: `tail -f /tmp/ids.log`
 - To count credential stuffing alerts fired so far: `grep -c "CREDENTIAL STUFFING" /tmp/ids.log`
 
+> **Graph 3 detection proxy note:** `collect_graph23_data.py` does **not** rely solely on
+> the IDS log for detection. Its primary proxy is `GET /tarpit/status` →
+> `stats.total_flag_events` — a counter that increments the instant IDS Engine 2 calls
+> `tarpit_state.flag()`, before the portal has served a single delayed response. This
+> eliminates the race condition where a short bot run ends before the portal can increment
+> `total_delayed`. The log file (`/tmp/ids.log`) is only used as a fallback when running
+> directly on the victim VM.
+
 **Engine 1 — Volumetric** (SYN/UDP flood detection):
 - Alert triggers when SYN packets from one IP exceed **100/second** in a 1-second window
 - UDP alert triggers at **200 packets/second**
@@ -785,18 +813,23 @@ sudo PYTHONPATH="/home/vboxuser/.local/lib/python3.12/site-packages" \
 - Computes CV = σ/μ over a 20-request sliding window
 - Alert triggers when `CV < 0.15` (bot-like rigid timing)
 - Human users have CV typically > 0.5
-- **Tarpit feedback:** on confirmed bot (CV < 0.15), the source IP is automatically flagged in `tarpit_state.json`; `fake_portal.py` then delays all responses to that IP by 8 ± 2 seconds
+- **Tarpit feedback:** on confirmed bot (CV < 0.15), the source IP is automatically flagged in `tarpit_state.json`; `fake_portal.py` then delays all responses to that IP by 8 ± 2 seconds; `tarpit_state.get_flag_count()` is incremented immediately
 - **Auto-unblock:** if a flagged IP is silent for 120 seconds (bot finished or switched IP), the tarpit flag is automatically removed
 
-**Engine 3 — DNS/DGA entropy** (DGA detection):
-- Counts NXDOMAIN responses per source IP in a 30-second window
-- Alert triggers at **10 NXDOMAINs in 30s**
-- Also scores domain names by Shannon entropy H(X) = −Σ P(xᵢ) log₂ P(xᵢ)
-- Alert triggers when H > **3.8 bits/char** (raised from 4.0 in docs to catch more DGA)
+**Engine 3 — DNS/DGA detection** (two independent alert triggers):
+- **NXDOMAIN burst:** counts NXDOMAIN responses per source IP in a 30-second window; alert (HIGH) triggers at **≥10 NXDOMAINs in 30s**
+- **High-entropy query burst:** scores domain name labels by Shannon entropy H(X) = −Σ P(xᵢ) log₂ P(xᵢ); alert (MED) triggers when one IP queries **≥5 high-entropy domains (H > 3.8) in 30s** — this path fires even before NXDOMAIN responses arrive (useful when DNS is slow or the DGA run is short)
+- Both triggers include sample domains with entropy scores in the alert message
+- Both write to `/tmp/ids.log` so both are counted by Graph 3 measurement
+
+**Engine 4 — DPI/Covert channel** (repeated HTTPS polling):
+- Tracks HTTPS SYN connections per (source IP, destination IP) pair in a 60-second window
+- Alert (MED) triggers at **≥10 HTTPS connections to the same destination in 60s**
 
 **Host-based engine** (cryptojacking + ghost process):
 - Checks every 5 seconds for processes with `(deleted)` in `/proc/[pid]/exe` (memory-resident malware)
 - Flags any non-system process sustaining **≥85% CPU** per core
+- Detects process name spoofing: `/proc/pid/comm` ≠ exe basename
 
 ### 9.2 DPI Engine (Graph 1 data collection)
 
@@ -844,17 +877,18 @@ Rather than blocking suspected credential-stuffing bots outright (which reveals 
 IDS Engine 2 detects CV < 0.15
     → calls tarpit_state.flag(src_ip)
         → writes timestamp to /tmp/tarpit_state.json  (TTL = 300s)
+        → increments tarpit_state.total_flag_events (persisted, survives TTL expiry)
             → fake_portal.py checks is_flagged(src_ip) on every /login request
                 → flagged IPs receive time.sleep(8 ± 2s) before any response
                 → legitimate IPs (high CV) see no delay
 ```
 
-**Auto-unblock:** `ids_detector.py` monitors login-request timestamps per IP. If a flagged IP goes silent for 120 seconds (bot finished its run or switched IP), the flag is automatically removed.
+**Auto-unblock:** `ids_detector.py` monitors login-request timestamps per IP. If a flagged IP goes silent for 120 seconds (bot finished its run or switched IP), the flag is automatically removed. The `total_flag_events` counter is **not** decremented on unblock — it is a cumulative history of all detections this session, reset only by `clear_all()`.
 
 **`tarpit_state.py` CLI:**
 
 ```bash
-# List all currently flagged IPs
+# List all currently flagged IPs (and cumulative event count)
 python3 tarpit_state.py list
 
 # Manually flag an IP (e.g. from a separate detection script)
@@ -863,14 +897,18 @@ python3 tarpit_state.py flag 192.168.100.11
 # Remove a flag early (before TTL expiry)
 python3 tarpit_state.py unflag 192.168.100.11
 
-# Wipe all entries (post-session cleanup)
+# Wipe all entries and reset cumulative counter (post-session cleanup)
 python3 tarpit_state.py clear
+
+# Show just the cumulative total_flag_events count
+python3 tarpit_state.py count
 ```
 
 **`fake_portal.py` REST endpoints** (admin/debug use):
 
 ```bash
 # Flag an IP via HTTP (alternative to IDS file-based signalling)
+# Also increments total_flag_events so Graph 3 measurement still works.
 curl -X POST http://192.168.100.20/tarpit/flag \
      -H "Content-Type: application/json" \
      -d '{"ip":"192.168.100.11"}'
@@ -880,24 +918,33 @@ curl -X POST http://192.168.100.20/tarpit/unflag \
      -H "Content-Type: application/json" \
      -d '{"ip":"192.168.100.11"}'
 
-# Inspect tarpit state (flagged IPs, delay stats, total delayed count)
+# Inspect tarpit state.
+# stats.total_flag_events = race-free Graph 3 detection counter (use this for TPR)
+# stats.total_delayed     = requests actually delayed (legacy, race-prone)
 curl http://192.168.100.20/tarpit/status | python3 -m json.tool
 
-# Reset the in-memory attempt log and tarpit stats between measurement windows.
-# Used by collect_graph23_data.py --graph3 before each jitter-level sweep.
-# Optional: "clear_tarpit":true also wipes /tmp/tarpit_state.json.
+# Reset the in-memory attempt log, tarpit stats, and total_flag_events
+# between measurement windows. Also wipes /tmp/tarpit_state.json when
+# clear_tarpit is true (required for accurate Graph 3 per-level measurement).
 curl -X POST http://192.168.100.20/attempts/reset \
      -H "Content-Type: application/json" \
      -d '{"clear_tarpit":true}'
 # Returns: {"status":"reset","cleared_tarpit":true}
 ```
 
+> **Tarpit dependency for Graph 3:** `fake_portal.py` must be started from `~/lab/`
+> where `tarpit_state.py` exists, so that `TARPIT_ENABLED = True` inside the portal.
+> If it starts with `TARPIT_ENABLED = False`, Engine 2 cannot call `tarpit_state.flag()`
+> and `total_flag_events` will always be 0 — all TPR readings will show 0% regardless
+> of whether the IDS actually fired. Verify with:
+> `curl http://192.168.100.20/tarpit/status | python3 -c "import sys,json; d=json.load(sys.stdin); print('Tarpit enabled:', d['enabled'])"`
+
 **Configuration** (edit `tarpit_state.py` constants to tune):
 
 | Constant | Default | Effect |
 |---|---|---|
 | `STATE_FILE` | `/tmp/tarpit_state.json` | Shared between IDS and portal |
-| `TTL_SECONDS` | `300` | Flag expires after 5 minutes |
+| `TTL_SECONDS` | `300` | Per-IP flag expires after 5 minutes |
 | `TARPIT_DELAY` | `8.0` | Seconds of sleep per flagged request |
 | `TARPIT_JITTER` | `2.0` | ±jitter on delay to avoid timing fingerprint |
 
@@ -1040,9 +1087,9 @@ python3 collect_graph23_data.py --graph3 --host 192.168.100.20
 ```
 
 **How alert detection works across VMs:**
-`ids_detector.py` runs on the victim VM and writes its alerts to `/tmp/ids.log` there — a file the bot VM cannot access directly. The script therefore uses the portal's `GET /tarpit/status` endpoint as its detection proxy: when Engine 2 fires it calls `tarpit_state.flag(src_ip)`, which increments the `total_delayed` counter visible via HTTP. An increase in that counter between the start and end of a jitter sweep means the IDS fired.
+`ids_detector.py` runs on the victim VM. When Engine 2 fires, it calls `tarpit_state.flag(src_ip)`, which immediately increments the persistent `total_flag_events` counter in `/tmp/tarpit_state.json`. The portal exposes this counter via `GET /tarpit/status → stats.total_flag_events`. `collect_graph23_data.py` reads this counter as its **primary detection proxy** — it increments the instant the IDS flags the IP, not only when the portal serves a delayed response, eliminating the race condition where a short bot run ends before any delayed response is processed.
 
-If you run `collect_graph23_data.py` directly on the victim VM (or have the log bind-mounted), the local file is also read as a fallback:
+If you run `collect_graph23_data.py` directly on the victim VM (or have the log bind-mounted), the local IDS log file is used as a fallback:
 
 ```bash
 # Running on the victim VM itself — file is local, use it directly:
@@ -1050,29 +1097,41 @@ python3 collect_graph23_data.py --graph3 --host 192.168.100.20 \
     --ids-log /tmp/ids.log
 ```
 
+> **Prerequisite check:** before starting the sweep, verify the portal has tarpit enabled:
+> ```bash
+> curl -s http://192.168.100.20/tarpit/status | python3 -c \
+>   "import sys,json; d=json.load(sys.stdin); print('Tarpit enabled:', d['enabled'])"
+> # Must print: Tarpit enabled: True
+> ```
+> If it prints `False`, tarpit_state.py is not importable by the portal. Start
+> `fake_portal.py` from `~/lab/` where `tarpit_state.py` exists, then retry.
+
 > **Note:** single-run binary results are noisy at intermediate jitter levels. Run the sweep multiple times and average for smoother curves — the script prints a reminder at the end.
 
 > **Accuracy tip:** start `ids_detector.py` directly in a terminal on the victim VM (not via `run_full_lab.sh`) when collecting Graph 3 data. This gives live alert output in the terminal alongside the log file and avoids any dependency on the orchestrator's process management.
 
+> **Human baseline duration:** The automated sweep runs the human baseline for **60 seconds** (not 30). Human mode uses Gaussian delays around 3 seconds, so only ~10 requests complete in 30s — not enough for Engine 2 to evaluate CV. 60 seconds yields ~20 requests, sufficient for a reliable FPR reading.
+
 Manual sweep (if you prefer to control each level):
 
 ```bash
-# On victim VM — start IDS first:
+# On victim VM — start IDS and portal first (from ~/lab/):
 sudo python3 ids_detector.py &
+sudo python3 fake_portal.py &
 
 for JITTER in 0 50 100 200 350 500 750 1000; do
-    # Reset portal baseline before each run
+    # Reset portal baseline before each run (wipes flag counter too)
     curl -s -X POST http://192.168.100.20/attempts/reset \
          -H "Content-Type: application/json" -d '{"clear_tarpit":true}'
-    # Snapshot tarpit counter before run
+    # Snapshot race-free flag counter before run
     BEFORE=$(curl -s http://192.168.100.20/tarpit/status | python3 -c \
-             "import sys,json; d=json.load(sys.stdin); print(d['stats']['total_delayed'])")
+             "import sys,json; d=json.load(sys.stdin); print(d['stats'].get('total_flag_events', d['stats']['total_delayed']))")
     # Run bot traffic from bot VM for 30s
     python3 cred_stuffing.py --mode jitter --interval 500 --jitter $JITTER &
     sleep 30; kill %1; sleep 5
     # Snapshot counter after run
     AFTER=$(curl -s http://192.168.100.20/tarpit/status | python3 -c \
-            "import sys,json; d=json.load(sys.stdin); print(d['stats']['total_delayed'])")
+            "import sys,json; d=json.load(sys.stdin); print(d['stats'].get('total_flag_events', d['stats']['total_delayed']))")
     echo "Jitter ±${JITTER}ms range (~$((JITTER * 577 / 1000))ms eff-stddev) — IDS fired: $([[ $AFTER -gt $BEFORE ]] && echo YES || echo NO)"
 done
 ```
@@ -1172,11 +1231,11 @@ Post-session:
 
 **P2P demo size:** Both `kademlia_p2p.c --demo` and `p2p_node.py --demo` run a **5-node** local mesh and kill 2 of them (40%) to demonstrate resilience. Earlier documentation referred to a "3-node demo" — that was the original design; the final implementation was upgraded to 5 nodes for a more convincing resilience test.
 
-**`cred_stuffing` command parity:** The `cred_stuffing` P2P command is implemented in both `kademlia_p2p.c` (spawns `cred_stuffing.py` via `system()`) and `p2p_node.py` (inline loop with urllib). Both implementations accept the same six JSON fields — `target`, `port`, `duration`, `mode` (`"bot"` / `"jitter"` / `"distributed"`), `jitter`, `workers` — with identical defaults. The Phase 1 C2 server (`c2_server.py`) also forwards all these fields through the AES-encrypted task payload, so the operator's full parameterisation is preserved end-to-end across all three botnet phases.
+**`cred_stuffing` command parity:** The `cred_stuffing` P2P command is implemented in both `kademlia_p2p.c` (spawns `cred_stuffing.py` via `system()`) and `p2p_node.py` (tries `cred_stuffing.py` subprocess first; falls back to an inline loop using `urllib.request` from the standard library — **not** the `requests` third-party library). Both implementations accept the same six JSON fields — `target`, `port`, `duration`, `mode` (`"bot"` / `"jitter"` / `"distributed"`), `jitter`, `workers` — with identical defaults. The Phase 1 C2 server (`c2_server.py`) also forwards all these fields through the AES-encrypted task payload, so the operator's full parameterisation is preserved end-to-end across all three botnet phases.
 
-**IDS log file:** `ids_detector.py` writes every alert to `/tmp/ids.log` on the victim VM (in addition to stdout). The file is opened at startup so it exists before any attack begins. `run_full_lab.sh` routes IDS stdout to `/dev/null` rather than to `/tmp/ids.log`, so each alert is written exactly once — an earlier design redirected stdout to the same path, doubling every entry and inflating Graph 3 TPR measurements by 2×. `collect_graph23_data.py --graph3` uses the portal's `GET /tarpit/status` endpoint as its primary detection proxy (HTTP-accessible from any VM), and falls back to reading the local log file path when run directly on the victim VM or when `--ids-log` is passed.
+**IDS log file:** `ids_detector.py` writes every alert to `/tmp/ids.log` on the victim VM (in addition to stdout). The file is opened at startup so it exists before any attack begins. `run_full_lab.sh` routes IDS stdout to `/dev/null` rather than to `/tmp/ids.log`, so each alert is written exactly once — an earlier design redirected stdout to the same path, doubling every entry and inflating Graph 3 TPR measurements by 2×. `collect_graph23_data.py --graph3` uses the portal's `GET /tarpit/status → stats.total_flag_events` as its **primary detection proxy** — this counter increments the instant IDS Engine 2 calls `tarpit_state.flag()`, eliminating the race condition where a bot run ends before the portal serves a delayed response. The local log file (`/tmp/ids.log`) is only used as a fallback when running directly on the victim VM or when `--ids-log` is passed.
 
-**Portal reset endpoint:** `fake_portal.py` exposes `POST /attempts/reset` which clears the in-memory attempt log, tarpit stats, and optionally tarpit flags. `collect_graph23_data.py --graph3` calls this between jitter levels to ensure a clean measurement baseline for each sweep. The `attempt_log` list is now protected by `_stats_lock` in both the append (login handler) and clear (reset handler) paths.
+**Portal reset endpoint:** `fake_portal.py` exposes `POST /attempts/reset` which clears the in-memory attempt log, tarpit stats (including `total_flag_events`), and optionally tarpit flags via `clear_tarpit: true`. `collect_graph23_data.py --graph3` always calls this with `clear_tarpit: true` between jitter levels to ensure a clean measurement baseline. The `attempt_log` list and `tarpit_stats` dict are protected by `_stats_lock` in the append (login handler), clear (reset handler), and read (`/attempts` and `/tarpit/status`) paths.
 
 **`firewall_dpi.py` PORT_BLOCK_RULES:** A malformed entry that embedded `-j ACCEPT` inside the options string (causing iptables to see a double-action rule it rejected) has been removed. DNS rate-limiting is handled by the `dns_rate_cmd` variable in `setup_firewall()` and is unaffected.
 
@@ -1198,11 +1257,15 @@ Post-session:
 - `kademlia_p2p.c` — calls `rotate_p2p_key(new_secret)`, which acquires a write lock on `g_key_rwlock`, SHA-256s the new secret into `g_key_hash`, then releases the lock. All concurrent `xor_cipher()` calls hold a read lock, so there is no window where a message is encrypted with a partially-written key.
 - `p2p_node.py` — reassigns the module-level `SHARED_SECRET` global; `decode_command()` and `encode_command()` resolve `SHARED_SECRET` at call time (not at definition time) so the change takes effect on the next poll cycle.
 
+**Slowloris drip mechanism:** Both the C (`bot_agent.c`, `kademlia_p2p.c`) and Python (`slowloris.py`, `covert_bot.py`) Slowloris implementations drip one complete keep-alive HTTP header line (`X-a: <random>\r\n`) per socket every SLOWLORIS_INTERVAL seconds. The attack does **not** drip a single byte at a time (that description is sometimes used colloquially in Slowloris write-ups). The key property is that the HTTP request is never *completed* — the final blank line (`\r\n\r\n`) terminating the header block is never sent, so Apache holds the thread open indefinitely waiting for the rest of the headers.
+
 **Bot agent v3:** `bot_agent.c` dispatches all five payload types. SYN flood and UDP flood are implemented natively in C with raw sockets; Slowloris is a pure C implementation maintaining a 150-socket pool with dead-socket refill; cryptojacking uses a duty-cycle SHA-256 burn loop with `/proc/self/comm` name spoofing via `prctl(PR_SET_NAME)`; credential stuffing and DGA search spawn the Python modules via `system()`.
 
 **`/result` reporting — Phase 1 C bots:** `bot_agent.c` now posts task outcomes back to `POST /result` on the C2 server after each command completes. Synchronous attacks (`syn_flood`, `udp_flood`) post `"status":"completed"` after the blocking call returns. Asynchronous attacks that run in detached threads (`slowloris`, `cryptojack`) and subprocess-delegated commands (`cred_stuffing`, `dga_search`) post `"status":"started"` immediately after the thread or process is launched. Key-rotation responses report `"status":"key_rotated"` or `"status":"rejected_too_short"`. The C2 server's `/result` endpoint logs the payload and returns `{"status":"received"}`; the operator can `tail /tmp/c2_server.log` to monitor task outcomes across all registered bots.
 
-**Dead drop — lab vs real GitHub Gist:** `covert_bot.py` ships with `DEAD_DROP_URL` pointing to the local Flask server (`http://192.168.100.10:5001/dead_drop`). To use a real GitHub Gist (the production threat model), set `DEAD_DROP_URL` to the raw Gist URL and use `python3 covert_bot.py gist '<json>'` to push commands via the GitHub API. The bot's parsing and AES decryption are identical in both modes. The `gist` CLI mode requires `GIST_ID` and `GITHUB_TOKEN` environment variables; credentials must never be committed to the repository.
+**Dead drop — lab vs real GitHub Gist:** `covert_bot.py` ships with `DEAD_DROP_URL` pointing to the local Flask server (`http://192.168.100.10:5001/dead_drop`). This is plain HTTP to a local IP; TLS/JA3 mimicry is irrelevant at this URL. To use a real GitHub Gist (the production threat model), set `DEAD_DROP_URL` to the raw Gist URL — at that point the bot makes HTTPS requests to `raw.githubusercontent.com`, and the JA3 mimicry (Chrome 120 cipher suite order) becomes meaningful. Use `python3 covert_bot.py gist '<json>'` to push commands via the GitHub API. The bot's parsing and AES decryption are identical in both modes. The `gist` CLI mode requires `GIST_ID` and `GITHUB_TOKEN` environment variables; credentials must never be committed to the repository.
+
+**`tarpit_state.py` race-free detection counter:** `tarpit_state.flag(ip)` now also increments a persistent `total_flag_events` integer stored inside `tarpit_state.json`. Unlike the per-IP timestamp entries which expire after `TTL_SECONDS`, this counter is cumulative — it survives TTL expiry and is only reset by `clear_all()`. `fake_portal.py` exposes it in `GET /tarpit/status → stats.total_flag_events`. Because this counter increments at the moment of detection (not at the moment a delayed response is served), it eliminates the race condition in Graph 3 TPR measurement where a short bot run ends before the portal processes any delayed request. `collect_graph23_data.py` reads `total_flag_events` as its primary detection proxy, falling back to `total_delayed` for older portal versions that lack it.
 
 **AES key rotation:** `c2_server.py` now exposes `POST /rotate_key` (requires `X-Auth-Token`). It encrypts an `update_secret` task with the current key, queues it for every registered bot, then switches the server to the new key atomically. The dead-drop server exposes the equivalent `POST /push_key` and the `python3 covert_bot.py rotate <secret>` shortcut. Both must be called with the same new secret; after one heartbeat/poll cycle all bots have switched. Servers must be restarted (or the `_current_secret` updated in process) to persist the new key across restarts.
 

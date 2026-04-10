@@ -6,12 +6,20 @@
  Environment: ISOLATED VM LAB ONLY
 ====================================================
 
-Three detection engines + host-based monitor:
-  Engine 1 - Volumetric:  SYN flood, UDP flood
-  Engine 2 - Behavioral:  Credential stuffing (CV timing)
+Three detection engines + covert-channel monitor + host-based monitor:
+  Engine 1 - Volumetric:      SYN flood, UDP flood
+  Engine 2 - Behavioral:      Credential stuffing (CV timing)
               ↳ NEW: flags confirmed bots in tarpit_state.json
                      so fake_portal.py slows their responses
-  Engine 3 - DNS Anomaly: DGA detection via entropy + NXDOMAIN burst
+  Engine 3 - DNS Anomaly:     DGA detection via entropy + NXDOMAIN burst
+              ↳ Alert fires on EITHER:
+                  (a) ≥ HIGH_ENTROPY_BURST high-entropy domain queries
+                      from one IP within DNS_WINDOW, OR
+                  (b) ≥ NXDOMAIN_BURST NXDOMAIN responses from one IP
+                      within DNS_WINDOW
+              Both paths write to the alert log so Graph 3 TPR
+              measurement via collect_graph23_data.py works correctly.
+  Engine 4 - DPI/Covert:      Repeated HTTPS polling → dead-drop detection
   Host      - Cryptojacking / ghost-process (deleted exe, high CPU)
 
 TARPIT INTEGRATION:
@@ -60,14 +68,13 @@ CRED_WINDOW          = 20     # requests to analyze for timing analysis
 CV_BOT_THRESHOLD     = 0.15   # CV below this = bot timing detected
 DGA_ENTROPY_THRESH   = 3.8    # Shannon entropy > this = suspicious domain
 NXDOMAIN_BURST       = 10     # NXDOMAIN count per 30s window before alert
+HIGH_ENTROPY_BURST   = 5      # high-entropy queries per 30s window before alert
 CPU_SPIKE_THRESHOLD  = 85.0   # % CPU per process to flag as cryptojacking
 MONITOR_INTERFACE    = "enp0s3"
 TARPIT_UNBLOCK_IDLE  = 120    # seconds without login requests → auto-unflag
 
 # Alert log file — collect_graph23_data.py reads this to count alerts.
 # Set to None to disable file logging (stdout only).
-# run_full_lab.sh redirects stdout to this same path; writing directly
-# here ensures the file exists even when the script is run standalone.
 IDS_LOG_FILE         = "/tmp/ids.log"
 
 
@@ -103,10 +110,6 @@ def alert(engine, severity, msg):
 
     collect_graph23_data.py counts lines containing the alert keyword
     (e.g. "CREDENTIAL STUFFING") in IDS_LOG_FILE to measure TPR/FPR.
-    Writing directly to the file means the count is accurate whether the
-    script is run standalone or via run_full_lab.sh (which also redirects
-    stdout to the same path — both writes are idempotent because they
-    target the same file).
     """
     global alert_count
     ts = datetime.now().strftime("%H:%M:%S")
@@ -116,7 +119,6 @@ def alert(engine, severity, msg):
         "LOW":  "\033[94m[LOW] \033[0m",
     }.get(severity, severity)
 
-    # Plain-text line for the log file (no ANSI codes)
     plain_header = (
         f"\n{'='*60}\n"
         f"  ALERT #{alert_count + 1}  [{severity}]  Engine: {engine}  @ {ts}\n"
@@ -126,13 +128,11 @@ def alert(engine, severity, msg):
 
     with alert_lock:
         alert_count += 1
-        # stdout — coloured
         print(f"\n{'='*60}")
         print(f"  ALERT #{alert_count}  {sev_str}  Engine: {engine}  @ {ts}")
         print(f"  {msg}")
         print(f"{'='*60}\n")
 
-        # log file — plain text
         if IDS_LOG_FILE is not None:
             _open_log_file()
             if _log_fh is not None:
@@ -183,9 +183,7 @@ def process_volumetric(pkt):
 #            + TARPIT FEEDBACK LOOP
 # ══════════════════════════════════════════════════════════════
 
-# src_ip → deque of timestamps of HTTP POST /login requests
 login_times      = defaultdict(lambda: deque(maxlen=CRED_WINDOW))
-# src_ip → last seen timestamp (for auto-unblock logic)
 login_last_seen  = {}
 login_times_lock = threading.Lock()
 
@@ -240,7 +238,6 @@ def process_credential_stuffing(pkt):
                               f"  CV = {cv:.4f} (threshold: {CV_BOT_THRESHOLD})\n"
                               f"  Avg interval: {avg_interval:.3f}s  → bot-like rigid timing")
 
-                        # ── TARPIT FEEDBACK ─────────────────────────────
                         if TARPIT_ENABLED:
                             if not tarpit_state.is_flagged(src_ip):
                                 tarpit_state.flag(src_ip)
@@ -248,7 +245,6 @@ def process_credential_stuffing(pkt):
                                       f"(CV={cv:.4f})")
                             else:
                                 print(f"[IDS-E2] {src_ip} already tarpitted")
-                        # ────────────────────────────────────────────────
 
                         login_times[src_ip].clear()  # reset window after alert
 
@@ -260,7 +256,6 @@ def tarpit_auto_unblock_loop():
     """
     Background thread: if a flagged IP has been silent for
     TARPIT_UNBLOCK_IDLE seconds, automatically remove its tarpit flag.
-    Handles bots that finish their run or switch IPs.
     """
     if not TARPIT_ENABLED:
         return
@@ -281,12 +276,31 @@ def tarpit_auto_unblock_loop():
 
 # ══════════════════════════════════════════════════════════════
 #  ENGINE 3: DNS ANOMALY & DGA DETECTION
+#
+#  Two independent alert triggers (both write to the alert log):
+#
+#    (a) HIGH-ENTROPY QUERY BURST
+#        When a single source IP queries >= HIGH_ENTROPY_BURST domains
+#        whose label part has Shannon entropy > DGA_ENTROPY_THRESH within
+#        DNS_WINDOW seconds.  This catches DGA scanners that may not yet
+#        have received NXDOMAIN responses (e.g. if DNS is slow).
+#
+#    (b) NXDOMAIN BURST
+#        When a single source IP receives >= NXDOMAIN_BURST NXDOMAIN
+#        responses within DNS_WINDOW seconds.  This is the classic DGA
+#        detection signal — a bot iterating through its daily domain list
+#        will receive one NXDOMAIN per domain until the registered C2
+#        domain is found.
+#
+#  Both triggers include entropy context in the alert message so analysts
+#  can verify the DGA hypothesis from the log without additional tooling.
 # ══════════════════════════════════════════════════════════════
 
-nxdomain_counts = defaultdict(int)
-queried_domains = defaultdict(set)
-last_dns_reset  = time.time()
-DNS_WINDOW      = 30.0   # seconds
+nxdomain_counts     = defaultdict(int)
+high_entropy_counts = defaultdict(int)   # per-IP count of high-entropy queries
+queried_domains     = defaultdict(set)   # per-IP set of queried domains (for context)
+last_dns_reset      = time.time()
+DNS_WINDOW          = 30.0   # seconds
 
 
 def shannon_entropy(name: str) -> float:
@@ -308,13 +322,40 @@ def process_dns(pkt):
     now = time.time()
 
     if now - last_dns_reset >= DNS_WINDOW:
+        # ── Check NXDOMAIN burst ───────────────────────────────────
         for ip, count in list(nxdomain_counts.items()):
             if count >= NXDOMAIN_BURST:
+                sample = list(queried_domains.get(ip, set()))[:5]
+                # Include entropy scores for analyst context
+                entropy_context = ", ".join(
+                    f"{d}(H={shannon_entropy(d.split('.')[0]):.2f})"
+                    for d in sample
+                )
                 alert("DNS/DGA", "HIGH",
-                      f"DGA ACTIVITY detected: {ip} got {count} NXDOMAIN "
-                      f"responses in {DNS_WINDOW}s\n"
-                      f"  Sample domains: {list(queried_domains[ip])[:5]}")
+                      f"DGA ACTIVITY detected (NXDOMAIN burst): {ip} "
+                      f"got {count} NXDOMAIN responses in {DNS_WINDOW}s\n"
+                      f"  Sample domains: {entropy_context}")
+
+        # ── Check high-entropy query burst ─────────────────────────
+        for ip, count in list(high_entropy_counts.items()):
+            if count >= HIGH_ENTROPY_BURST:
+                # Only fire if this IP did NOT already trigger the NXDOMAIN
+                # alert above (to avoid duplicate alerts for the same event)
+                if nxdomain_counts.get(ip, 0) < NXDOMAIN_BURST:
+                    sample = list(queried_domains.get(ip, set()))[:5]
+                    entropy_context = ", ".join(
+                        f"{d}(H={shannon_entropy(d.split('.')[0]):.2f})"
+                        for d in sample
+                    )
+                    alert("DNS/DGA", "MED",
+                          f"DGA ACTIVITY detected (high-entropy queries): {ip} "
+                          f"queried {count} high-entropy domains in {DNS_WINDOW}s\n"
+                          f"  H threshold: >{DGA_ENTROPY_THRESH} bits/char\n"
+                          f"  Sample domains: {entropy_context}\n"
+                          f"  (NXDOMAIN burst may follow — or DNS is slow)")
+
         nxdomain_counts.clear()
+        high_entropy_counts.clear()
         queried_domains.clear()
         last_dns_reset = now
 
@@ -323,7 +364,7 @@ def process_dns(pkt):
 
     src_ip = pkt[IP].src if pkt.haslayer(IP) else "?"
 
-    # DNS Query — check domain entropy
+    # DNS Query — score domain entropy and track per-IP
     if pkt.haslayer(DNSQR):
         try:
             qname     = pkt[DNSQR].qname.decode("utf-8").rstrip(".")
@@ -331,8 +372,11 @@ def process_dns(pkt):
             entropy   = shannon_entropy(name_part)
             queried_domains[src_ip].add(qname)
             if entropy > DGA_ENTROPY_THRESH and len(name_part) > 6:
-                print(f"[DNS-ENG] High-entropy domain query from {src_ip}: "
-                      f"{qname}  H={entropy:.2f}")
+                high_entropy_counts[src_ip] += 1
+                # Debug line for live monitoring — does NOT replace the alert
+                print(f"[DNS-ENG] High-entropy query from {src_ip}: "
+                      f"{qname}  H={entropy:.2f} "
+                      f"(window count: {high_entropy_counts[src_ip]}/{HIGH_ENTROPY_BURST})")
         except Exception:
             pass
 
@@ -342,103 +386,9 @@ def process_dns(pkt):
 
 
 # ══════════════════════════════════════════════════════════════
-#  HOST-BASED ENGINE: CRYPTOJACKING + GHOST PROCESS
+#  ENGINE 4: DPI / COVERT CHANNEL MONITOR
 # ══════════════════════════════════════════════════════════════
 
-# Known system process names that legitimately use high CPU
-SYSTEM_PROCESS_WHITELIST = {
-    "kworker", "ksoftirqd", "migration", "rcu_sched",
-    "systemd", "python3", "gcc", "make", "apt", "dpkg",
-}
-
-def host_monitor_loop():
-    """
-    Poll every 5 seconds for:
-      1. Memory-resident binaries: /proc/[pid]/exe → (deleted)
-         (payload delivered and immediately rm -f'd — lives in RAM only)
-      2. Sustained high CPU from unexpected processes
-         (cryptojacking throttled to ~25% but still above normal idle)
-    """
-    print("[HOST] Host-based monitor started (cryptojacking + ghost process)")
-    # cpu_percent(interval=None) needs a priming call
-    for proc in psutil.process_iter(["pid", "name", "cpu_percent", "exe"]):
-        try:
-            proc.cpu_percent(interval=None)
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            pass
-
-    while True:
-        time.sleep(5)
-        for proc in psutil.process_iter(["pid", "name", "cpu_percent", "exe",
-                                          "username", "cmdline"]):
-            try:
-                info    = proc.info
-                pid     = info["pid"]
-                name    = info["name"] or ""
-                cpu     = proc.cpu_percent(interval=None)
-                exe     = info["exe"] or ""
-                cmdline = " ".join(info["cmdline"] or [])
-
-                # ── Ghost process check ──────────────────────────
-                # /proc/[pid]/exe contains " (deleted)" when the on-disk
-                # binary has been removed but the process is still running.
-                # This is the exact signature of Mirai's memory-resident payload.
-                exe_path = f"/proc/{pid}/exe"
-                try:
-                    real_exe = subprocess.check_output(
-                        ["readlink", "-f", exe_path],
-                        stderr=subprocess.DEVNULL
-                    ).decode().strip()
-                    if "(deleted)" in real_exe:
-                        alert("Host/Ghost", "HIGH",
-                              f"GHOST PROCESS detected: PID={pid} name={name}\n"
-                              f"  /proc/{pid}/exe → {real_exe}\n"
-                              f"  Binary deleted from disk — memory-resident payload!\n"
-                              f"  MITRE: T1070.004 (Indicator Removal — File Deletion)")
-                except Exception:
-                    pass
-
-                # ── Sustained CPU spike check ────────────────────
-                if cpu >= CPU_SPIKE_THRESHOLD:
-                    # Only flag if name doesn't match known system processes
-                    base_name = name.split("/")[0].split(":")[0]
-                    if base_name not in SYSTEM_PROCESS_WHITELIST:
-                        alert("Host/CPU", "MED",
-                              f"HIGH CPU PROCESS: PID={pid} name={name} cpu={cpu:.1f}%\n"
-                              f"  cmdline: {cmdline[:100]}\n"
-                              f"  exe: {exe}\n"
-                              f"  Threshold: {CPU_SPIKE_THRESHOLD}% — possible cryptojacking\n"
-                              f"  MITRE: T1496 (Resource Hijacking)")
-
-                # ── Name-spoof detection ─────────────────────────
-                # If comm (short name in /proc/pid/comm) doesn't match exe basename,
-                # the process has overwritten its name to look like a system process.
-                comm_path = f"/proc/{pid}/comm"
-                if exe and os.path.exists(comm_path):
-                    try:
-                        with open(comm_path) as f:
-                            comm = f.read().strip()
-                        exe_base = os.path.basename(exe).split(" ")[0]
-                        if (comm in ("kworker/0:1", "syslogd", "kthreadd",
-                                     "migration/0", "rcu_bh")
-                                and exe_base not in ("", comm)):
-                            alert("Host/Spoof", "MED",
-                                  f"PROCESS NAME SPOOF detected: PID={pid}\n"
-                                  f"  /proc/{pid}/comm = '{comm}'\n"
-                                  f"  exe basename    = '{exe_base}'\n"
-                                  f"  Classic cryptojacker signature")
-                    except Exception:
-                        pass
-
-            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
-                pass
-
-
-# ══════════════════════════════════════════════════════════════
-#  COVERT CHANNEL MONITOR (DPI supplement)
-# ══════════════════════════════════════════════════════════════
-
-# Track repeated HTTPS connections to the same dest IP (dead-drop polling pattern)
 https_conn_tracker  = defaultdict(lambda: defaultdict(list))  # src→dst→[timestamps]
 last_https_reset    = time.time()
 HTTPS_WINDOW        = 60.0
@@ -448,8 +398,6 @@ def process_covert_channel(pkt):
     """
     Detect the Phase 2 dead-drop polling pattern:
     repeated HTTPS SYN connections from one source to the same destination.
-    A single developer hitting github.com several times a day is fine.
-    A bot polling every 60s produces ~10 connections/hour to one specific IP.
     """
     global last_https_reset
     now = time.time()
@@ -473,6 +421,90 @@ def process_covert_channel(pkt):
         src = pkt[IP].src
         dst = pkt[IP].dst
         https_conn_tracker[src][dst].append(now)
+
+
+# ══════════════════════════════════════════════════════════════
+#  HOST-BASED ENGINE: CRYPTOJACKING + GHOST PROCESS
+# ══════════════════════════════════════════════════════════════
+
+SYSTEM_PROCESS_WHITELIST = {
+    "kworker", "ksoftirqd", "migration", "rcu_sched",
+    "systemd", "python3", "gcc", "make", "apt", "dpkg",
+}
+
+def host_monitor_loop():
+    """
+    Poll every 5 seconds for:
+      1. Memory-resident binaries: /proc/[pid]/exe → (deleted)
+      2. Sustained high CPU from unexpected processes
+      3. Process name spoofing (/proc/pid/comm ≠ exe basename)
+    """
+    print("[HOST] Host-based monitor started (cryptojacking + ghost process)")
+    for proc in psutil.process_iter(["pid", "name", "cpu_percent", "exe"]):
+        try:
+            proc.cpu_percent(interval=None)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+
+    while True:
+        time.sleep(5)
+        for proc in psutil.process_iter(["pid", "name", "cpu_percent", "exe",
+                                          "username", "cmdline"]):
+            try:
+                info    = proc.info
+                pid     = info["pid"]
+                name    = info["name"] or ""
+                cpu     = proc.cpu_percent(interval=None)
+                exe     = info["exe"] or ""
+                cmdline = " ".join(info["cmdline"] or [])
+
+                # ── Ghost process check ──────────────────────────
+                exe_path = f"/proc/{pid}/exe"
+                try:
+                    real_exe = subprocess.check_output(
+                        ["readlink", "-f", exe_path],
+                        stderr=subprocess.DEVNULL
+                    ).decode().strip()
+                    if "(deleted)" in real_exe:
+                        alert("Host/Ghost", "HIGH",
+                              f"GHOST PROCESS detected: PID={pid} name={name}\n"
+                              f"  /proc/{pid}/exe → {real_exe}\n"
+                              f"  Binary deleted from disk — memory-resident payload!\n"
+                              f"  MITRE: T1070.004 (Indicator Removal — File Deletion)")
+                except Exception:
+                    pass
+
+                # ── Sustained CPU spike check ────────────────────
+                if cpu >= CPU_SPIKE_THRESHOLD:
+                    base_name = name.split("/")[0].split(":")[0]
+                    if base_name not in SYSTEM_PROCESS_WHITELIST:
+                        alert("Host/CPU", "MED",
+                              f"HIGH CPU PROCESS: PID={pid} name={name} cpu={cpu:.1f}%\n"
+                              f"  cmdline: {cmdline[:100]}\n"
+                              f"  exe: {exe}\n"
+                              f"  Threshold: {CPU_SPIKE_THRESHOLD}% — possible cryptojacking\n"
+                              f"  MITRE: T1496 (Resource Hijacking)")
+
+                # ── Name-spoof detection ─────────────────────────
+                comm_path = f"/proc/{pid}/comm"
+                if exe and os.path.exists(comm_path):
+                    try:
+                        with open(comm_path) as f:
+                            comm = f.read().strip()
+                        exe_base = os.path.basename(exe).split(" ")[0]
+                        if (comm in ("kworker/0:1", "syslogd", "kthreadd",
+                                     "migration/0", "rcu_bh")
+                                and exe_base not in ("", comm)):
+                            alert("Host/Spoof", "MED",
+                                  f"PROCESS NAME SPOOF detected: PID={pid}\n"
+                                  f"  /proc/{pid}/comm = '{comm}'\n"
+                                  f"  exe basename    = '{exe_base}'\n"
+                                  f"  Classic cryptojacker signature")
+                    except Exception:
+                        pass
+
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                pass
 
 
 # ══════════════════════════════════════════════════════════════
@@ -502,7 +534,9 @@ def main():
     if TARPIT_ENABLED:
         print("      └─ Tarpit    — Flags bot IPs in tarpit_state.json")
         print(f"         └─ Auto-unblock after {TARPIT_UNBLOCK_IDLE}s silence")
-    print("   3  DNS/DGA       — Entropy + NXDOMAIN burst")
+    print("   3  DNS/DGA       — High-entropy query burst OR NXDOMAIN burst")
+    print(f"      └─ Entropy alert: ≥{HIGH_ENTROPY_BURST} H>{DGA_ENTROPY_THRESH:.1f} queries in {DNS_WINDOW:.0f}s")
+    print(f"      └─ NXDOMAIN alert: ≥{NXDOMAIN_BURST} NXDOMAINs in {DNS_WINDOW:.0f}s")
     print("   4  DPI/Covert    — Repeated HTTPS polling pattern")
     print("   H  Host          — Ghost process + name spoof + CPU spike")
     print("=" * 60)
@@ -511,18 +545,15 @@ def main():
         print("[IDS] Cannot start: Scapy required. pip3 install scapy")
         return
 
-    # Open log file early so it exists before any attack starts
     if IDS_LOG_FILE:
         _open_log_file()
         if _log_fh is not None:
             print(f"[IDS] Logging alerts to {IDS_LOG_FILE}")
 
-    # Start host-based monitor in background
     host_t = threading.Thread(target=host_monitor_loop, daemon=True,
                                name="host-monitor")
     host_t.start()
 
-    # Start tarpit auto-unblock monitor
     if TARPIT_ENABLED:
         unblock_t = threading.Thread(target=tarpit_auto_unblock_loop,
                                      daemon=True, name="tarpit-unblock")
@@ -539,7 +570,6 @@ def main():
         print(f"\n[IDS] Stopped. Total alerts fired: {alert_count}")
         if TARPIT_ENABLED:
             print(f"[IDS] Currently tarpitted IPs: {tarpit_state.list_flagged()}")
-        # Flush and close the log file cleanly
         with _log_lock:
             if _log_fh is not None:
                 try:

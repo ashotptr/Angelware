@@ -16,6 +16,12 @@ Design:
     when running in separate terminals (no shared memory needed).
   - Entries automatically expire after TTL_SECONDS so a bot that
     adds jitter and later passes the CV check gets unblocked.
+  - A cumulative total_flag_events counter is persisted alongside
+    the per-IP entries.  Unlike total_delayed (which increments only
+    when the portal actually serves a delayed response), this counter
+    increments the moment the IDS calls flag(), making it a reliable
+    Graph 3 detection proxy even when the bot finishes its run before
+    the portal has processed enough requests to increment total_delayed.
 
 This implements the "tarpitting" countermeasure described in the
 README (Section 9.3): the attacker's connection is kept open but
@@ -35,6 +41,10 @@ STATE_FILE    = "/tmp/tarpit_state.json"   # shared between IDS and portal
 TTL_SECONDS   = 300                         # flagged entries expire after 5 min
 TARPIT_DELAY  = 8.0                         # seconds to delay flagged IPs
 TARPIT_JITTER = 2.0                         # ±jitter on delay (avoid timing fingerprint)
+
+# Internal key used to store the cumulative flag counter inside the JSON file.
+# Using a value that cannot be a valid IPv4 address avoids collisions with IP keys.
+_FLAG_COUNT_KEY = "__total_flag_events__"
 
 _lock = threading.Lock()
 
@@ -57,9 +67,15 @@ def _save(state: dict):
 
 
 def _prune(state: dict) -> dict:
-    """Remove expired entries."""
+    """Remove expired per-IP entries, preserving the flag counter."""
     now = time.time()
-    return {ip: ts for ip, ts in state.items() if now - ts < TTL_SECONDS}
+    pruned = {_FLAG_COUNT_KEY: state.get(_FLAG_COUNT_KEY, 0)}
+    for ip, ts in state.items():
+        if ip == _FLAG_COUNT_KEY:
+            continue
+        if now - ts < TTL_SECONDS:
+            pruned[ip] = ts
+    return pruned
 
 
 # ── Public API ────────────────────────────────────────────────
@@ -68,10 +84,13 @@ def flag(ip: str):
     """
     Mark an IP as a confirmed bot (called by IDS Engine 2).
     Writes a timestamp; the portal reads this before responding.
+    Also increments the cumulative total_flag_events counter which
+    collect_graph23_data.py uses as the primary Graph 3 TPR proxy.
     """
     with _lock:
         state = _prune(_load())
         state[ip] = time.time()
+        state[_FLAG_COUNT_KEY] = state.get(_FLAG_COUNT_KEY, 0) + 1
         _save(state)
     print(f"[TARPIT] Flagged {ip} — portal will now slow all responses from this IP")
 
@@ -93,18 +112,34 @@ def is_flagged(ip: str) -> bool:
         return ip in state
 
 
-def list_flagged() -> list[str]:
+def list_flagged() -> list:
     """Return all currently flagged IPs (for admin/debug)."""
     with _lock:
         state = _prune(_load())
         _save(state)
-        return list(state.keys())
+        return [k for k in state.keys() if k != _FLAG_COUNT_KEY]
+
+
+def get_flag_count() -> int:
+    """
+    Return the cumulative total number of IPs ever flagged since the last
+    clear_all().  Unlike total_delayed (which only increments when the portal
+    serves a delayed response), this counter increments the instant flag() is
+    called — making it race-condition-free for Graph 3 TPR measurement even
+    when a bot run ends before the portal has processed a delayed request.
+
+    collect_graph23_data.py reads this via fake_portal.py GET /tarpit/status
+    → stats.total_flag_events.
+    """
+    with _lock:
+        state = _load()
+        return int(state.get(_FLAG_COUNT_KEY, 0))
 
 
 def clear_all():
-    """Wipe all tarpit entries (cleanup / post-session reset)."""
+    """Wipe all tarpit entries and reset the flag counter (cleanup / post-session reset)."""
     with _lock:
-        _save({})
+        _save({_FLAG_COUNT_KEY: 0})
     print("[TARPIT] All entries cleared")
 
 
@@ -120,7 +155,7 @@ if __name__ == "__main__":
     import sys
 
     if len(sys.argv) < 2:
-        print(f"Usage: python3 tarpit_state.py [list | flag <ip> | unflag <ip> | clear]")
+        print(f"Usage: python3 tarpit_state.py [list | flag <ip> | unflag <ip> | clear | count]")
         sys.exit(0)
 
     cmd = sys.argv[1]
@@ -129,11 +164,14 @@ if __name__ == "__main__":
         print(f"Currently flagged ({len(ips)} IPs):")
         for ip in ips:
             print(f"  {ip}")
+        print(f"Total flag events (cumulative): {get_flag_count()}")
     elif cmd == "flag" and len(sys.argv) == 3:
         flag(sys.argv[2])
     elif cmd == "unflag" and len(sys.argv) == 3:
         unflag(sys.argv[2])
     elif cmd == "clear":
         clear_all()
+    elif cmd == "count":
+        print(f"Total flag events: {get_flag_count()}")
     else:
         print("Unknown command")

