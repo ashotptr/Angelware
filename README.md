@@ -1280,9 +1280,6 @@ Post-session:
 
 ---
 
-35. Researchers Null-Route Over 550 Kimwolf and Aisuru Botnet Command Servers - 
-The Hacker News, accessed March 12, 2026, 
-https://thehackernews.com/2026/01/kimwolf-botnet-infected-over-2-million.html 
 36. Kimwolf Botnet Risks for Enterprises and Institutions - Infoblox, accessed March 
 12, 2026, 
 https://www.infoblox.com/blog/threat-intelligence/kimwolf-howls-from-inside-th
