@@ -1280,10 +1280,6 @@ Post-session:
 
 ---
 
-37. Mirai botnet evolution since its source code is available online | Infosec, accessed 
-March 12, 2026, 
-https://www.infosecinstitute.com/resources/malware-analysis/mirai-botnet-evolu
-tion-since-its-source-code-is-available-online/ 
 38. Slowloris Attack: A Guided Simulation | by Alex Perrakis | Medium, accessed 
 March 12, 2026, 
 https://medium.com/@alexperrakis/slowloris-attack-a-guided-simulation-and-eff
