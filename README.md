@@ -1217,9 +1217,6 @@ Post-session:
 
 ---
 
-
-28. Understanding the Mirai Botnet - Google Research, accessed March 12, 2026, 
-https://research.google.com/pubs/archive/46301.pdf 
 29. Python Network Programming: Forging and Sniffing Packets with Scapy - 
 ExamCollection, accessed March 12, 2026, 
 https://www.examcollection.com/blog/python-network-programming-forging-an
