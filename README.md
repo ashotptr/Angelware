@@ -1280,8 +1280,6 @@ Post-session:
 
 ---
 
-32. Measuring the Difficulty and User Experience of Remediating Persistent IoT 
-Malware - arXiv, accessed March 12, 2026, https://arxiv.org/pdf/2203.01683 
 33. Mirai (malware) - Wikipedia, accessed March 12, 2026, 
 https://en.wikipedia.org/wiki/Mirai_(malware) 
 34. What is the Aisuru-Kimwolf botnet? - Cloudflare, accessed March 12, 2026, 
