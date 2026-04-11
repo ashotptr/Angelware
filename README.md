@@ -1611,13 +1611,7 @@ breach_dump.txt
 ```
 
 ---
-
-62. (PDF) QUANTITATIVE ANALYSIS OF DEFENSE ARCHITECTURES IN 
-CYBERPHYSICAL SYSTEMS: IMPACT ASSESSMENT FROM DETECTION TO 
-RECOVERY - ResearchGate, accessed March 12, 2026, 
-https://www.researchgate.net/publication/400899082_QUANTITATIVE_ANALYSIS_
-OF_DEFENSE_ARCHITECTURES_IN_CYBERPHYSICAL_SYSTEMS_IMPACT_ASSESS
-MENT_FROM_DETECTION_TO_RECOVERY 
+ 
 63. Post-Mortem of a Zombie: Conficker Cleanup After Six Years - USENIX, accessed 
 March 12, 2026, https://www.usenix.org/system/files/sec15-paper-asghari.pdf 
 64. API Rate Limiting vs. Throttling: Key Differences - Blog, accessed March 12, 2026, 
