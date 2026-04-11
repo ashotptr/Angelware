@@ -1612,9 +1612,6 @@ breach_dump.txt
 
 ---
 
-55. Traffic Anomaly Detection – TCP and DNS - Infosec, accessed March 12, 2026, 
-https://www.infosecinstitute.com/resources/network-security-101/traffic-anomal
-y-detection/ 
 56. Sentinel Notebook: Guided Hunting - Domain Generation Algorithm (DGA) 
 Detection, accessed March 12, 2026, 
 https://techcommunity.microsoft.com/blog/coreinfrastructureandsecurityblog/se
