@@ -1280,40 +1280,6 @@ Post-session:
 
 ---
 
-30. Breaking Down Mirai: An IoT DDoS Botnet Analysis - Imperva, Inc., accessed 
-March 12, 2026, 
-https://www.imperva.com/blog/malware-analysis-mirai-ddos-botnet/ 
-31. Understanding the MIRAI botnet: scanning process, infection method and key 
-features - CNR-IRIS, accessed March 12, 2026, 
-https://iris.cnr.it/retrieve/c8af9fa9-4172-4fa2-9a86-18d019eb7f8b/prod_482082-d
-oc_198344.pdf 
-32. Measuring the Difficulty and User Experience of Remediating Persistent IoT 
-Malware - arXiv, accessed March 12, 2026, https://arxiv.org/pdf/2203.01683 
-33. Mirai (malware) - Wikipedia, accessed March 12, 2026, 
-https://en.wikipedia.org/wiki/Mirai_(malware) 
-34. What is the Aisuru-Kimwolf botnet? - Cloudflare, accessed March 12, 2026, 
-https://www.cloudflare.com/learning/ddos/glossary/aisuru-kimwolf-botnet/ 
-35. Researchers Null-Route Over 550 Kimwolf and Aisuru Botnet Command Servers - 
-The Hacker News, accessed March 12, 2026, 
-https://thehackernews.com/2026/01/kimwolf-botnet-infected-over-2-million.html 
-36. Kimwolf Botnet Risks for Enterprises and Institutions - Infoblox, accessed March 
-12, 2026, 
-https://www.infoblox.com/blog/threat-intelligence/kimwolf-howls-from-inside-th
-e-enterprise/ 
-37. Mirai botnet evolution since its source code is available online | Infosec, accessed 
-March 12, 2026, 
-https://www.infosecinstitute.com/resources/malware-analysis/mirai-botnet-evolu
-tion-since-its-source-code-is-available-online/ 
-38. Slowloris Attack: A Guided Simulation | by Alex Perrakis | Medium, accessed 
-March 12, 2026, 
-https://medium.com/@alexperrakis/slowloris-attack-a-guided-simulation-and-eff
-ective-defense-strategies-7f4ae3660b60 
-39. What is a Slowloris DDoS Attack and How Does it Work? - Indusface, accessed 
-March 12, 2026, https://www.indusface.com/blog/what-is-slowloris/ 
-40. Slowloris DDoS attack - Cloudflare, accessed March 12, 2026, 
-https://www.cloudflare.com/ru-ru/learning/ddos/ddos-attack-tools/slowloris/ 
-41. Slowloris DDoS attack - Cloudflare, accessed March 12, 2026, 
-https://www.cloudflare.com/learning/ddos/ddos-attack-tools/slowloris/ 
 42. CryptoGuard: Lightweight Hybrid Detection and Response to Host-based 
 Cryptojackers in Linux Cloud Environments - arXiv.org, accessed March 12, 2026, 
 https://arxiv.org/html/2510.18324v1 
