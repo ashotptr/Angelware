@@ -1612,8 +1612,6 @@ breach_dump.txt
 
 ---
 
-59. Mirai Nomi: A Botnet Leveraging DGA - 奇安信X 实验室, accessed March 12, 2026, 
-https://blog.xlab.qianxin.com/mirai-nomi-en/ 
 60. Evaluation of Persistence Methods Used by Malware on Microsoft Windows 
 Systems - SciTePress, accessed March 12, 2026, 
 https://www.scitepress.org/Papers/2023/117102/117102.pdf 
