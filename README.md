@@ -1612,10 +1612,6 @@ breach_dump.txt
 
 ---
 
-50. WiP: Developing High-interaction Honeypots to Capture and Analyze 
-Region-Specific Bot Behaviors, accessed March 12, 2026, 
-https://isi.jhu.edu/wp-content/uploads/2024/02/Honeypot_Paper_for_HoTSoS-20
-24-2.pdf 
 51. How to Build a Honeypot in Python: A Practical Guide to Security Deception, 
 accessed March 12, 2026, 
 https://www.freecodecamp.org/news/build-a-honeypot-with-python/ 
