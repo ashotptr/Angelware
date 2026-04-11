@@ -1612,10 +1612,6 @@ breach_dump.txt
 
 ---
 
-52. How I Set Up a Cowrie Honeypot to Capture Real SSH Attacks | HackerNoon, 
-accessed March 12, 2026, 
-https://hackernoon.com/how-i-set-up-a-cowrie-honeypot-to-capture-real-ssh-a
-ttacks 
 53. Creating a Simple Honeypot Project on Kali Linux: A Guide with Attack Simulation | 
 by IritT, accessed March 12, 2026, 
 https://iritt.medium.com/creating-a-simple-honeypot-project-on-kali-linux-a-ste
