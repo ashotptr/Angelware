@@ -1612,10 +1612,7 @@ breach_dump.txt
 
 ---
 
-53. Creating a Simple Honeypot Project on Kali Linux: A Guide with Attack Simulation | 
-by IritT, accessed March 12, 2026, 
-https://iritt.medium.com/creating-a-simple-honeypot-project-on-kali-linux-a-ste
-p-by-step-guide-with-attack-simulation-d2aacf5e35ea 
+ 
 54. Incident Response - SANS Institute, accessed March 12, 2026, 
 https://www.sans.org/security-resources/glossary-of-terms/incident-response 
 55. Traffic Anomaly Detection – TCP and DNS - Infosec, accessed March 12, 2026, 
