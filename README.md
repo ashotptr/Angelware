@@ -1612,9 +1612,6 @@ breach_dump.txt
 
 ---
 
-58. DDoS: Slowloris Attack, accessed March 12, 2026, 
-https://jelenamirkovic.github.io/sphere-education.github.io/docs/slowloris/index.h
-tml 
 59. Mirai Nomi: A Botnet Leveraging DGA - 奇安信X 实验室, accessed March 12, 2026, 
 https://blog.xlab.qianxin.com/mirai-nomi-en/ 
 60. Evaluation of Persistence Methods Used by Malware on Microsoft Windows 
