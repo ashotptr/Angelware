@@ -1612,10 +1612,6 @@ breach_dump.txt
 
 ---
 
-57. Day 14 — I Built ProcWatch : A Linux Process Security Scanner for Forensics & 
-Incident Response - DEV Community, accessed March 12, 2026, 
-https://dev.to/hafiz_shamnad/day-14-i-built-procwatch-a-linux-process-security-
-scanner-for-forensics-incident-response-2bm5 
 58. DDoS: Slowloris Attack, accessed March 12, 2026, 
 https://jelenamirkovic.github.io/sphere-education.github.io/docs/slowloris/index.h
 tml 
