@@ -1612,9 +1612,6 @@ breach_dump.txt
 
 ---
 
-42. CryptoGuard: Lightweight Hybrid Detection and Response to Host-based 
-Cryptojackers in Linux Cloud Environments - arXiv.org, accessed March 12, 2026, 
-https://arxiv.org/html/2510.18324v1 
 43. Cryptojacking Detection with CPU Usage Metrics - Universidade de Lisboa, 
 accessed March 12, 2026, 
 https://fenix.tecnico.ulisboa.pt/downloadFile/1126295043837524/Res_alargado.pdf 
