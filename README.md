@@ -1612,10 +1612,6 @@ breach_dump.txt
 
 ---
 
-45. Credential Stuffing: How It Works & 4 Real-World Attacks - Seraphic, accessed 
-March 12, 2026, 
-https://seraphicsecurity.com/learn/website-security/credential-stuffing-how-it-w
-orks-and-4-real-world-attacks/ 
 46. What Is Credential Stuffing? - Definition & More on Attacks | Proofpoint US, 
 accessed March 12, 2026, 
 https://www.proofpoint.com/us/threat-reference/credential-stuffing 
