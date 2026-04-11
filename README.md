@@ -1612,8 +1612,6 @@ breach_dump.txt
 
 ---
 
-44. What Is Credential Stuffing? - Palo Alto Networks, accessed March 12, 2026, 
-https://www.paloaltonetworks.com/cyberpedia/credential-stuffing 
 45. Credential Stuffing: How It Works & 4 Real-World Attacks - Seraphic, accessed 
 March 12, 2026, 
 https://seraphicsecurity.com/learn/website-security/credential-stuffing-how-it-w
