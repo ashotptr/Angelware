@@ -175,6 +175,32 @@ botnet_lab/
 │                        CLI: python3 tarpit_state.py [list | flag <ip> |
 │                             unflag <ip> | clear | count]
 ├── run_full_lab.sh      Master orchestration script — runs everything at once
+├── ip_reputation.py     IP reputation & proxy-pool scoring module.
+│                        Scores every /login request for bot indicators:
+│                          • Datacenter/hosting subnet detection
+│                          • Suspicious User-Agent strings (urllib, curl, etc.)
+│                          • Missing Accept-Language header (common in scripts)
+│                          • Chrome UA without Sec-Ch-Ua (impersonation)
+│                          • Cross-IP fingerprint reuse (proxy pool detection)
+│                          • X-Forwarded-For subnet cycling
+│                        Shared module between fake_portal.py and IDS Engine 6.
+│                        CLI demo: python3 ip_reputation.py
+│
+├── monetization_sim.py  Post-compromise monetization simulator.
+│                        Models what attackers do after obtaining valid hits:
+│                          1. Gift-card / loyalty balance drain
+│                          2. Fraudulent order with saved payment method
+│                          3. Account resale listing (Telegram/dark-web sim)
+│                          4. Password pivot — 30% simulated reuse rate
+│                             tested against 6 other simulated services
+│                          5. Verified combo-list export → /tmp/verified_hits.txt
+│                        Triggered by: python3 cred_stuffing.py --monetize
+│                        CLI: python3 monetization_sim.py [--hits email:pass ...]
+│
+├── breach_dump.txt      Simulated breach credential dump (200+ pairs).
+│                        email:password format, mirrors Collection #1 style.
+│                        Loaded with: python3 cred_stuffing.py --creds-file breach_dump.txt
+│                        Add to .gitignore — never commit to a public repo.
 └── README.md            This file
 ```
 
@@ -544,6 +570,59 @@ python3 cred_stuffing.py --mode human     # baseline (should NOT trigger IDS)
 
 # View portal attempt log:
 curl http://192.168.100.20/attempts | python3 -m json.tool
+```bash
+# ── NEW: Load credentials from a breach dump file ──────────────────────────
+# Simulates the attacker sourcing step (Collection #1, stealer logs,
+# Telegram combo lists). Without --creds-file the default 30-pair list is used.
+python3 cred_stuffing.py --creds-file breach_dump.txt --mode bot
+ 
+# ── NEW: UA rotation (raises bar for IDS Engine 6) ────────────────────────
+# Without --ua-rotate, all requests share User-Agent "Mozilla/5.0
+# (compatible; Research/1.0)" — a trivial fingerprint target for Engine 6.
+# With --ua-rotate, each request picks randomly from 8 real browser UA strings
+# (Chrome/Firefox/Safari on Windows/macOS/Linux), varying the fingerprint hash.
+python3 cred_stuffing.py --mode distributed --workers 3 --ua-rotate
+ 
+# ── NEW: Monetization pipeline ────────────────────────────────────────────
+# Runs monetization_sim.py on all valid hits after the attack completes.
+python3 cred_stuffing.py --mode bot --monetize
+ 
+# ── Full production-model attack ──────────────────────────────────────────
+python3 cred_stuffing.py \
+    --creds-file breach_dump.txt \
+    --mode distributed --workers 4 \
+    --ua-rotate \
+    --monetize \
+    --host 192.168.100.20 --port 80
+ 
+# ── Existing modes (unchanged) ────────────────────────────────────────────
+python3 cred_stuffing.py --mode bot       --interval 300 --jitter 0
+python3 cred_stuffing.py --mode jitter    --interval 500 --jitter 300
+python3 cred_stuffing.py --mode distributed --workers 3
+python3 cred_stuffing.py --mode human     # FPR baseline (should NOT trigger IDS)
+```
+ 
+**--ua-rotate teaching point:**
+Run the same distributed attack with and without the flag:
+ 
+```bash
+# Without rotation: all 4 workers share one fingerprint → Engine 6 fires
+python3 cred_stuffing.py --mode distributed --workers 4
+ 
+# With rotation: fingerprint varies per request → Engine 6 silent
+python3 cred_stuffing.py --mode distributed --workers 4 --ua-rotate
+```
+ 
+This demonstrates the arms-race dynamic from the article: "Block IPs?
+They rotate. Fingerprint devices? They use anti-detect browsers."
+A more complete defense would add TLS JA3 fingerprinting, which would
+still catch bots even with HTTP-header rotation (not implemented here).
+ 
+**--creds-file teaching point:**
+A breach dump loaded with `--creds-file breach_dump.txt` contains ~200
+pairs including many emails never registered on `fake_portal.py`.  This
+immediately triggers IDS Engine 5's unknown-account-spike alert — even
+at jitter levels too high for Engine 2's CV timing to detect.
 ```
 
 ### 8.6 DGA
@@ -866,7 +945,209 @@ The two-threshold design means the alert sensitivity depends on destination: agg
 
 The thresholds are defined as class constants in `DPIEngine` and can be tuned without
 restarting the engine by editing `firewall_dpi.py` and re-running `--dpi`.
-
+### 9.X.1 fake_portal.py — new defenses
+ 
+The following defenses are added on top of the existing tarpit integration.
+All original endpoints (`/attempts`, `/tarpit/status`, `/tarpit/flag`,
+`/tarpit/unflag`, `/attempts/reset`) are fully preserved with identical
+response schemas.
+ 
+| Defense | Mechanism | Article section |
+|---|---|---|
+| Per-username rate limiting | HTTP 429 after `USERNAME_RATE_MAX` (5) attempts per email per 60 s | "Adaptive rate limits — rate-limit by username, not just IP" |
+| Progressive CAPTCHA | HTTP 403 + JSON math challenge after `CAPTCHA_FAIL_THRESHOLD` (3) consecutive failures from one IP | "Apply progressive friction — trigger CAPTCHA on suspicious behavior" |
+| Hard block (429) | Explicit HTTP 429 after `N_BEFORE_BLOCK` (10) further failures post-tarpit | Escalation from silent tarpit to detected block |
+| Unknown-account tracking | Per-IP count of attempts to non-existent emails, exposed in /stats/advanced | "Unusual volume of failed logins for non-existent accounts" |
+| Breach credential detection | Flags passwords matching a 35-entry HIBP-style list | "Risk-based authentication" |
+| IP reputation scoring | Composite 0–100 score via ip_reputation.py on every request | "Proxy and VPN usage detection" |
+| /stats/advanced endpoint | All new signals for IDS Engine 5 | "Real-time visibility" |
+ 
+#### Per-username rate limiting
+ 
+```
+Max USERNAME_RATE_MAX (5) attempts per email per USERNAME_RATE_WINDOW (60) s.
+6th attempt for the same email → HTTP 429.
+ 
+Teaching point: orthogonal to IP-based rate limiting.
+A distributed attack from 100 different IPs still gets limited
+per-username because credential stuffing loops over email:password
+pairs — one attempt per account from many IPs still hits the same
+email multiple times across workers.
+```
+ 
+#### Progressive CAPTCHA
+ 
+```
+After CAPTCHA_FAIL_THRESHOLD (3) consecutive failures from one IP:
+  Portal returns HTTP 403 with JSON body:
+  {
+    "status": "captcha_required",
+    "captcha_question": "What is 7 * 4?",
+    "message": "Submit 'captcha_answer' with your next login request."
+  }
+ 
+Bot must:
+  1. Parse the JSON response (not just check status code)
+  2. Evaluate the arithmetic expression
+  3. Re-submit: {"email":..., "password":..., "captcha_answer": 28}
+ 
+A plain urllib/requests loop cannot do this without custom code.
+Attacker cost increases: must extend the config to handle challenges.
+Once solved, flag clears for that IP.  Wrong answer → stays blocked (403).
+```
+ 
+#### Hard block escalation path
+ 
+```
+IDS Engine 2 fires (CV < 0.15)
+  → tarpit_state.flag(src_ip)
+    → portal delays every response 8±2s (silent — bot unaware)
+      → bot continues submitting (very slowly)
+        → after N_BEFORE_BLOCK (10) post-tarpit failures:
+          → HTTP 429 (explicit — attacker now knows they are detected)
+ 
+Teaching point: shows the tradeoff between:
+  - Silent tarpitting: maximum intelligence gathering, bot stays up
+  - Hard block: maximum disruption, attacker knows and adapts
+```
+ 
+#### /stats/advanced endpoint
+ 
+```bash
+# Inspect all new signals in real time:
+curl http://192.168.100.20/stats/advanced | python3 -m json.tool
+```
+ 
+Key fields consumed by IDS Engine 5:
+ 
+| Field | Type | Meaning |
+|---|---|---|
+| `success_rate_pct` | float | % of logins that succeeded |
+| `unknown_acct_pct` | float | % of attempts to non-existent emails |
+| `off_hours_pct` | float | % outside 08:00-22:00 local time |
+| `breached_cred_hits` | int | Attempts with HIBP-listed passwords |
+| `per_ip_unknowns` | dict | Per-IP unknown-account counts |
+| `reputation_scores` | dict | Latest IP reputation per source IP |
+| `captcha_active` | dict | IPs in active CAPTCHA challenge state |
+| `hard_blocked_ips` | dict | IPs that hit the post-tarpit 429 threshold |
+| `hourly_distribution` | dict | Login counts by hour-of-day |
+| `total_flag_events` | int | Cumulative tarpit flag counter (Graph 3) |
+ 
+---
+ 
+### 9.X.2 IDS Engines 5 and 6 (new)
+ 
+#### Engine 5 — Login Analytics
+ 
+Polls `GET /stats/advanced` every `ENGINE5_POLL_SEC` (30) seconds and fires
+alerts for statistical anomalies in the login stream that are **invisible to
+packet-level analysis**:
+ 
+| Signal | Threshold | Severity | Article section |
+|---|---|---|---|
+| Success-rate drop | < 5% with ≥ 20 attempts | HIGH | "Drop in login success rate across high volume" |
+| Off-hours surge | > 50% outside 08:00-22:00 | MED | "Login surges during off-hours" |
+| Unknown-account spike | > 40% non-existent emails | HIGH | "Unusual volume of failed logins for non-existent accounts" |
+| Breached-cred use | ≥ 5 HIBP-list hits | MED | (implied by article breach-dump sourcing section) |
+ 
+**Why Engine 5 is necessary even with Engine 2:**
+Engine 2 fires on low CV timing — but `distributed` mode spreads requests
+across many IPs, each IP making only a few attempts.  No single IP fills
+the CV window.  Engine 5 aggregates at the application layer and sees the
+campaign regardless of IP count.
+ 
+Each alert fires at most once per `_E5_ALERT_COOLDOWN` (120) seconds to
+avoid alert floods during a sustained run.
+ 
+**Dependency:** Engine 5 requires `fake_portal.py` running at
+`PORTAL_HOST:PORTAL_PORT` (`192.168.100.20:80`).
+ 
+#### Engine 6 — Cross-IP Fingerprint Correlation
+ 
+Reads `ip_reputation.py`'s shared in-memory state to detect the same
+browser fingerprint seen from multiple source IPs.
+ 
+```
+Fingerprint = SHA-256(User-Agent | Accept | Accept-Language | Accept-Encoding)[:12]
+ 
+Alert fires when:
+  same fingerprint seen from ≥ FP_MULTIIP_MIN (3) distinct IPs
+  within FP_WINDOW (300) seconds
+ 
+MITRE: T1090 (Proxy)
+```
+ 
+**Dependency:** Engine 6 requires `ip_reputation.py` importable in the
+same directory.  Without it, Engine 6 prints a warning and does not start.
+ 
+**Teaching experiment:**
+ 
+```bash
+# Attack 1 — no UA rotation: same fingerprint from 4 worker IPs
+python3 cred_stuffing.py --mode distributed --workers 4
+# → Engine 6 fires CrossIP/Fingerprint alert
+ 
+# Attack 2 — with UA rotation: fingerprint varies per request
+python3 cred_stuffing.py --mode distributed --workers 4 --ua-rotate
+# → Engine 6 silent (no shared fingerprint to correlate)
+# → Teaches: HTTP-header rotation evades Engine 6; TLS JA3 would not
+```
+ 
+---
+ 
+### 9.X.3 IP Reputation Module
+ 
+```bash
+# Demo mode — scores a bot-like vs browser-like request:
+python3 ip_reputation.py
+```
+ 
+Scoring bands: CLEAN (0–24) / SUSPECT (25–49) / LIKELY_BOT (50–74) / BOT (75–100).
+ 
+The portal logs the band for every attempt via `/stats/advanced → reputation_scores`.
+ 
+Score components:
+ 
+| Component | Points | Detects |
+|---|---|---|
+| Datacenter/hosting subnet | +15 | VPS / cloud-hosted bot |
+| Suspicious User-Agent | +20 | urllib, curl, requests, scrapy… |
+| Missing Accept-Language | +15 | Scripts that omit browser headers |
+| Chrome UA without Sec-Ch-Ua | +10 | Impersonating Chrome incompletely |
+| Same fingerprint ≥3 IPs / 5 min | +25 | Proxy pool with shared config |
+| X-Forwarded-For cycling ≥3 /24s | +20 | Header-based proxy rotation |
+ 
+---
+ 
+### 9.X.4 Monetization Simulator
+ 
+```bash
+# Run standalone with default hits:
+python3 monetization_sim.py
+ 
+# Specific credentials:
+python3 monetization_sim.py --hits admin@example.com:securePass123!
+ 
+# Disable specific phases:
+python3 monetization_sim.py --no-pivot --no-resale
+ 
+# Output files (add all to .gitignore):
+#   /tmp/drain_log.json        gift-card/loyalty drain receipts
+#   /tmp/resale_market.json    account resale listings
+#   /tmp/pivot_log.json        password pivot results per service
+#   /tmp/verified_hits.txt     verified combo list export
+```
+ 
+Monetization vectors and article mapping:
+ 
+| Vector | Models | Article quote |
+|---|---|---|
+| Balance drain | Gift card + loyalty point theft | "drain stored value" |
+| Fraudulent order | Purchase via saved card | "make fraudulent purchases" |
+| Account resale | Telegram/dark-web listing $0.50–$15 | "sold or bundled into new combo lists" |
+| Password pivot | 30% reuse rate, 6 other services | "pivot — reset passwords on other platforms" |
+| Combo export | `/tmp/verified_hits.txt` | "marketed as verified hits" |
+ 
 ### 9.3 Tarpitting (Credential Stuffing Response)
 
 Rather than blocking suspected credential-stuffing bots outright (which reveals detection and lets the attacker tune their jitter), a tarpit diverts them to a slow-response endpoint that artificially delays each reply by several seconds. The bot remains connected but productive throughput approaches zero, increasing the attacker's time-cost per tested credential by orders of magnitude without triggering an obvious block.
@@ -1022,6 +1303,39 @@ sensitive to the measurement window length — if you re-run `--measure --durati
 DPI detection rates will appear higher because the same absolute TTD is a larger fraction
 of the shorter window. Keep the window at 120 s for comparability with the simulated
 reference data.
+### IP Reputation Scoring
+ 
+The cumulative score is additive across all dimensions observed for
+a source IP.  A request with `python-requests` + no Accept-Language
+already scores 35 (SUSPECT).  A distributed attack where the same
+fingerprint appears from 3 IPs adds +25 (≥50, LIKELY_BOT).
+ 
+No single indicator is conclusive — this is intentional.  A legitimate
+developer might curl a login form.  Stacking multiple weak signals into
+a composite score is the pattern used by commercial bot-management
+platforms (Castle, Cloudflare, Akamai Bot Manager).
+ 
+### Off-Hours Detection
+ 
+`off_hours_pct = attempts_outside_08:00-22:00 / total_attempts × 100`
+ 
+A threshold of 50% means the majority of traffic must be nocturnal before
+an alert fires — avoiding false positives from evening users while still
+catching campaigns launched from distant time zones.
+ 
+### Unknown-Account Spike
+ 
+A service with 3 known users (alice, bob, admin) receiving 100 login
+attempts, of which 70 target unknown emails:
+ 
+`unknown_acct_pct = 70/100 × 100 = 70%`  (threshold 40%)
+ 
+This indicates the attacker used a bulk breach dump not filtered for this
+service's user base — exactly as described in the article.
+ 
+The per-IP breakdown in `/stats/advanced → per_ip_unknowns` reveals which
+source IP drives the spray, enabling targeted tarpit escalation even when
+the timing CV is too high for Engine 2 to trigger alone.
 
 ---
 
@@ -1277,6 +1591,24 @@ Post-session:
 - `p2p_node.py` — `_attack_dga_search()` first tries `from dga import bot_c2_search, generate_daily_domains` (direct in-process call, cleanest); if the module is not importable from the current working directory it falls back to `subprocess.Popen(["python3", "dga.py"])`. The stop-event is checked between domain resolution attempts so a subsequent `stop_all` command cancels the sweep cleanly.
 
 **Graph output directory:** `generate_graphs.py` saves PNGs to `./graphs/` by default (relative to the script). `run_full_lab.sh` overrides this to `/tmp/botnet_graphs/` via the inline Python call. Use `--out <path>` to set a custom directory when calling the script directly.
+
+New files require the same isolation guarantees as existing offensive modules:
+ 
+| New file | Risk category | Mitigation |
+|---|---|---|
+| `breach_dump.txt` | Fictitious but realistic credential pairs | Add to `.gitignore`; never commit to public repo |
+| `monetization_sim.py` | Models ATO monetization techniques | All accounts, balances, and orders are fictional; zero real HTTP calls |
+| `ip_reputation.py` | Proxy-detection heuristics | Read-only analysis; no network calls; operates on in-lab IPs only |
+ 
+**Additional `.gitignore` entries:**
+```
+/tmp/drain_log.json
+/tmp/resale_market.json
+/tmp/pivot_log.json
+/tmp/verified_hits.txt
+/tmp/tarpit_state.json
+breach_dump.txt
+```
 
 ---
 
