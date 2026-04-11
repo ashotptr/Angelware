@@ -1612,10 +1612,6 @@ breach_dump.txt
 
 ---
 
-49. How to Build a Real-Time Intrusion Detection System with Python and 
-Open-Source Libraries - freeCodeCamp, accessed March 12, 2026, 
-https://www.freecodecamp.org/news/build-a-real-time-intrusion-detection-syste
-m-with-python/ 
 50. WiP: Developing High-interaction Honeypots to Capture and Analyze 
 Region-Specific Bot Behaviors, accessed March 12, 2026, 
 https://isi.jhu.edu/wp-content/uploads/2024/02/Honeypot_Paper_for_HoTSoS-20
