@@ -1612,9 +1612,6 @@ breach_dump.txt
 
 ---
 
-43. Cryptojacking Detection with CPU Usage Metrics - Universidade de Lisboa, 
-accessed March 12, 2026, 
-https://fenix.tecnico.ulisboa.pt/downloadFile/1126295043837524/Res_alargado.pdf 
 44. What Is Credential Stuffing? - Palo Alto Networks, accessed March 12, 2026, 
 https://www.paloaltonetworks.com/cyberpedia/credential-stuffing 
 45. Credential Stuffing: How It Works & 4 Real-World Attacks - Seraphic, accessed 
