@@ -1612,11 +1612,6 @@ breach_dump.txt
 
 ---
 
-56. Sentinel Notebook: Guided Hunting - Domain Generation Algorithm (DGA) 
-Detection, accessed March 12, 2026, 
-https://techcommunity.microsoft.com/blog/coreinfrastructureandsecurityblog/se
-ntinel-notebook-guided-hunting---domain-generation-algorithm-dga-detection
-/4412682 
 57. Day 14 — I Built ProcWatch : A Linux Process Security Scanner for Forensics & 
 Incident Response - DEV Community, accessed March 12, 2026, 
 https://dev.to/hafiz_shamnad/day-14-i-built-procwatch-a-linux-process-security-
