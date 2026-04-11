@@ -1612,9 +1612,6 @@ breach_dump.txt
 
 ---
 
- 
-54. Incident Response - SANS Institute, accessed March 12, 2026, 
-https://www.sans.org/security-resources/glossary-of-terms/incident-response 
 55. Traffic Anomaly Detection – TCP and DNS - Infosec, accessed March 12, 2026, 
 https://www.infosecinstitute.com/resources/network-security-101/traffic-anomal
 y-detection/ 
