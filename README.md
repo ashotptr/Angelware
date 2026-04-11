@@ -1612,9 +1612,6 @@ breach_dump.txt
 
 ---
 
-51. How to Build a Honeypot in Python: A Practical Guide to Security Deception, 
-accessed March 12, 2026, 
-https://www.freecodecamp.org/news/build-a-honeypot-with-python/ 
 52. How I Set Up a Cowrie Honeypot to Capture Real SSH Attacks | HackerNoon, 
 accessed March 12, 2026, 
 https://hackernoon.com/how-i-set-up-a-cowrie-honeypot-to-capture-real-ssh-a
