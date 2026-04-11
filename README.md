@@ -1280,10 +1280,6 @@ Post-session:
 
 ---
 
-40. Slowloris DDoS attack - Cloudflare, accessed March 12, 2026, 
-https://www.cloudflare.com/ru-ru/learning/ddos/ddos-attack-tools/slowloris/ 
-41. Slowloris DDoS attack - Cloudflare, accessed March 12, 2026, 
-https://www.cloudflare.com/learning/ddos/ddos-attack-tools/slowloris/ 
 42. CryptoGuard: Lightweight Hybrid Detection and Response to Host-based 
 Cryptojackers in Linux Cloud Environments - arXiv.org, accessed March 12, 2026, 
 https://arxiv.org/html/2510.18324v1 
