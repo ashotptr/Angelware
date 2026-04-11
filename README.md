@@ -1612,9 +1612,6 @@ breach_dump.txt
 
 ---
 
-60. Evaluation of Persistence Methods Used by Malware on Microsoft Windows 
-Systems - SciTePress, accessed March 12, 2026, 
-https://www.scitepress.org/Papers/2023/117102/117102.pdf 
 61. deep-packet-inspection · GitHub Topics, accessed March 12, 2026, 
 https://github.com/topics/deep-packet-inspection?o=asc&s=stars 
 62. (PDF) QUANTITATIVE ANALYSIS OF DEFENSE ARCHITECTURES IN 
