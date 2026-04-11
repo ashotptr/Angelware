@@ -1612,9 +1612,6 @@ breach_dump.txt
 
 ---
 
-46. What Is Credential Stuffing? - Definition & More on Attacks | Proofpoint US, 
-accessed March 12, 2026, 
-https://www.proofpoint.com/us/threat-reference/credential-stuffing 
 47. Credential Stuffing: How Breaches on Other Sites Lead to Logins on Yours | by 
 InstaTunnel, accessed March 12, 2026, 
 https://medium.com/@instatunnel/credential-stuffing-how-breaches-on-other-si
