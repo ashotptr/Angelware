@@ -6,46 +6,23 @@
  Environment: ISOLATED VM LAB ONLY
 ====================================================
 
-Five detection engines + covert-channel monitor + host-based monitor:
+Detection engines:
   Engine 1 - Volumetric:      SYN flood, UDP flood
   Engine 2 - Behavioral:      Credential stuffing (CV timing)
-              ↳ NEW: flags confirmed bots in tarpit_state.json
-                     so fake_portal.py slows their responses
+              Flags confirmed bots in tarpit_state.json
   Engine 3 - DNS Anomaly:     DGA detection via entropy + NXDOMAIN burst
-              ↳ Alert fires on EITHER:
-                  (a) ≥ HIGH_ENTROPY_BURST high-entropy domain queries
-                      from one IP within DNS_WINDOW, OR
-                  (b) ≥ NXDOMAIN_BURST NXDOMAIN responses from one IP
-                      within DNS_WINDOW
-              Both paths write to the alert log so Graph 3 TPR
-              measurement via collect_graph23_data.py works correctly.
-  Engine 4 - DPI/Covert:      Repeated HTTPS polling → dead-drop detection
-  Engine 5 - Login Analytics  (NEW — article: "Drop in login success rate",
-              "Login surges during off-hours", "Unusual volume of failed
-              logins for non-existent accounts"):
-              ↳ Polls fake_portal /stats/advanced every ENGINE5_POLL_SEC
-              ↳ Success-rate drop  (< SUCCESS_RATE_MIN % with > MIN_ATTEMPTS)
-              ↳ Off-hours surge    (> OFF_HOURS_PCT_THRESH % outside 08-22)
-              ↳ Unknown-acct spike (> UNKNOWN_ACCT_PCT_THRESH % unknown emails)
-              ↳ Breached-cred use  (≥ BREACHED_COUNT_THRESH HIBP-list hits)
-  Engine 6 - Cross-IP Fingerprint Correlation (NEW — article: "Fingerprint
-              reuse: same browser characteristics appearing across many
-              sessions", "Session linking"):
-              ↳ Same browser fingerprint (UA+Accept SHA-256) seen from
-                ≥ FP_MULTIIP_MIN distinct IPs in FP_WINDOW seconds
-  Host      - Cryptojacking / ghost-process (deleted exe, high CPU,
-              name spoof)
-
-TARPIT INTEGRATION:
-  When Engine 2 fires (CV < CV_BOT_THRESHOLD), the source IP is
-  written to tarpit_state.json (via tarpit_state.flag()). The
-  portal reads this file and inserts a multi-second delay for that
-  IP — keeping the attacker's connection open but making credential
-  testing so slow it becomes economically impractical.
-
-  The IDS also monitors the tarpit state: if an IP's request rate
-  drops to zero for TARPIT_UNBLOCK_IDLE seconds, it is automatically
-  unflagged (bot moved on or changed IP) to prevent stale entries.
+  Engine 4 - DPI/Covert:      Repeated HTTPS polling -- dead-drop detection
+  Engine 5 - Login Analytics: Success-rate drop, off-hours surge,
+              unknown-account spike, breached-cred use,
+              username clustering (new)
+  Engine 6 - CrossIP/Fingerprint: same browser fingerprint from >=3 IPs
+  Engine 7 - TLS/JA3: TLS ClientHello fingerprinting (new)
+              Fires on known-bad tool hashes (urllib, curl, OpenBullet)
+              and on the same fingerprint from >=3 distinct source IPs
+  Engine 8 - ML/Adaptive: EWMA baseline + optional IsolationForest (new)
+              Replaces static thresholds with learned normal-traffic
+              baselines; adapts as service traffic profile shifts
+  Host      - Cryptojacking / ghost-process detection
 """
 
 import threading
@@ -67,53 +44,84 @@ except ImportError:
     print("[IDS] Scapy not installed. Run: pip3 install scapy")
     SCAPY_OK = False
 
-# Import tarpit state (must be in same directory)
 try:
     import tarpit_state
     TARPIT_ENABLED = True
     print("[IDS] Tarpit integration: ENABLED")
 except ImportError:
     TARPIT_ENABLED = False
-    print("[IDS] WARNING: tarpit_state.py not found — tarpit signalling disabled")
+    print("[IDS] WARNING: tarpit_state.py not found -- tarpit signalling disabled")
 
-# Import IP reputation scorer for Engine 6 cross-IP correlation (new)
 try:
     import ip_reputation
     REPUTATION_ENABLED = True
 except ImportError:
     REPUTATION_ENABLED = False
 
+# Engine 7 -- TLS JA3 Fingerprinting (new)
+try:
+    import tls_ja3
+    JA3_ENABLED = True
+    print("[IDS] TLS JA3 fingerprinting: ENABLED (Engine 7)")
+except ImportError:
+    JA3_ENABLED = False
+    print("[IDS] INFO: tls_ja3.py not found -- Engine 7 disabled")
+
+# Engine 8 -- Adaptive ML (new)
+try:
+    import ml_detector
+    ML_ENABLED = True
+    print("[IDS] Adaptive ML detector: ENABLED (Engine 8)")
+except ImportError:
+    ML_ENABLED = False
+    print("[IDS] INFO: ml_detector.py not found -- Engine 8 disabled")
+
+# Engine 5 extension -- Username clustering (new)
+try:
+    import username_clustering as _uc_module
+    CLUSTERING_ENABLED = True
+except ImportError:
+    CLUSTERING_ENABLED = False
+
 
 # ── Configuration ──────────────────────────────────────────────
-SYN_THRESHOLD        = 100    # SYNs/sec from one IP before alert
-UDP_THRESHOLD        = 200    # UDP packets/sec from one IP before alert
-CRED_WINDOW          = 20     # requests to analyze for timing analysis
-CV_BOT_THRESHOLD     = 0.15   # CV below this = bot timing detected
-DGA_ENTROPY_THRESH   = 3.8    # Shannon entropy > this = suspicious domain
-NXDOMAIN_BURST       = 10     # NXDOMAIN count per 30s window before alert
-HIGH_ENTROPY_BURST   = 5      # high-entropy queries per 30s window before alert
-CPU_SPIKE_THRESHOLD  = 85.0   # % CPU per process to flag as cryptojacking
+SYN_THRESHOLD        = 100
+UDP_THRESHOLD        = 200
+CRED_WINDOW          = 20
+CV_BOT_THRESHOLD     = 0.15
+DGA_ENTROPY_THRESH   = 3.8
+NXDOMAIN_BURST       = 10
+HIGH_ENTROPY_BURST   = 5
+CPU_SPIKE_THRESHOLD  = 85.0
 MONITOR_INTERFACE    = "enp0s3"
-TARPIT_UNBLOCK_IDLE  = 120    # seconds without login requests → auto-unflag
+TARPIT_UNBLOCK_IDLE  = 120
 
-# Alert log file — collect_graph23_data.py reads this to count alerts.
-# Set to None to disable file logging (stdout only).
 IDS_LOG_FILE         = "/tmp/ids.log"
 
-# Engine 5 — Login Analytics (new)
+# Engine 5 -- Login Analytics
 PORTAL_HOST               = "192.168.100.20"
 PORTAL_PORT               = 80
-ENGINE5_POLL_SEC          = 30    # how often to poll /stats/advanced
-SUCCESS_RATE_MIN          = 5.0   # % below this → alert (requires MIN_ATTEMPTS)
-MIN_ATTEMPTS_FOR_RATE     = 20    # minimum total attempts before rate alert fires
-OFF_HOURS_PCT_THRESH      = 50.0  # % outside 08:00-22:00 → alert
-UNKNOWN_ACCT_PCT_THRESH   = 40.0  # % unknown-account attempts → alert
-BREACHED_COUNT_THRESH     = 5     # count of HIBP-list attempts → alert
-_E5_ALERT_COOLDOWN        = 120   # seconds between repeated alerts for same signal
+ENGINE5_POLL_SEC          = 30
+SUCCESS_RATE_MIN          = 5.0
+MIN_ATTEMPTS_FOR_RATE     = 20
+OFF_HOURS_PCT_THRESH      = 50.0
+UNKNOWN_ACCT_PCT_THRESH   = 40.0
+BREACHED_COUNT_THRESH     = 5
+_E5_ALERT_COOLDOWN        = 120
 
-# Engine 6 — Cross-IP Fingerprint Correlation (new)
-FP_MULTIIP_MIN   = 3     # same fingerprint from this many IPs → alert
-FP_WINDOW        = 300   # seconds over which to track fingerprint reuse
+# Engine 6 -- Cross-IP Fingerprint Correlation
+FP_MULTIIP_MIN   = 3
+FP_WINDOW        = 300
+
+# Engine 7 -- TLS JA3 (new)
+JA3_MULTIIP_MIN  = 3
+JA3_WINDOW       = 300
+
+# Engine 8 -- Adaptive ML (new)
+ML_FEATURE_WINDOW  = 60
+_ml_last_sample    = 0.0
+_e8_alert_cooldown = 90.0
+_e8_last_alert_ts  = [0.0]   # list to allow mutation inside nested function
 
 
 # ── Log file setup ─────────────────────────────────────────────
@@ -121,17 +129,15 @@ _log_fh   = None
 _log_lock = threading.Lock()
 
 def _open_log_file():
-    """Open the IDS log file for append on first use (thread-safe)."""
     global _log_fh
     if IDS_LOG_FILE is None:
         return
     with _log_lock:
         if _log_fh is None:
             try:
-                _log_fh = open(IDS_LOG_FILE, "a", buffering=1)  # line-buffered
+                _log_fh = open(IDS_LOG_FILE, "a", buffering=1)
             except OSError as e:
                 print(f"[IDS] WARNING: cannot open log file {IDS_LOG_FILE}: {e}")
-                print(f"[IDS] Alerts will be printed to stdout only.")
 
 
 # ── Shared alert state ──────────────────────────────────────────
@@ -139,22 +145,13 @@ alert_count = 0
 alert_lock  = threading.Lock()
 
 def alert(engine, severity, msg):
-    """
-    Fire an IDS alert.
-
-    Writes to:
-      1. stdout  — coloured, human-readable (always)
-      2. IDS_LOG_FILE — plain text, one '=' header per alert (when configured)
-
-    collect_graph23_data.py counts lines containing the alert keyword
-    (e.g. "CREDENTIAL STUFFING") in IDS_LOG_FILE to measure TPR/FPR.
-    """
     global alert_count
     ts = datetime.now().strftime("%H:%M:%S")
     sev_str = {
-        "HIGH": "\033[91m[HIGH]\033[0m",
-        "MED":  "\033[93m[MED] \033[0m",
-        "LOW":  "\033[94m[LOW] \033[0m",
+        "HIGH":     "\033[91m[HIGH]\033[0m",
+        "CRITICAL": "\033[91m[CRITICAL]\033[0m",
+        "MED":      "\033[93m[MED] \033[0m",
+        "LOW":      "\033[94m[LOW] \033[0m",
     }.get(severity, severity)
 
     plain_header = (
@@ -188,7 +185,7 @@ def alert(engine, severity, msg):
 syn_counter    = defaultdict(int)
 udp_counter    = defaultdict(int)
 last_vol_reset = time.time()
-VOL_WINDOW     = 1.0   # seconds
+VOL_WINDOW     = 1.0
 
 def process_volumetric(pkt):
     global last_vol_reset, syn_counter, udp_counter
@@ -198,8 +195,7 @@ def process_volumetric(pkt):
         for ip, count in list(syn_counter.items()):
             if count >= SYN_THRESHOLD:
                 alert("Volumetric", "HIGH",
-                      f"SYN FLOOD detected: {ip} sent {count} SYNs in {VOL_WINDOW}s "
-                      f"→ likely target port exhaustion")
+                      f"SYN FLOOD detected: {ip} sent {count} SYNs in {VOL_WINDOW}s")
         for ip, count in list(udp_counter.items()):
             if count >= UDP_THRESHOLD:
                 alert("Volumetric", "HIGH",
@@ -210,7 +206,7 @@ def process_volumetric(pkt):
 
     if pkt.haslayer(IP):
         src = pkt[IP].src
-        if pkt.haslayer(TCP) and pkt[TCP].flags == 0x02:   # SYN only
+        if pkt.haslayer(TCP) and pkt[TCP].flags == 0x02:
             syn_counter[src] += 1
         if pkt.haslayer(UDP):
             udp_counter[src] += 1
@@ -227,11 +223,6 @@ login_times_lock = threading.Lock()
 
 
 def compute_cv(timestamps: deque) -> float:
-    """
-    Coefficient of Variation = stddev / mean of inter-arrival times.
-    Low CV (< 0.15) = bot-like rigid timing.
-    High CV (> 0.5) = human-like irregular timing.
-    """
     if len(timestamps) < 5:
         return float('inf')
     intervals = [timestamps[i] - timestamps[i-1] for i in range(1, len(timestamps))]
@@ -241,12 +232,6 @@ def compute_cv(timestamps: deque) -> float:
 
 
 def process_credential_stuffing(pkt):
-    """
-    Detect HTTP POST requests to /login, analyze timing CV.
-    On confirmed bot (CV < threshold):
-      1. Fire IDS alert
-      2. Flag the source IP in tarpit_state → portal adds delay
-    """
     if not (pkt.haslayer(IP) and pkt.haslayer(TCP)):
         return
     if pkt[TCP].dport != 80:
@@ -274,7 +259,7 @@ def process_credential_stuffing(pkt):
                               f"CREDENTIAL STUFFING detected: {src_ip}\n"
                               f"  Requests analyzed: {len(q)}\n"
                               f"  CV = {cv:.4f} (threshold: {CV_BOT_THRESHOLD})\n"
-                              f"  Avg interval: {avg_interval:.3f}s  → bot-like rigid timing")
+                              f"  Avg interval: {avg_interval:.3f}s  -- bot-like rigid timing")
 
                         if TARPIT_ENABLED:
                             if not tarpit_state.is_flagged(src_ip):
@@ -284,17 +269,13 @@ def process_credential_stuffing(pkt):
                             else:
                                 print(f"[IDS-E2] {src_ip} already tarpitted")
 
-                        login_times[src_ip].clear()  # reset window after alert
+                        login_times[src_ip].clear()
 
     except Exception:
         pass
 
 
 def tarpit_auto_unblock_loop():
-    """
-    Background thread: if a flagged IP has been silent for
-    TARPIT_UNBLOCK_IDLE seconds, automatically remove its tarpit flag.
-    """
     if not TARPIT_ENABLED:
         return
     print(f"[IDS-TARPIT] Auto-unblock monitor started "
@@ -314,35 +295,16 @@ def tarpit_auto_unblock_loop():
 
 # ══════════════════════════════════════════════════════════════
 #  ENGINE 3: DNS ANOMALY & DGA DETECTION
-#
-#  Two independent alert triggers (both write to the alert log):
-#
-#    (a) HIGH-ENTROPY QUERY BURST
-#        When a single source IP queries >= HIGH_ENTROPY_BURST domains
-#        whose label part has Shannon entropy > DGA_ENTROPY_THRESH within
-#        DNS_WINDOW seconds.  This catches DGA scanners that may not yet
-#        have received NXDOMAIN responses (e.g. if DNS is slow).
-#
-#    (b) NXDOMAIN BURST
-#        When a single source IP receives >= NXDOMAIN_BURST NXDOMAIN
-#        responses within DNS_WINDOW seconds.  This is the classic DGA
-#        detection signal — a bot iterating through its daily domain list
-#        will receive one NXDOMAIN per domain until the registered C2
-#        domain is found.
-#
-#  Both triggers include entropy context in the alert message so analysts
-#  can verify the DGA hypothesis from the log without additional tooling.
 # ══════════════════════════════════════════════════════════════
 
 nxdomain_counts     = defaultdict(int)
-high_entropy_counts = defaultdict(int)   # per-IP count of high-entropy queries
-queried_domains     = defaultdict(set)   # per-IP set of queried domains (for context)
+high_entropy_counts = defaultdict(int)
+queried_domains     = defaultdict(set)
 last_dns_reset      = time.time()
-DNS_WINDOW          = 30.0   # seconds
+DNS_WINDOW          = 30.0
 
 
 def shannon_entropy(name: str) -> float:
-    """H(X) = -sum P(x_i) log2 P(x_i) for character distribution."""
     if not name:
         return 0.0
     freq = {}
@@ -360,11 +322,9 @@ def process_dns(pkt):
     now = time.time()
 
     if now - last_dns_reset >= DNS_WINDOW:
-        # ── Check NXDOMAIN burst ───────────────────────────────────
         for ip, count in list(nxdomain_counts.items()):
             if count >= NXDOMAIN_BURST:
                 sample = list(queried_domains.get(ip, set()))[:5]
-                # Include entropy scores for analyst context
                 entropy_context = ", ".join(
                     f"{d}(H={shannon_entropy(d.split('.')[0]):.2f})"
                     for d in sample
@@ -374,11 +334,8 @@ def process_dns(pkt):
                       f"got {count} NXDOMAIN responses in {DNS_WINDOW}s\n"
                       f"  Sample domains: {entropy_context}")
 
-        # ── Check high-entropy query burst ─────────────────────────
         for ip, count in list(high_entropy_counts.items()):
             if count >= HIGH_ENTROPY_BURST:
-                # Only fire if this IP did NOT already trigger the NXDOMAIN
-                # alert above (to avoid duplicate alerts for the same event)
                 if nxdomain_counts.get(ip, 0) < NXDOMAIN_BURST:
                     sample = list(queried_domains.get(ip, set()))[:5]
                     entropy_context = ", ".join(
@@ -390,7 +347,7 @@ def process_dns(pkt):
                           f"queried {count} high-entropy domains in {DNS_WINDOW}s\n"
                           f"  H threshold: >{DGA_ENTROPY_THRESH} bits/char\n"
                           f"  Sample domains: {entropy_context}\n"
-                          f"  (NXDOMAIN burst may follow — or DNS is slow)")
+                          f"  (NXDOMAIN burst may follow -- or DNS is slow)")
 
         nxdomain_counts.clear()
         high_entropy_counts.clear()
@@ -402,7 +359,6 @@ def process_dns(pkt):
 
     src_ip = pkt[IP].src if pkt.haslayer(IP) else "?"
 
-    # DNS Query — score domain entropy and track per-IP
     if pkt.haslayer(DNSQR):
         try:
             qname     = pkt[DNSQR].qname.decode("utf-8").rstrip(".")
@@ -411,14 +367,12 @@ def process_dns(pkt):
             queried_domains[src_ip].add(qname)
             if entropy > DGA_ENTROPY_THRESH and len(name_part) > 6:
                 high_entropy_counts[src_ip] += 1
-                # Debug line for live monitoring — does NOT replace the alert
                 print(f"[DNS-ENG] High-entropy query from {src_ip}: "
                       f"{qname}  H={entropy:.2f} "
                       f"(window count: {high_entropy_counts[src_ip]}/{HIGH_ENTROPY_BURST})")
         except Exception:
             pass
 
-    # DNS Response — detect NXDOMAIN (rcode=3)
     if pkt[DNS].qr == 1 and pkt[DNS].rcode == 3:
         nxdomain_counts[src_ip] += 1
 
@@ -427,16 +381,12 @@ def process_dns(pkt):
 #  ENGINE 4: DPI / COVERT CHANNEL MONITOR
 # ══════════════════════════════════════════════════════════════
 
-https_conn_tracker  = defaultdict(lambda: defaultdict(list))  # src→dst→[timestamps]
+https_conn_tracker  = defaultdict(lambda: defaultdict(list))
 last_https_reset    = time.time()
 HTTPS_WINDOW        = 60.0
-HTTPS_CONN_THRESH   = 10    # >10 HTTPS connections to same dest in 60s → alert
+HTTPS_CONN_THRESH   = 10
 
 def process_covert_channel(pkt):
-    """
-    Detect the Phase 2 dead-drop polling pattern:
-    repeated HTTPS SYN connections from one source to the same destination.
-    """
     global last_https_reset
     now = time.time()
 
@@ -446,41 +396,25 @@ def process_covert_channel(pkt):
                 count = len(timestamps)
                 if count >= HTTPS_CONN_THRESH:
                     alert("DPI/Covert", "MED",
-                          f"COVERT CHANNEL suspected: {src} → {dst}\n"
+                          f"COVERT CHANNEL suspected: {src} -> {dst}\n"
                           f"  {count} HTTPS SYNs in {HTTPS_WINDOW:.0f}s window\n"
                           f"  Pattern matches dead-drop polling (Phase 2 botnet)\n"
-                          f"  Port blocking (443) would NOT detect this — requires DPI")
+                          f"  Port blocking (443) would NOT detect this -- requires DPI")
         https_conn_tracker.clear()
         last_https_reset = now
 
     if not (pkt.haslayer(IP) and pkt.haslayer(TCP)):
         return
-    if pkt[TCP].dport == 443 and pkt[TCP].flags == 0x02:   # HTTPS SYN
+    if pkt[TCP].dport == 443 and pkt[TCP].flags == 0x02:
         src = pkt[IP].src
         dst = pkt[IP].dst
         https_conn_tracker[src][dst].append(now)
 
 
 # ══════════════════════════════════════════════════════════════
-#  ENGINE 5: LOGIN ANALYTICS (new)
-#
-#  Polls fake_portal.py /stats/advanced every ENGINE5_POLL_SEC.
-#  Detects signals invisible to packet-level analysis:
-#    a) Success-rate drop  — ratio of successes to total attempts
-#       plummets when a bot sprays wrong passwords from a breach dump.
-#       Crucially catches distributed attacks that spread across many
-#       IPs (each IP below Engine 2's CV window threshold).
-#    b) Off-hours surge    — legitimate human logins cluster during
-#       waking hours; bot campaigns often run at night / off-timezone.
-#    c) Unknown-account spike — bots use bulk breach dumps containing
-#       many emails never registered on this service.
-#    d) Breached password use — submitting known-breached passwords
-#       signals automated spray, not a human forgetting their password.
-#
-#  Article mapping (Castle blog):
-#    "Unusual volume of failed logins for non-existent accounts"
-#    "Login surges during off-hours"
-#    "Drop in login success rate across high volume"
+#  ENGINE 5: LOGIN ANALYTICS
+#  + ENGINE 5e: USERNAME CLUSTERING (new)
+#  + ENGINE 8 TRIGGER (new)
 # ══════════════════════════════════════════════════════════════
 
 _e5_last_alert: dict = {
@@ -488,11 +422,11 @@ _e5_last_alert: dict = {
     "off_hours":    0.0,
     "unknown_acct": 0.0,
     "breached":     0.0,
+    "clustering":   0.0,   # new
 }
 
 
 def _fetch_portal_stats() -> dict:
-    """Fetch /stats/advanced from the fake portal."""
     url = f"http://{PORTAL_HOST}:{PORTAL_PORT}/stats/advanced"
     try:
         with urllib.request.urlopen(url, timeout=5) as resp:
@@ -503,11 +437,6 @@ def _fetch_portal_stats() -> dict:
 
 
 def engine5_loop():
-    """
-    Background thread for Engine 5 — Login Analytics.
-    Polls the portal every ENGINE5_POLL_SEC seconds and fires
-    alerts for statistical anomalies in the login stream.
-    """
     print(f"[IDS-E5] Login Analytics engine started "
           f"(polling {PORTAL_HOST}:{PORTAL_PORT}/stats/advanced "
           f"every {ENGINE5_POLL_SEC}s)")
@@ -577,44 +506,43 @@ def engine5_loop():
                   f"BREACHED CREDENTIAL SPRAY detected\n"
                   f"  {br_cnt} login attempts used passwords from known-breached "
                   f"password lists (simulated HIBP k-Anonymity check).\n"
-                  f"  Threshold: ≥{BREACHED_COUNT_THRESH} hits\n"
+                  f"  Threshold: >={BREACHED_COUNT_THRESH} hits\n"
                   f"  Indicates automated spray from a breach combo list, "
                   f"not a human who simply forgot their password.")
 
+        # e) Username clustering (new)
+        # Article mapping: "Clustering around similar usernames: high volumes
+        #   targeting similar email patterns suggest automation using generic
+        #   breach data or brute-force permutations."
+        if CLUSTERING_ENABLED:
+            clustering = stats.get("username_clustering", {})
+            if clustering.get("anomalous") and clustering.get("alerts"):
+                c_alerts = clustering["alerts"]
+                if now - _e5_last_alert["clustering"] > _E5_ALERT_COOLDOWN:
+                    _e5_last_alert["clustering"] = now
+                    alert(
+                        "LoginAnalytics/UsernameClustering", "MED",
+                        "USERNAME CLUSTERING detected\n"
+                        "  " + "\n  ".join(c_alerts) + "\n"
+                        "  Indicates breach dump from a single service or\n"
+                        "  automated username permutation list.\n"
+                        "  MITRE: T1110.004 (Credential Stuffing)"
+                    )
+
+        # Engine 8 -- adaptive ML check (new)
+        _engine8_update(stats, now)
+
 
 # ══════════════════════════════════════════════════════════════
-#  ENGINE 6: CROSS-IP FINGERPRINT CORRELATION (new)
-#
-#  Detects credential stuffing via distributed proxy pools by
-#  identifying requests sharing the same browser fingerprint
-#  (User-Agent + Accept headers → SHA-256) across many distinct
-#  source IPs within a short window.
-#
-#  A single bot config (OpenBullet config, Python script) being used
-#  from a proxy pool generates identical headers from different IPs.
-#  This attack evades per-IP rate limiting entirely — the fingerprint
-#  is the cross-IP link.
-#
-#  Article mapping (Castle blog):
-#    "Fingerprint reuse: same browser characteristics appearing across
-#     many sessions, suggesting automation or anti-detect tools."
-#    "Session linking: by linking sessions over time using TLS
-#     fingerprints and device traits, you can detect distributed
-#     attacks that wouldn't trigger individual alerts."
-#  MITRE: T1090 (Proxy)
+#  ENGINE 6: CROSS-IP FINGERPRINT CORRELATION
 # ══════════════════════════════════════════════════════════════
 
-_e6_alerted_fps: set = set()   # fingerprints already alerted on
+_e6_alerted_fps: set = set()
 
 
 def engine6_loop():
-    """
-    Background thread for Engine 6 — Cross-IP Fingerprint Correlation.
-    Reads the ip_reputation module's shared state to detect the same
-    browser fingerprint appearing from multiple source IPs.
-    """
     if not REPUTATION_ENABLED:
-        print("[IDS-E6] ip_reputation.py not available — Engine 6 disabled")
+        print("[IDS-E6] ip_reputation.py not available -- Engine 6 disabled")
         return
 
     print(f"[IDS-E6] Cross-IP Fingerprint Correlation engine started "
@@ -625,7 +553,7 @@ def engine6_loop():
         for h in hits:
             fp = h["fingerprint"]
             if fp in _e6_alerted_fps:
-                continue   # already fired for this fingerprint
+                continue
             _e6_alerted_fps.add(fp)
             alert("CrossIP/Fingerprint", "HIGH",
                   f"DISTRIBUTED BOT FINGERPRINT detected\n"
@@ -633,14 +561,115 @@ def engine6_loop():
                   f"  Seen from {h['n_ips']} distinct source IPs "
                   f"in {h['age_sec']:.0f}s:\n"
                   f"    {h['ips']}\n"
-                  f"  Threshold: ≥{FP_MULTIIP_MIN} IPs / {FP_WINDOW}s\n"
+                  f"  Threshold: >={FP_MULTIIP_MIN} IPs / {FP_WINDOW}s\n"
                   f"  A single bot config (same UA + Accept headers) being "
                   f"used from multiple IPs indicates proxy pool rotation.\n"
-                  f"  This attack evades per-IP rate limiting — the shared "
+                  f"  This attack evades per-IP rate limiting -- the shared "
                   f"fingerprint is the cross-IP link.\n"
                   f"  Countermeasure: block or challenge the fingerprint, "
                   f"not just individual IPs.\n"
                   f"  MITRE: T1090 (Proxy)")
+
+
+# ══════════════════════════════════════════════════════════════
+#  ENGINE 7: TLS JA3 FINGERPRINTING (new)
+#
+#  Extracts JA3 fingerprint from TLS ClientHello packets.
+#  Fires two alert classes:
+#    a) KNOWN_BAD  -- hash matches a known HTTP-library fingerprint
+#       (Python urllib, requests, curl, OpenBullet embedded Chromium)
+#    b) MULTI_IP   -- same hash from >=3 distinct IPs within window
+#       (shared bot framework; evades HTTP header rotation)
+#
+#  Key teaching point vs Engine 6:
+#    Engine 6: HTTP header fingerprint -- defeated by rotating UA/Accept
+#    Engine 7: TLS JA3 fingerprint -- cannot be changed without patching
+#              the HTTP library, because ClientHello is generated below
+#              the application layer
+#
+#  Article mapping (Castle blog):
+#    "Uniform TLS or header signatures: unusual spikes linked to
+#     specific TLS fingerprints across login attempts may indicate
+#     a shared bot framework."
+#  MITRE: T1071.001 (Application Layer Protocol: Web Protocols)
+# ══════════════════════════════════════════════════════════════
+
+def process_tls_fingerprint(pkt):
+    if not JA3_ENABLED:
+        return
+    result = tls_ja3.engine7_process(pkt)
+    if result:
+        alert(result["alert_type"], result.get("severity", "HIGH"),
+              result["message"])
+
+
+# ══════════════════════════════════════════════════════════════
+#  ENGINE 8: ADAPTIVE ML ANOMALY DETECTION (new)
+#
+#  Replaces static thresholds with EWMA baselines that learn the
+#  normal traffic pattern for this service. Fires when a feature
+#  vector [cv, rate, success_pct, unknown_pct] deviates from the
+#  learned baseline by more than Z_THRESHOLD standard deviations.
+#
+#  Also wraps an optional IsolationForest (sklearn) retrained
+#  every 50 samples on normal-traffic windows.
+#
+#  Article mapping (Castle blog):
+#    "Evolving detection signals: the bot ecosystem moves quickly.
+#     New Puppeteer forks, anti-fingerprint patches, solver APIs --
+#     all ship weekly. Static detections degrade fast. Your system
+#     needs to ingest fresh signals, retrain detection logic, and
+#     respond to campaign-level shifts as they emerge."
+# ══════════════════════════════════════════════════════════════
+
+def _engine8_update(stats: dict, now: float):
+    global _ml_last_sample
+    if not ML_ENABLED:
+        return
+
+    total        = stats.get("total_attempts", 0)
+    success_pct  = stats.get("success_rate_pct", 100.0)
+    unknown_pct  = stats.get("unknown_acct_pct", 0.0)
+    elapsed      = max(1.0, now - _ml_last_sample) if _ml_last_sample else ML_FEATURE_WINDOW
+    rate         = total / elapsed
+
+    # Extract minimum (worst-case) CV across tracked IPs
+    with login_times_lock:
+        all_cvs = []
+        for ip, dq in login_times.items():
+            if len(dq) >= 5:
+                intervals = [dq[i] - dq[i-1] for i in range(1, len(dq))]
+                mean = statistics.mean(intervals)
+                if mean > 0:
+                    all_cvs.append(statistics.stdev(intervals) / mean)
+        global_cv = min(all_cvs) if all_cvs else 1.0
+
+    result = ml_detector.engine8_update(
+        cv=global_cv, rate=rate,
+        success_pct=success_pct, unknown_pct=unknown_pct,
+    )
+    _ml_last_sample = now
+
+    if result["anomalous"] and now - _e8_last_alert_ts[0] > _e8_alert_cooldown:
+        _e8_last_alert_ts[0] = now
+        trig = "\n  ".join(result["triggers"])
+        bs   = result["baselines"]
+        alert(
+            "ML/Adaptive", "HIGH",
+            f"ADAPTIVE ANOMALY DETECTED (Engine 8)\n"
+            f"  Anomaly score:   {result['score']}/100\n"
+            f"  Global min CV:   {global_cv:.4f}  "
+            f"(baseline {bs['cv']['mean']:.4f} +/-{bs['cv']['stddev']:.4f})\n"
+            f"  Request rate:    {rate:.2f} req/s  "
+            f"(baseline {bs['rate']['mean']:.2f})\n"
+            f"  Success rate:    {success_pct:.1f}%  "
+            f"(baseline {bs['success']['mean']:.1f}%)\n"
+            f"  Unknown accts:   {unknown_pct:.1f}%\n"
+            f"  Triggers:\n  {trig}\n"
+            f"  IsolationForest: {'flagged' if result.get('forest_flag') else 'not flagged'}\n"
+            f"  Adaptive ready:  {result['adaptive_ready']}\n"
+            f"  MITRE: T1110.004 (Credential Stuffing)"
+        )
 
 
 # ══════════════════════════════════════════════════════════════
@@ -653,12 +682,6 @@ SYSTEM_PROCESS_WHITELIST = {
 }
 
 def host_monitor_loop():
-    """
-    Poll every 5 seconds for:
-      1. Memory-resident binaries: /proc/[pid]/exe → (deleted)
-      2. Sustained high CPU from unexpected processes
-      3. Process name spoofing (/proc/pid/comm ≠ exe basename)
-    """
     print("[HOST] Host-based monitor started (cryptojacking + ghost process)")
     for proc in psutil.process_iter(["pid", "name", "cpu_percent", "exe"]):
         try:
@@ -678,7 +701,7 @@ def host_monitor_loop():
                 exe     = info["exe"] or ""
                 cmdline = " ".join(info["cmdline"] or [])
 
-                # ── Ghost process check ──────────────────────────
+                # Ghost process check
                 exe_path = f"/proc/{pid}/exe"
                 try:
                     real_exe = subprocess.check_output(
@@ -688,13 +711,13 @@ def host_monitor_loop():
                     if "(deleted)" in real_exe:
                         alert("Host/Ghost", "HIGH",
                               f"GHOST PROCESS detected: PID={pid} name={name}\n"
-                              f"  /proc/{pid}/exe → {real_exe}\n"
-                              f"  Binary deleted from disk — memory-resident payload!\n"
-                              f"  MITRE: T1070.004 (Indicator Removal — File Deletion)")
+                              f"  /proc/{pid}/exe -> {real_exe}\n"
+                              f"  Binary deleted from disk -- memory-resident payload!\n"
+                              f"  MITRE: T1070.004 (Indicator Removal -- File Deletion)")
                 except Exception:
                     pass
 
-                # ── Sustained CPU spike check ────────────────────
+                # Sustained CPU spike check
                 if cpu >= CPU_SPIKE_THRESHOLD:
                     base_name = name.split("/")[0].split(":")[0]
                     if base_name not in SYSTEM_PROCESS_WHITELIST:
@@ -702,10 +725,10 @@ def host_monitor_loop():
                               f"HIGH CPU PROCESS: PID={pid} name={name} cpu={cpu:.1f}%\n"
                               f"  cmdline: {cmdline[:100]}\n"
                               f"  exe: {exe}\n"
-                              f"  Threshold: {CPU_SPIKE_THRESHOLD}% — possible cryptojacking\n"
+                              f"  Threshold: {CPU_SPIKE_THRESHOLD}% -- possible cryptojacking\n"
                               f"  MITRE: T1496 (Resource Hijacking)")
 
-                # ── Name-spoof detection ─────────────────────────
+                # Name-spoof detection
                 comm_path = f"/proc/{pid}/comm"
                 if exe and os.path.exists(comm_path):
                     try:
@@ -728,47 +751,64 @@ def host_monitor_loop():
 
 
 # ══════════════════════════════════════════════════════════════
-#  MAIN — DISPATCHER
+#  MAIN DISPATCHER
 # ══════════════════════════════════════════════════════════════
 
 def packet_handler(pkt):
-    """Route each captured packet to all relevant engines."""
     process_volumetric(pkt)
     process_credential_stuffing(pkt)
     process_dns(pkt)
     process_covert_channel(pkt)
+    process_tls_fingerprint(pkt)   # Engine 7 (new)
 
 
 def main():
     print("=" * 60)
-    print(" AUA CS 232/337 — Network + Host IDS")
+    print(" AUA CS 232/337 -- Network + Host IDS")
     print(f" Interface: {MONITOR_INTERFACE}")
     print(f" Tarpit: {'ENABLED' if TARPIT_ENABLED else 'DISABLED'}")
     if IDS_LOG_FILE:
         print(f" Alert log: {IDS_LOG_FILE}")
-        print(f"   (collect_graph23_data.py reads this for TPR/FPR measurement)")
     print()
     print(" Engines:")
-    print("   1  Volumetric    — SYN/UDP flood")
-    print("   2  Behavioral    — Credential stuffing CV timing")
+    print("   1  Volumetric    -- SYN/UDP flood")
+    print("   2  Behavioral    -- Credential stuffing CV timing")
     if TARPIT_ENABLED:
-        print("      └─ Tarpit    — Flags bot IPs in tarpit_state.json")
-        print(f"         └─ Auto-unblock after {TARPIT_UNBLOCK_IDLE}s silence")
-    print("   3  DNS/DGA       — High-entropy query burst OR NXDOMAIN burst")
-    print(f"      └─ Entropy alert: ≥{HIGH_ENTROPY_BURST} H>{DGA_ENTROPY_THRESH:.1f} queries in {DNS_WINDOW:.0f}s")
-    print(f"      └─ NXDOMAIN alert: ≥{NXDOMAIN_BURST} NXDOMAINs in {DNS_WINDOW:.0f}s")
-    print("   4  DPI/Covert    — Repeated HTTPS polling pattern")
-    print("   5  LoginAnalytics (NEW)")
-    print(f"      ├─ Success-rate drop  (< {SUCCESS_RATE_MIN}% with ≥ {MIN_ATTEMPTS_FOR_RATE} attempts)")
-    print(f"      ├─ Off-hours surge    (> {OFF_HOURS_PCT_THRESH}% outside 08:00-22:00)")
-    print(f"      ├─ Unknown-acct spike (> {UNKNOWN_ACCT_PCT_THRESH}% non-existent emails)")
-    print(f"      └─ Breached-cred use  (≥ {BREACHED_COUNT_THRESH} HIBP-list hits)")
+        print("      Tarpit       -- Flags bot IPs in tarpit_state.json")
+        print(f"         Auto-unblock after {TARPIT_UNBLOCK_IDLE}s silence")
+    print("   3  DNS/DGA       -- High-entropy query burst OR NXDOMAIN burst")
+    print(f"      Entropy alert: >={HIGH_ENTROPY_BURST} H>{DGA_ENTROPY_THRESH:.1f} queries in {DNS_WINDOW:.0f}s")
+    print(f"      NXDOMAIN alert: >={NXDOMAIN_BURST} NXDOMAINs in {DNS_WINDOW:.0f}s")
+    print("   4  DPI/Covert    -- Repeated HTTPS polling pattern")
+    print("   5  LoginAnalytics")
+    print(f"      Success-rate drop  (< {SUCCESS_RATE_MIN}% with >= {MIN_ATTEMPTS_FOR_RATE} attempts)")
+    print(f"      Off-hours surge    (> {OFF_HOURS_PCT_THRESH}% outside 08:00-22:00)")
+    print(f"      Unknown-acct spike (> {UNKNOWN_ACCT_PCT_THRESH}% non-existent emails)")
+    print(f"      Breached-cred use  (>= {BREACHED_COUNT_THRESH} HIBP-list hits)")
+    if CLUSTERING_ENABLED:
+        print("      Username clustering  -- domain conc / sequential / prefix (NEW)")
+    else:
+        print("      Username clustering  (DISABLED -- username_clustering.py not found)")
     print(f"         Polls {PORTAL_HOST}:{PORTAL_PORT}/stats/advanced every {ENGINE5_POLL_SEC}s")
-    print("   6  CrossIP/Fingerprint (NEW)")
-    print(f"      └─ Same browser fingerprint from ≥{FP_MULTIIP_MIN} IPs in {FP_WINDOW}s")
+    print("   6  CrossIP/Fingerprint -- same browser fingerprint from "
+          f">={FP_MULTIIP_MIN} IPs in {FP_WINDOW}s")
     if not REPUTATION_ENABLED:
-        print("         (DISABLED — ip_reputation.py not found)")
-    print("   H  Host          — Ghost process + name spoof + CPU spike")
+        print("         (DISABLED -- ip_reputation.py not found)")
+    print("   7  TLS/JA3       -- TLS ClientHello fingerprinting (NEW)")
+    if JA3_ENABLED:
+        print(f"      Known-bad hashes: {len(tls_ja3.KNOWN_BAD_JA3)}")
+        print(f"      Multi-IP alert: same JA3 from >={JA3_MULTIIP_MIN} IPs / {JA3_WINDOW}s")
+    else:
+        print("         (DISABLED -- tls_ja3.py not found)")
+    print("   8  ML/Adaptive   -- EWMA baseline + IsolationForest (NEW)")
+    if ML_ENABLED:
+        status = ml_detector.global_detector.get_status()
+        print(f"      sklearn IsolationForest: "
+              f"{'enabled' if status['sklearn_forest'] else 'disabled (pip install scikit-learn)'}")
+        print(f"      warmup samples: {ml_detector.WARMUP_SAMPLES}")
+    else:
+        print("         (DISABLED -- ml_detector.py not found)")
+    print("   H  Host          -- Ghost process + name spoof + CPU spike")
     print("=" * 60)
 
     if not SCAPY_OK:

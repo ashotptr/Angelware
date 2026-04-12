@@ -16,48 +16,29 @@ TARPIT INTEGRATION:
   it writes that IP to tarpit_state.json. This portal
   reads that file on every /login request:
 
-  Flagged IP  → response delayed by 8±2 seconds
-               (attacker's throughput → near zero)
-               (connection is kept alive, not blocked)
-  Normal IP   → response in <200ms (unchanged)
-
-  This is non-blocking tarpitting: the bot stays connected
-  and receives a valid HTTP response, but so slowly that
-  testing 1,000 credentials now takes ~2.2 hours instead
-  of ~5 minutes. Crucially, the attacker cannot detect
-  that they are blocked — no 429, no RST, no error.
+  Flagged IP  -> response delayed by 8+-2 seconds
+  Normal IP   -> response in <200ms (unchanged)
 
 GRAPH 3 DETECTION PROXY:
   collect_graph23_data.py uses GET /tarpit/status to measure
-  whether the IDS fired during a jitter-level sweep.  The
-  response includes two counters:
-    total_delayed     — increments when a /login response is
-                        actually delayed (race-prone: only
-                        increments if the bot is still sending
-                        requests after the flag is set)
-    total_flag_events — increments the instant tarpit_state.flag()
-                        is called, before any response is delayed
-                        (race-condition-free)
-  collect_graph23_data.py prefers total_flag_events when present.
+  whether the IDS fired during a jitter-level sweep.
+    total_delayed     -- increments when a /login response is delayed
+    total_flag_events -- increments the instant tarpit_state.flag()
+                         is called (race-condition-free)
 
 NEW DEFENSES (added to match Castle credential stuffing article):
-  1. Unknown-account tracking  — counts attempts against emails not
-     in the user DB; exposed per-IP in /stats/advanced for Engine 5.
-  2. Per-username rate limiting — 429 after USERNAME_RATE_MAX attempts
-     per email per USERNAME_RATE_WINDOW seconds.
-  3. IP reputation scoring     — every request scored via
-     ip_reputation.py (datacenter subnet, suspicious UA, missing
-     headers, X-Fwd cycling, cross-IP fingerprint reuse).
-  4. Progressive CAPTCHA        — after CAPTCHA_FAIL_THRESHOLD
-     consecutive failures from one IP, a math challenge is issued.
-     Bots using plain urllib/requests cannot solve it without custom
-     parsing code, increasing attacker cost.
-  5. Hard block (429)          — after N_BEFORE_BLOCK further failures
-     post-tarpit, escalates to an explicit 429 to demonstrate the
-     silent tarpit → detected escalation path.
-  6. Breach credential detection — flags passwords found in a
-     known-breached list (HIBP k-Anonymity API simulation).
-  7. /stats/advanced endpoint  — all new signals for IDS Engine 5.
+  1. Unknown-account tracking
+  2. Per-username rate limiting
+  3. IP reputation scoring (ip_reputation.py)
+  4. Progressive CAPTCHA
+  5. Hard block (429) after tarpit + persistence
+  6. Breach credential detection (HIBP simulation)
+  7. /stats/advanced endpoint
+
+ADDITIONAL NEW DEFENSES (patch):
+  8. Sec-Fetch / browser security header scoring
+  9. Email clustering tracking (username_clustering.py)
+ 10. Risk-based step-up 2FA via TOTP (totp_2fa.py)
 """
 
 import time
@@ -75,15 +56,37 @@ try:
     TARPIT_ENABLED = True
 except ImportError:
     TARPIT_ENABLED = False
-    print("[PORTAL] WARNING: tarpit_state.py not found — tarpit disabled")
+    print("[PORTAL] WARNING: tarpit_state.py not found -- tarpit disabled")
 
-# ── IP reputation scoring (new) ───────────────────────────────
+# ── IP reputation scoring ─────────────────────────────────────
 try:
     import ip_reputation
     REPUTATION_ENABLED = True
 except ImportError:
     REPUTATION_ENABLED = False
-    print("[PORTAL] WARNING: ip_reputation.py not found — scoring disabled")
+    print("[PORTAL] WARNING: ip_reputation.py not found -- scoring disabled")
+
+# ── Step-up 2FA via TOTP (new) ────────────────────────────────
+try:
+    import totp_2fa
+    TOTP_ENABLED = True
+    _totp_mgr    = totp_2fa.get_manager()
+    print("[PORTAL] Step-up 2FA: ENABLED (totp_2fa.py)")
+except ImportError:
+    TOTP_ENABLED = False
+    _totp_mgr    = None
+    print("[PORTAL] INFO: totp_2fa.py not found -- step-up 2FA disabled")
+
+# ── Email clustering tracking (new) ──────────────────────────
+try:
+    import username_clustering as _uc_module
+    CLUSTERING_ENABLED = True
+    _email_tracker     = _uc_module.get_tracker()
+    print("[PORTAL] Username clustering: ENABLED (username_clustering.py)")
+except ImportError:
+    CLUSTERING_ENABLED = False
+    _email_tracker     = None
+    print("[PORTAL] INFO: username_clustering.py not found -- clustering disabled")
 
 app = Flask(__name__)
 logging.basicConfig(
@@ -99,8 +102,14 @@ USERS = {
     "admin@example.com":  "securePass123!",
 }
 
-# ── Known-breached password list (HIBP simulation, new) ───────
-# In production: call the k-Anonymity HIBP API.
+# ── Pre-enrol fake users in 2FA (new) ─────────────────────────
+if TOTP_ENABLED:
+    for _u in USERS:
+        _sec = _totp_mgr.enrol(_u)
+        print(f"[PORTAL]  2FA enrolled: {_u}  "
+              f"({_totp_mgr.get_uri(_u, 'MyApp')[:72]}...)")
+
+# ── Known-breached password list (HIBP simulation) ───────────
 BREACHED_PASSWORDS = {
     "password", "password123", "123456", "12345678", "qwerty",
     "abc123", "monkey", "1234567", "letmein", "trustno1",
@@ -116,41 +125,41 @@ attempt_log  = []
 tarpit_stats = {
     "total_delayed":       0,
     "total_delay_seconds": 0.0,
-    # total_flag_events mirrors tarpit_state.get_flag_count().
-    # Kept in memory here so /tarpit/status reflects the most current
-    # value without an extra file read on every request.
     "total_flag_events":   0,
 }
 _stats_lock  = threading.Lock()
 
-# ── Per-username rate limiting (new) ─────────────────────────
-USERNAME_RATE_WINDOW  = 60    # seconds
-USERNAME_RATE_MAX     = 5     # max attempts per email per window
+# ── Per-username rate limiting ────────────────────────────────
+USERNAME_RATE_WINDOW  = 60
+USERNAME_RATE_MAX     = 5
 _username_attempts: dict = defaultdict(lambda: deque())
 _username_lock = threading.Lock()
 
-# ── Progressive CAPTCHA state (new) ──────────────────────────
-CAPTCHA_FAIL_THRESHOLD = 3     # consecutive failures before challenge
-CAPTCHA_TTL            = 120   # seconds before challenge expires
+# ── Progressive CAPTCHA state ─────────────────────────────────
+CAPTCHA_FAIL_THRESHOLD = 3
+CAPTCHA_TTL            = 120
 _captcha_state: dict = {}
 _captcha_lock = threading.Lock()
 
-# ── Hard block escalation (new) ──────────────────────────────
+# ── Hard block escalation ─────────────────────────────────────
 N_BEFORE_BLOCK = 10
 _post_tarpit_fails: dict = defaultdict(int)
 
-# ── Unknown account tracking (new) ───────────────────────────
-_unknown_acct_counts: dict = defaultdict(int)  # src_ip → count
+# ── Unknown account tracking ──────────────────────────────────
+_unknown_acct_counts: dict = defaultdict(int)
 _unknown_acct_total   = 0
 
-# ── Off-hours tracking (new) ─────────────────────────────────
-_hourly_counts: dict = defaultdict(int)   # hour → count
+# ── Off-hours tracking ────────────────────────────────────────
+_hourly_counts: dict = defaultdict(int)
 
-# ── Reputation snapshot (new) ────────────────────────────────
-_rep_scores: dict = {}   # src_ip → latest reputation dict
+# ── Reputation snapshot ───────────────────────────────────────
+_rep_scores: dict = {}
 
-# ── Breach credential hit counter (new) ──────────────────────
+# ── Breach credential hit counter ────────────────────────────
 _breached_cred_hits = 0
+
+# ── Step-up 2FA thresholds (new) ─────────────────────────────
+TWOFACTOR_SCORE_THRESHOLD = 25   # rep score >= this triggers step-up 2FA
 
 # ── HTML ──────────────────────────────────────────────────────
 LOGIN_PAGE = """
@@ -174,10 +183,9 @@ LOGIN_PAGE = """
 </html>
 """
 
-# ── Helpers (new) ─────────────────────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────
 
 def _make_captcha() -> dict:
-    """Generate a simple arithmetic CAPTCHA challenge."""
     a  = random.randint(2, 20)
     b  = random.randint(2, 20)
     op = random.choice(["+", "-", "*"])
@@ -186,7 +194,6 @@ def _make_captcha() -> dict:
 
 
 def _check_username_rate_limit(email: str) -> bool:
-    """Return True if this email has exceeded the per-username rate limit."""
     now    = time.time()
     cutoff = now - USERNAME_RATE_WINDOW
     with _username_lock:
@@ -197,6 +204,111 @@ def _check_username_rate_limit(email: str) -> bool:
             return True
         dq.append(now)
         return False
+
+
+def _apply_sec_fetch_check(headers: dict, rep_score: int) -> tuple:
+    """
+    Returns (effective_score, sec_fetch_info_dict).
+    Adds Sec-Fetch penalty on top of ip_reputation score for
+    downstream decisions (2FA trigger, logging).
+    """
+    if REPUTATION_ENABLED:
+        try:
+            info = ip_reputation.check_sec_fetch_headers(headers)
+        except AttributeError:
+            info = {"score_penalty": 0, "reasons": [],
+                    "missing_sec_fetch": False, "missing_sec_ch_ua": False,
+                    "missing_origin": False}
+    else:
+        ua = headers.get("User-Agent", "")
+        has_sec = any(k.startswith("Sec-Fetch-") for k in headers)
+        is_chrome = "Chrome" in ua or "Chromium" in ua
+        has_ch_ua = "Sec-Ch-Ua" in headers or "sec-ch-ua" in headers
+        penalty = (15 if not has_sec else 0) + \
+                  (10 if is_chrome and not has_ch_ua else 0) + \
+                  (10 if not (headers.get("Origin") or headers.get("Referer")) and ua else 0)
+        info = {"score_penalty": penalty, "reasons": [],
+                "missing_sec_fetch": not has_sec,
+                "missing_sec_ch_ua": is_chrome and not has_ch_ua,
+                "missing_origin": False}
+
+    if info["score_penalty"] >= 25:
+        logging.warning(
+            f"SEC-FETCH-ANOMALY | penalty={info['score_penalty']} | "
+            f"{info.get('reasons', [])}"
+        )
+    return min(100, rep_score + info["score_penalty"]), info
+
+
+def _step_up_2fa(email: str, src_ip: str,
+                 effective_rep_score: int,
+                 form_data: dict):
+    """
+    Risk-based step-up 2FA gate.
+
+    Returns (blocked: bool, flask_response | None).
+      blocked=True  -- return the response immediately from /login
+      blocked=False -- continue to credential check
+
+    Policy (from totp_2fa.requires_2fa):
+      CLEAN (score < 25)      -- no 2FA
+      SUSPECT (25-49)         -- TOTP required for new sessions
+      LIKELY_BOT (50-74)      -- TOTP required always
+      BOT (75+)               -- hard block via N_BEFORE_BLOCK; no 2FA hint
+
+    A credential stuffer has the correct password but NOT physical
+    access to the victim's authenticator app. This renders even a
+    100% hit rate against credentials useless.
+    """
+    if not TOTP_ENABLED:
+        return False, None
+
+    if effective_rep_score < 25:
+        band = "CLEAN"
+    elif effective_rep_score < 50:
+        band = "SUSPECT"
+    elif effective_rep_score < 75:
+        band = "LIKELY_BOT"
+    else:
+        # BOT -- let N_BEFORE_BLOCK handle silently; do not reveal detection
+        return False, None
+
+    policy = totp_2fa.requires_2fa(band, session_is_new=True)
+    if policy == "none":
+        return False, None
+
+    totp_code = (form_data.get("totp_code")
+                 or form_data.get("otp")
+                 or form_data.get("mfa_code"))
+
+    if totp_code is None:
+        return True, (jsonify({
+            "status":  "2fa_required",
+            "message": (
+                "Step-up authentication required for this session. "
+                "Submit your 6-digit authenticator code in field 'totp_code'."
+            ),
+            "trigger":  band,
+            "enrolled": _totp_mgr.is_enrolled(email or ""),
+        }), 403)
+
+    if not _totp_mgr.is_enrolled(email or ""):
+        if email:
+            sec     = _totp_mgr.enrol(email)
+            current = totp_2fa.get_totp(sec)
+            logging.warning(
+                f"2FA-AUTO-ENROL | {email} | current code: {current} "
+                f"(lab demo -- in production store secret at signup)"
+            )
+        return False, None
+
+    ok, msg = _totp_mgr.verify(email, totp_code, src_ip=src_ip)
+    if ok:
+        logging.info(f"2FA-OK | src={src_ip} email={email}")
+        return False, None
+
+    logging.warning(f"2FA-FAIL | src={src_ip} email={email} | {msg}")
+    return True, (jsonify({"status": "2fa_failed", "message": msg}), 403)
 
 
 # ── Routes ────────────────────────────────────────────────────
@@ -214,13 +326,14 @@ def login():
         return render_template_string(LOGIN_PAGE)
 
     if request.is_json:
-        data     = request.get_json() or {}
-        email    = data.get("email", "")
-        password = data.get("password", "")
+        data           = request.get_json() or {}
+        email          = data.get("email", "")
+        password       = data.get("password", "")
         captcha_answer = data.get("captcha_answer")
     else:
-        email    = request.form.get("email", "")
-        password = request.form.get("password", "")
+        data           = request.form.to_dict()
+        email          = request.form.get("email", "")
+        password       = request.form.get("password", "")
         captcha_answer = request.form.get("captcha_answer")
 
     timestamp = time.time()
@@ -228,18 +341,26 @@ def login():
     headers   = dict(request.headers)
     hour      = datetime.now().hour
 
-    # ── Track off-hours attempts (new) ────────────────────────
+    # ── Track off-hours attempts ──────────────────────────────
     with _stats_lock:
         _hourly_counts[hour] += 1
 
-    # ── IP reputation scoring (new) ───────────────────────────
+    # ── IP reputation scoring ─────────────────────────────────
     rep = {}
     if REPUTATION_ENABLED:
         rep = ip_reputation.score_request(src_ip, headers)
         with _stats_lock:
             _rep_scores[src_ip] = rep
 
-    # ── Per-username rate limiting (new) ──────────────────────
+    # ── Sec-Fetch check + effective score for 2FA (new) ───────
+    rep_score_raw  = rep.get("score", 0) if REPUTATION_ENABLED else 0
+    effective_rep, sec_fetch_info = _apply_sec_fetch_check(headers, rep_score_raw)
+
+    # ── Email clustering tracking (new) ───────────────────────
+    if CLUSTERING_ENABLED and email and _email_tracker:
+        _email_tracker.add(email)
+
+    # ── Per-username rate limiting ────────────────────────────
     if email and _check_username_rate_limit(email):
         logging.warning(
             f"RATE-LIMITED | src={src_ip} | email={email} | "
@@ -250,14 +371,20 @@ def login():
             "message": "Too many login attempts for this account. Try again later.",
         }), 429
 
-    # ── Unknown account detection (new) ──────────────────────
+    # ── Step-up 2FA check (new) ───────────────────────────────
+    if TOTP_ENABLED and email:
+        _blocked, _2fa_resp = _step_up_2fa(email, src_ip, effective_rep, data)
+        if _blocked:
+            return _2fa_resp
+
+    # ── Unknown account detection ─────────────────────────────
     email_known = email in USERS
     if not email_known:
         with _stats_lock:
             _unknown_acct_counts[src_ip] += 1
             _unknown_acct_total += 1
 
-    # ── Breach credential detection (new) ────────────────────
+    # ── Breach credential detection ───────────────────────────
     is_breached = password in BREACHED_PASSWORDS
     if is_breached:
         with _stats_lock:
@@ -267,7 +394,7 @@ def login():
             f"password in known-breached list (HIBP simulation)"
         )
 
-    # ── CAPTCHA check (new) ───────────────────────────────────
+    # ── CAPTCHA check ─────────────────────────────────────────
     with _captcha_lock:
         state = _captcha_state.setdefault(src_ip, {
             "fails": 0, "challenge": None,
@@ -305,7 +432,7 @@ def login():
                     "message": "Incorrect security answer.",
                 }), 403
 
-    # ── Hard block after tarpit + persistence (new) ───────────
+    # ── Hard block after tarpit + persistence ─────────────────
     already_tarpitted = TARPIT_ENABLED and tarpit_state.is_flagged(src_ip)
     if already_tarpitted:
         _post_tarpit_fails[src_ip] += 1
@@ -319,7 +446,7 @@ def login():
     # ── Check credentials ─────────────────────────────────────
     success = USERS.get(email) == password
 
-    # ── TARPIT CHECK ─────────────────────────────────────────
+    # ── TARPIT CHECK ──────────────────────────────────────────
     tarpitted      = False
     tarpit_delay_s = 0.0
 
@@ -347,7 +474,7 @@ def login():
         except Exception:
             pass
 
-    # ── Update CAPTCHA failure counter (new) ──────────────────
+    # ── Update CAPTCHA failure counter ────────────────────────
     if not success:
         with _captcha_lock:
             st = _captcha_state.setdefault(src_ip, {
@@ -359,29 +486,30 @@ def login():
             _captcha_state.pop(src_ip, None)
         _post_tarpit_fails.pop(src_ip, None)
 
-    # ── Log attempt ──────────────────────────────────────────
-    # Original fields preserved; new fields appended (additive, backward-compatible).
+    # ── Log attempt ───────────────────────────────────────────
     entry = {
-        "ts":           timestamp,
-        "src":          src_ip,
-        "email":        email,
-        "success":      success,
-        "tarpitted":    tarpitted,
-        "tarpit_delay": round(tarpit_delay_s, 2),
-        "dt":           datetime.now().isoformat(),
-        # new fields
-        "email_known":  email_known,
-        "is_breached":  is_breached,
-        "rep_score":    rep.get("score", 0),
-        "rep_band":     rep.get("band", "UNKNOWN"),
-        "fingerprint":  rep.get("fingerprint", ""),
+        "ts":              timestamp,
+        "src":             src_ip,
+        "email":           email,
+        "success":         success,
+        "tarpitted":       tarpitted,
+        "tarpit_delay":    round(tarpit_delay_s, 2),
+        "dt":              datetime.now().isoformat(),
+        "email_known":     email_known,
+        "is_breached":     is_breached,
+        "rep_score":       rep.get("score", 0),
+        "rep_band":        rep.get("band", "UNKNOWN"),
+        "effective_rep":   effective_rep,
+        "fingerprint":     rep.get("fingerprint", ""),
+        "sec_fetch_penalty": sec_fetch_info.get("score_penalty", 0),
     }
     with _stats_lock:
         attempt_log.append(entry)
 
     logging.info(
         f"LOGIN   | src={src_ip} | email={email} | "
-        f"success={success} | tarpitted={tarpitted}"
+        f"success={success} | tarpitted={tarpitted} | "
+        f"rep={rep.get('band','?')} | eff_rep={effective_rep}"
     )
 
     if success:
@@ -392,7 +520,6 @@ def login():
 
 @app.route("/attempts")
 def view_attempts():
-    """Admin endpoint — inspect login log, tarpit stats, and flagged IPs."""
     with _stats_lock:
         recent         = list(attempt_log[-200:])
         tarpitted_log  = [e for e in attempt_log if e.get("tarpitted")]
@@ -427,17 +554,11 @@ def advanced_stats():
     """
     Extended statistics endpoint consumed by IDS Engine 5.
 
-    Fields:
-      success_rate_pct     — overall login success rate (low → bot spray)
-      unknown_acct_pct     — % of attempts to non-existent emails
-      off_hours_pct        — % of attempts outside 08:00-22:00
-      breached_cred_hits   — count of HIBP-listed passwords submitted
-      per_ip_unknowns      — per-source-IP count of unknown-account hits
-      reputation_scores    — latest IP reputation band per IP
-      captcha_active       — IPs currently under CAPTCHA challenge
-      hard_blocked_ips     — IPs that hit the post-tarpit block threshold
-      hourly_distribution  — request counts by hour-of-day
-      total_flag_events    — cumulative tarpit flag counter (Graph 3)
+    Fields include all original metrics plus:
+      username_clustering -- domain/sequential/prefix anomalies (new)
+      totp_enabled        -- whether step-up 2FA is active (new)
+      sec_fetch_penalty_avg -- average Sec-Fetch penalty across recent
+                               attempts, indicating bot-like traffic (new)
     """
     with _stats_lock:
         total          = len(attempt_log)
@@ -452,6 +573,10 @@ def advanced_stats():
         rep_snap        = dict(_rep_scores)
         hourly_snap     = dict(_hourly_counts)
         ts_flag_events  = tarpit_stats["total_flag_events"]
+        # Average Sec-Fetch penalty across recent attempts (new)
+        recent          = attempt_log[-200:] if attempt_log else []
+        sfp_values      = [a.get("sec_fetch_penalty", 0) for a in recent]
+        sfp_avg         = round(sum(sfp_values) / max(1, len(sfp_values)), 1)
 
     with _captcha_lock:
         captcha_active = {
@@ -469,24 +594,34 @@ def advanced_stats():
         if count >= N_BEFORE_BLOCK
     }
 
+    # Username clustering stats (new)
+    clustering_stats = {}
+    if CLUSTERING_ENABLED and _email_tracker:
+        clustering_stats = _email_tracker.stats_for_api()
+
     return jsonify({
-        "total_attempts":      total,
-        "success_count":       success_count,
-        "fail_count":          total - success_count,
-        "success_rate_pct":    round(success_count / max(1, total) * 100, 2),
-        "unknown_acct_count":  unknown_count,
-        "unknown_acct_pct":    round(unknown_count / max(1, total) * 100, 2),
-        "off_hours_count":     off_hours,
-        "off_hours_pct":       round(off_hours / max(1, total_counted) * 100, 2),
-        "breached_cred_hits":  breached_count,
-        "per_ip_unknowns":     per_ip_unknowns,
-        "reputation_scores":   rep_snap,
-        "captcha_active":      captcha_active,
-        "hard_blocked_ips":    hard_blocked,
-        "hourly_distribution": hourly_snap,
-        "total_flag_events":   ts_flag_events,
-        "tarpit_enabled":      TARPIT_ENABLED,
-        "reputation_enabled":  REPUTATION_ENABLED,
+        "total_attempts":        total,
+        "success_count":         success_count,
+        "fail_count":            total - success_count,
+        "success_rate_pct":      round(success_count / max(1, total) * 100, 2),
+        "unknown_acct_count":    unknown_count,
+        "unknown_acct_pct":      round(unknown_count / max(1, total) * 100, 2),
+        "off_hours_count":       off_hours,
+        "off_hours_pct":         round(off_hours / max(1, total_counted) * 100, 2),
+        "breached_cred_hits":    breached_count,
+        "per_ip_unknowns":       per_ip_unknowns,
+        "reputation_scores":     rep_snap,
+        "captcha_active":        captcha_active,
+        "hard_blocked_ips":      hard_blocked,
+        "hourly_distribution":   hourly_snap,
+        "total_flag_events":     ts_flag_events,
+        "tarpit_enabled":        TARPIT_ENABLED,
+        "reputation_enabled":    REPUTATION_ENABLED,
+        # New fields
+        "username_clustering":   clustering_stats,
+        "totp_enabled":          TOTP_ENABLED,
+        "totp_enrolled":         _totp_mgr.status() if TOTP_ENABLED and _totp_mgr else {},
+        "sec_fetch_penalty_avg": sfp_avg,
     })
 
 
@@ -494,12 +629,10 @@ def advanced_stats():
 def reset_attempts():
     """
     Reset the in-memory attempt log and tarpit stats.
-
-    Used by collect_graph23_data.py between jitter-level sweeps so that
-    each measurement window starts from a clean baseline.
+    Used by collect_graph23_data.py between jitter-level sweeps.
 
     Optional JSON body:
-      {"clear_tarpit": true}  — also wipe tarpit_state.json (default false)
+      {"clear_tarpit": true}  -- also wipe tarpit_state.json
     """
     global _unknown_acct_total, _breached_cred_hits
     data = request.get_json(silent=True) or {}
@@ -526,6 +659,9 @@ def reset_attempts():
     if REPUTATION_ENABLED:
         ip_reputation.reset_scorer()
 
+    if CLUSTERING_ENABLED and _email_tracker:
+        _email_tracker.reset()
+
     clear_tarpit = data.get("clear_tarpit", False)
     if clear_tarpit and TARPIT_ENABLED:
         tarpit_state.clear_all()
@@ -538,13 +674,6 @@ def reset_attempts():
 
 @app.route("/tarpit/flag", methods=["POST"])
 def tarpit_flag():
-    """
-    IDS → portal signal endpoint (HTTP alternative to file-based state).
-    POST {"ip": "192.168.100.11"} to flag an IP programmatically.
-    Also increments total_flag_events so collect_graph23_data.py counts
-    this detection path even if the bot finishes before a delayed response
-    is served.
-    """
     if not TARPIT_ENABLED:
         return jsonify({"error": "tarpit disabled"}), 503
     data = request.get_json() or {}
@@ -559,7 +688,6 @@ def tarpit_flag():
 
 @app.route("/tarpit/unflag", methods=["POST"])
 def tarpit_unflag():
-    """Remove a tarpit flag."""
     if not TARPIT_ENABLED:
         return jsonify({"error": "tarpit disabled"}), 503
     data = request.get_json() or {}
@@ -572,23 +700,10 @@ def tarpit_unflag():
 def tarpit_status():
     """
     Show current tarpit state.
-
-    Response includes:
-      enabled           — whether tarpit_state.py was importable
-      flagged           — list of currently flagged IPs
-      stats             — counters:
-        total_delayed       — requests actually delayed (race-prone)
-        total_delay_seconds — total seconds of artificial delay served
-        total_flag_events   — IPs ever flagged this session (race-free)
-      ttl_sec           — per-IP flag expiry in seconds
-      delay_sec         — nominal delay applied to flagged IPs
-
-    collect_graph23_data.py reads stats.total_flag_events as its
-    primary Graph 3 TPR detection proxy.
+    stats.total_flag_events is the race-free Graph 3 TPR counter.
     """
     flagged = tarpit_state.list_flagged() if TARPIT_ENABLED else []
 
-    # Sync from file before responding so we always return the latest value
     if TARPIT_ENABLED:
         try:
             file_count = tarpit_state.get_flag_count()
@@ -610,22 +725,45 @@ def tarpit_status():
     })
 
 
+@app.route("/2fa/status", methods=["GET"])
+def twofactor_status():
+    """Admin endpoint: show 2FA enrolment and policy map."""
+    if not TOTP_ENABLED:
+        return jsonify({"enabled": False, "message": "totp_2fa.py not loaded"})
+    return jsonify({
+        "enabled":          True,
+        "enrolments":       _totp_mgr.status(),
+        "score_threshold":  TWOFACTOR_SCORE_THRESHOLD,
+        "policy_map":       totp_2fa.TWOFACTOR_POLICY,
+    })
+
+
+@app.route("/clustering/status", methods=["GET"])
+def clustering_status():
+    """Admin endpoint: show username clustering analysis."""
+    if not CLUSTERING_ENABLED or not _email_tracker:
+        return jsonify({"enabled": False})
+    return jsonify({"enabled": True, **_email_tracker.analyze()})
+
+
 # ── Entry point ───────────────────────────────────────────────
 
 if __name__ == "__main__":
     print("=" * 55)
     print(" Fake Login Portal - AUA Botnet Research Lab")
     print(" Listening on 0.0.0.0:80")
-    print(f" Tarpit:         {'ENABLED' if TARPIT_ENABLED else 'DISABLED (tarpit_state.py missing)'}")
+    print(f" Tarpit:         {'ENABLED' if TARPIT_ENABLED else 'DISABLED'}")
     if TARPIT_ENABLED:
-        print(f" Tarpit delay:   {tarpit_state.TARPIT_DELAY}±{tarpit_state.TARPIT_JITTER}s")
+        print(f" Tarpit delay:   {tarpit_state.TARPIT_DELAY}+-{tarpit_state.TARPIT_JITTER}s")
         print(f" State file:     {tarpit_state.STATE_FILE}")
-    print(f" IP Reputation:  {'ENABLED' if REPUTATION_ENABLED else 'DISABLED (ip_reputation.py missing)'}")
-    print(f" CAPTCHA:        ENABLED (triggers after {CAPTCHA_FAIL_THRESHOLD} consecutive failures per IP)")
+    print(f" IP Reputation:  {'ENABLED' if REPUTATION_ENABLED else 'DISABLED'}")
+    print(f" Step-up 2FA:    {'ENABLED' if TOTP_ENABLED else 'DISABLED'}")
+    print(f" Clustering:     {'ENABLED' if CLUSTERING_ENABLED else 'DISABLED'}")
+    print(f" CAPTCHA:        ENABLED (triggers after {CAPTCHA_FAIL_THRESHOLD} failures per IP)")
     print(f" Username limit: {USERNAME_RATE_MAX} attempts per {USERNAME_RATE_WINDOW}s per email")
-    print(f" Hard block:     after {N_BEFORE_BLOCK} post-tarpit attempts → HTTP 429")
+    print(f" Hard block:     after {N_BEFORE_BLOCK} post-tarpit attempts -> HTTP 429")
     print(f" Breach check:   ENABLED ({len(BREACHED_PASSWORDS)} known-breached passwords)")
     print(" Monitor:        GET /attempts | GET /tarpit/status | GET /stats/advanced")
-    print(" Graph 3:        stats.total_flag_events = race-free detection counter")
+    print(" New endpoints:  GET /2fa/status | GET /clustering/status")
     print("=" * 55)
     app.run(host="0.0.0.0", port=80, debug=False)

@@ -10,8 +10,8 @@ indicators of proxy/VPN use, distributed attack
 infrastructure, and bot-like header patterns.
 
 Used by:
-  fake_portal.py  — scores each /login request
-  ids_detector.py — Engine 6 fingerprint correlation
+  fake_portal.py  -- scores each /login request
+  ids_detector.py -- Engine 6 fingerprint correlation
 
 Article mapping (Castle credential stuffing blog):
   "Proxy and VPN usage: high usage of known proxy networks"
@@ -23,11 +23,20 @@ Article mapping (Castle credential stuffing blog):
   "Session linking: by linking sessions over time using TLS
    fingerprints and device traits, you can detect distributed
    attacks that wouldn't trigger individual alerts."
+  "Automation artifacts like navigator.webdriver,
+   inconsistencies in WebGL or audio fingerprints..."
+   --> HTTP-layer approximation: Sec-Fetch-* absence detection
 
 In production this module would call an external IP-reputation
 API (e.g. IPQualityScore, ipinfo.io, MaxMind GeoIP/ASN).
 Here we implement the same logic on in-lab traffic using
 proxy-indicator heuristics and header fingerprinting.
+
+NEW (patch):
+  - check_sec_fetch_headers()  -- detects missing browser-injected
+    headers (Sec-Fetch-*, Sec-CH-UA, Origin/Referer)
+  - GeoIP integration via geoip_sim.py  -- real geography and
+    carrier-type risk scoring with multi-region anomaly detection
 """
 
 import hashlib
@@ -37,6 +46,13 @@ import time
 import threading
 from collections import defaultdict
 from typing import Optional
+
+# ── GeoIP integration (new) ───────────────────────────────────
+try:
+    import geoip_sim
+    _GEOIP_OK = True
+except ImportError:
+    _GEOIP_OK = False
 
 # ── Known proxy / datacenter subnet ranges (simulated) ───────
 # In production: replace with MaxMind ASN database or
@@ -56,7 +72,6 @@ PROXY_POOL_SUBNET_THRESHOLD = 3
 PROXY_POOL_WINDOW_SEC       = 120   # seconds
 
 # ── Suspicious User-Agent substrings ─────────────────────────
-# Real bots often expose toolchain strings in their UA.
 SUSPICIOUS_UA_PATTERNS = [
     r"python[-/]",
     r"curl/",
@@ -94,7 +109,7 @@ def fingerprint_headers(headers: dict) -> str:
     interception.
 
     Key property: a bot config that doesn't rotate headers will
-    produce the same fingerprint even when rotating proxy IPs —
+    produce the same fingerprint even when rotating proxy IPs --
     exactly what Engine 6 exploits to link distributed requests.
     """
     ua   = headers.get("User-Agent",       "")
@@ -124,6 +139,76 @@ def _in_datacenter(ip: str) -> bool:
     return False
 
 
+# ── Sec-Fetch / browser security header check (new) ──────────
+
+def check_sec_fetch_headers(headers: dict) -> dict:
+    """
+    Detect missing or inconsistent browser security headers.
+
+    Modern browsers inject Sec-Fetch-* and Sec-CH-UA automatically
+    and cannot be suppressed by JavaScript. Scripts using urllib,
+    requests, or curl do NOT send them because injection happens
+    inside the browser's network stack, not the application layer.
+
+    This is the HTTP-layer approximation of detecting
+    navigator.webdriver: the ABSENCE is the signal.
+
+    Signals checked:
+      Sec-Fetch-Dest / Mode / Site -- injected by Chromium+Firefox
+        since 2019; absent in all HTTP libraries
+      Sec-CH-UA -- Chrome client hints; real Chrome without it
+        means incomplete spoofing
+      Origin / Referer -- a form POST from a real browser always
+        carries at least one; scripts often omit both
+
+    Article mapping (Castle blog):
+      "Automation artifacts like navigator.webdriver,
+       inconsistencies in WebGL or audio fingerprints,
+       or signs of Chrome DevTools Protocol (CDP) injection."
+
+    Returns:
+      {
+        missing_sec_fetch : bool,
+        missing_sec_ch_ua : bool,
+        missing_origin    : bool,
+        score_penalty     : int,   # additive to rep score
+        reasons           : list[str],
+      }
+    """
+    ua            = headers.get("User-Agent", "")
+    has_sec_fetch = any(k.startswith("Sec-Fetch-") for k in headers)
+    is_chrome_ua  = "Chrome" in ua or "Chromium" in ua
+    has_sec_ch_ua = "Sec-Ch-Ua" in headers or "sec-ch-ua" in headers
+    has_origin    = bool(headers.get("Origin") or headers.get("Referer"))
+
+    penalty = 0
+    reasons = []
+
+    if not has_sec_fetch:
+        penalty += 15
+        reasons.append(
+            "Missing Sec-Fetch-* headers -- browser-injected, absent in HTTP clients"
+        )
+    if is_chrome_ua and not has_sec_ch_ua:
+        penalty += 10
+        reasons.append(
+            "Chrome UA without Sec-CH-UA client hints -- incomplete browser spoofing"
+        )
+    if not has_origin and ua:
+        penalty += 10
+        reasons.append(
+            "No Origin or Referer on POST -- HTTP client, not browser"
+        )
+
+    return dict(
+        missing_sec_fetch = not has_sec_fetch,
+        missing_sec_ch_ua = is_chrome_ua and not has_sec_ch_ua,
+        missing_origin    = not has_origin,
+        score_penalty     = penalty,
+        reasons           = reasons,
+    )
+
+
 # ── IP scoring ────────────────────────────────────────────────
 
 class IPReputationScorer:
@@ -131,18 +216,24 @@ class IPReputationScorer:
     Per-session IP reputation tracker.
 
     Score bands:
-       0–24   CLEAN      — normal residential traffic
-      25–49   SUSPECT    — some bot indicators present
-      50–74   LIKELY_BOT — strong indicators; consider CAPTCHA
-      75–100  BOT        — block or tarpit immediately
+       0-24   CLEAN      -- normal residential traffic
+      25-49   SUSPECT    -- some bot indicators present
+      50-74   LIKELY_BOT -- strong indicators; consider CAPTCHA / 2FA
+      75-100  BOT        -- block or tarpit immediately
 
     Scoring components (additive):
       +15  datacenter / known hosting subnet
       +20  suspicious User-Agent string (tool fingerprint)
       +15  missing Accept-Language header (common in scripts)
       +10  Chrome UA without Sec-Ch-Ua header (impersonation)
-      +25  same fingerprint seen from ≥3 IPs in 5 minutes
-      +20  X-Forwarded-For cycling through ≥3 /24 subnets
+      +25  same fingerprint seen from >=3 IPs in 5 minutes
+      +20  X-Forwarded-For cycling through >=3 /24 subnets
+      -- NEW --
+      +15  missing Sec-Fetch-* headers
+      +10  Chrome UA without Sec-CH-UA client hints
+      +10  missing Origin/Referer on POST
+      +20  GeoIP HIGH_RISK (Tor/VPN/high-risk country)
+      +10  GeoIP SUSPECT/LIKELY_BOT (datacenter/neutral country)
     """
 
     SCORE_DATACENTER    = 15
@@ -151,6 +242,12 @@ class IPReputationScorer:
     SCORE_UA_INCONSIST  = 10
     SCORE_FP_MULTIIP    = 25
     SCORE_XFWD_CYCLING  = 20
+    # New scoring components
+    SCORE_NO_SEC_FETCH  = 15
+    SCORE_NO_CH_UA      = 10
+    SCORE_NO_ORIGIN     = 10
+    SCORE_GEOIP_RISK    = 20
+    SCORE_GEOIP_SUSPECT = 10
 
     BAND_CLEAN      = 25
     BAND_SUSPECT    = 50
@@ -159,13 +256,13 @@ class IPReputationScorer:
     def __init__(self):
         self._lock = threading.Lock()
 
-        # fingerprint → set of source IPs that used it
+        # fingerprint -> set of source IPs that used it
         self._fp_to_ips: dict = defaultdict(set)
-        # fingerprint → first-seen timestamp
+        # fingerprint -> first-seen timestamp
         self._fp_first_seen: dict = {}
-        # source_ip → list of (timestamp, /24 subnet) from X-Fwd headers
+        # source_ip -> list of (timestamp, /24 subnet) from X-Fwd headers
         self._xfwd_subnets: dict = defaultdict(list)
-        # source_ip → cumulative score (persists across requests)
+        # source_ip -> cumulative score (persists across requests)
         self._ip_scores: dict = defaultdict(int)
 
     # ── Public API ─────────────────────────────────────────────
@@ -176,7 +273,7 @@ class IPReputationScorer:
 
         Returns:
           {
-            "score":       int,       # 0–100
+            "score":       int,       # 0-100
             "band":        str,       # CLEAN / SUSPECT / LIKELY_BOT / BOT
             "reasons":     list[str], # human-readable reasons
             "fingerprint": str,       # 12-char hex fingerprint ID
@@ -237,7 +334,6 @@ class IPReputationScorer:
                     xfwd_ip  = xfwd.split(",")[0].strip()
                     subnet24 = ".".join(xfwd_ip.split(".")[:3])
                     self._xfwd_subnets[src_ip].append((now, subnet24))
-                    # Prune old entries
                     cutoff = now - PROXY_POOL_WINDOW_SEC
                     self._xfwd_subnets[src_ip] = [
                         (t, s) for t, s in self._xfwd_subnets[src_ip]
@@ -253,6 +349,45 @@ class IPReputationScorer:
                         )
                 except Exception:
                     pass
+
+            # 7. Sec-Fetch / browser security header check (new)
+            sec_info = check_sec_fetch_headers(headers)
+            if sec_info["missing_sec_fetch"]:
+                delta += self.SCORE_NO_SEC_FETCH
+                reasons.append(
+                    f"missing Sec-Fetch-* headers (+{self.SCORE_NO_SEC_FETCH})"
+                )
+            if sec_info["missing_sec_ch_ua"]:
+                delta += self.SCORE_NO_CH_UA
+                reasons.append(
+                    f"Chrome UA missing Sec-CH-UA (+{self.SCORE_NO_CH_UA})"
+                )
+            if sec_info["missing_origin"]:
+                delta += self.SCORE_NO_ORIGIN
+                reasons.append(
+                    f"no Origin/Referer on POST (+{self.SCORE_NO_ORIGIN})"
+                )
+
+            # 8. GeoIP risk scoring (new)
+            if _GEOIP_OK:
+                geo_result = geoip_sim.score_request(src_ip)
+                geo_band   = geo_result["band"]
+                if geo_band == "HIGH_RISK":
+                    delta += self.SCORE_GEOIP_RISK
+                    geo = geo_result["geo_info"]
+                    reasons.append(
+                        f"GeoIP HIGH_RISK: {geo['org']} "
+                        f"({geo['country']}) (+{self.SCORE_GEOIP_RISK})"
+                    )
+                    for gr in geo_result["reasons"]:
+                        reasons.append(f"  GeoIP: {gr}")
+                elif geo_band in ("SUSPECT", "LIKELY_BOT"):
+                    delta += self.SCORE_GEOIP_SUSPECT
+                    geo = geo_result["geo_info"]
+                    reasons.append(
+                        f"GeoIP {geo_band}: {geo['org']} "
+                        f"({geo['country']}) (+{self.SCORE_GEOIP_SUSPECT})"
+                    )
 
             # Accumulate and clamp to 100
             self._ip_scores[src_ip] += delta
@@ -326,43 +461,60 @@ def reset_scorer():
 
 if __name__ == "__main__":
     print("=" * 60)
-    print(" IP Reputation Scorer — AUA Botnet Research Lab")
+    print(" IP Reputation Scorer -- AUA Botnet Research Lab")
+    print(f" GeoIP integration: {'ENABLED (geoip_sim.py)' if _GEOIP_OK else 'DISABLED'}")
     print(" ISOLATED ENVIRONMENT ONLY")
     print("=" * 60)
 
     bot_headers = {
         "User-Agent": "python-requests/2.31.0",
         "Accept":     "*/*",
-        # No Accept-Language, no Accept-Encoding — typical urllib/requests
     }
     browser_headers = {
         "User-Agent":      ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                            "AppleWebKit/537.36 (KHTML, like Gecko) "
-                            "Chrome/120.0.0.0 Safari/537.36"),
-        "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                            "AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"),
+        "Accept":          "text/html,application/xhtml+xml,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
         "Accept-Encoding": "gzip, deflate, br",
         "Sec-Ch-Ua":       '"Not_A Brand";v="8", "Chromium";v="120"',
+        "Sec-Fetch-Dest":  "document",
+        "Sec-Fetch-Mode":  "navigate",
+        "Sec-Fetch-Site":  "same-origin",
+        "Origin":          "http://192.168.100.20",
     }
 
-    print("\n[DEMO] Scoring bot-like request from 192.168.100.11:")
+    print("\n[DEMO] Bot-like request from 192.168.100.11 (lab bot VM):")
     r1 = score_request("192.168.100.11", bot_headers)
     print(f"  Score: {r1['score']}  Band: {r1['band']}")
     for reason in r1["reasons"]:
-        print(f"  • {reason}")
-    print(f"  Fingerprint: {r1['fingerprint']}")
+        print(f"  * {reason}")
 
-    print("\n[DEMO] Scoring browser-like request from 192.168.100.50:")
-    r2 = score_request("192.168.100.50", browser_headers)
+    print("\n[DEMO] Browser-like request from 68.42.10.5 (Comcast residential):")
+    r2 = score_request("68.42.10.5", browser_headers)
     print(f"  Score: {r2['score']}  Band: {r2['band']}")
     for reason in r2["reasons"]:
-        print(f"  • {reason}")
-    print(f"  Fingerprint: {r2['fingerprint']}")
+        print(f"  * {reason}")
 
-    print("\n[DEMO] Simulating same fingerprint from 4 different IPs (proxy pool)...")
-    for i, ip in enumerate(["10.0.0.1", "10.0.1.2", "10.0.2.3", "10.0.3.4"]):
+    print("\n[DEMO] Tor exit node (185.220.100.1):")
+    r3 = score_request("185.220.100.1", bot_headers)
+    print(f"  Score: {r3['score']}  Band: {r3['band']}")
+    for reason in r3["reasons"]:
+        print(f"  * {reason}")
+
+    print("\n[DEMO] Sec-Fetch check standalone:")
+    for label, hdrs in [
+        ("Python urllib",        {"User-Agent": "Python/3.11"}),
+        ("Real Chrome",          browser_headers),
+        ("Bot spoofing Chrome",  {"User-Agent": "Mozilla/5.0 Chrome/120.0"}),
+    ]:
+        sf = check_sec_fetch_headers(hdrs)
+        flag = "SUSPICIOUS" if sf["score_penalty"] > 0 else "browser-like"
+        print(f"  {label:<30} penalty={sf['score_penalty']:>3}  [{flag}]")
+
+    print("\n[DEMO] Multi-IP fingerprint (proxy pool simulation):")
+    for ip in ["10.0.0.1", "10.0.1.2", "10.0.2.3", "10.0.3.4"]:
         r = score_request(ip, bot_headers)
         print(f"  {ip}: score={r['score']} band={r['band']}")
     multi = get_multiip_fingerprints(min_ips=3)
-    print(f"\n  Multi-IP fingerprints (≥3 IPs): {multi}")
-    print("\n  → IDS Engine 6 would fire a DISTRIBUTED BOT FINGERPRINT alert.")
+    print(f"  Multi-IP fingerprints (>=3 IPs): {len(multi)} found")
+    print("  -> IDS Engine 6 would fire a DISTRIBUTED BOT FINGERPRINT alert.")
