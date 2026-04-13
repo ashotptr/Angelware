@@ -5,3 +5,15 @@
 graph1_measured_data.json
 graph2_measured_data.json
 graph3_measured_data.json
+/tmp/drain_log.json
+/tmp/resale_market.json
+/tmp/pivot_log.json
+/tmp/verified_hits.txt
+/tmp/tarpit_state.json
+breach_dump.txt
+/tmp/enriched_breach_dump.txt
+/tmp/priority_creds.txt
+/tmp/confirmed_accounts.txt
+/tmp/supply_chain_audit.json
+/tmp/phishing_sent.json
+/tmp/mfa_bypass_log.json

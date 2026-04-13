@@ -35,7 +35,7 @@
 | Side | What | Language |
 |------|------|----------|
 | Offensive | C2 server, bot agents, DDoS payloads, IoT propagation scanner, P2P mesh | C + Python |
-| Defensive | IDS (4 engines + host monitor), Cowrie honeypot, DPI engine, tarpitting | Python (Scapy, psutil) |
+| Defensive | IDS (10 engines + host monitor), Cowrie honeypot, DPI engine, tarpitting | Python (Scapy, psutil) |
 | Research | 3 quantitative graphs, NIST IR report, MITRE ATT&CK mapping | Python (matplotlib) |
 
 ---
@@ -147,7 +147,7 @@ botnet_lab/
 ├── fake_portal.py       Credential stuffing target: Flask /login + /attempts
 │                        + tarpit integration + /tarpit/status (exposes
 │                        total_flag_events counter for race-free Graph 3 measurement)
-├── ids_detector.py      4-engine IDS + host monitor:
+├── ids_detector.py      10-engine IDS + host monitor:
 │                        Engine 1 — volumetric (SYN/UDP flood)
 │                        Engine 2 — behavioral CV timing (credential stuffing)
 │                                   + tarpit feedback loop
@@ -201,6 +201,168 @@ botnet_lab/
 │                        email:password format, mirrors Collection #1 style.
 │                        Loaded with: python3 cred_stuffing.py --creds-file breach_dump.txt
 │                        Add to .gitignore — never commit to a public repo.
+├── account_enum_sim.py  Attack+defense pair for account enumeration via password-reset.
+│                        Part 1: AccountEnumerationBot probes /reset-password to classify
+│                        emails from a breach dump as EXISTS/NOT_EXISTS/UNKNOWN.
+│                        Part 2: EnumerationDetector (IDS) fires on high not-found ratio
+│                        or burst volume from one IP (MITRE T1589.002).
+│                        Part 3: SecureResetEndpoint returns uniform responses to block
+│                        pre-filtering. Integrated with fake_portal.py and ids_detector.py.
+│                        CLI: python3 account_enum_sim.py [--host] [--port] [--max N]
+│
+├── breach_dump_enricher.py  Enriches plain email:password combo lists with source-service
+│                        metadata, password-reuse hints, and priority scoring.
+│                        Output: /tmp/enriched_breach_dump.txt (enriched format) and
+│                        /tmp/priority_creds.txt (highest-reuse candidates first).
+│                        Backward-compatible: output file works directly with
+│                        python3 cred_stuffing.py --creds-file.
+│                        CLI: python3 breach_dump_enricher.py [--input FILE] [--top N]
+│
+├── browser_bot_sim.py   Browser automation simulator + IDS Engine 9.
+│                        Attack side: simulates Puppeteer/Playwright-style login bots in
+│                        three modes — naive (webdriver artifact visible), patched (artifact
+│                        removed), stealth (anti-detect: canvas/WebGL/timezone spoofed).
+│                        Defense side (Engine 9): detects automation artifacts:
+│                          • navigator.webdriver leak in JS execution context
+│                          • CDP injection markers
+│                          • Canvas / WebGL fingerprint inconsistencies
+│                          • Missing or implausible screen/window geometry
+│                        CLI: python3 browser_bot_sim.py [--demo|--attack|--detect]
+│                             [--mode naive|patched|stealth]
+│
+├── captcha_economics.py CAPTCHA economics model + solver detection.
+│                        CAPTCHAEconomicsModel: models attacker cost (solve rate, price/
+│                        solve, solver latency) vs. defender friction (legitimate user
+│                        abandonment, false-positive rate). Finds break-even CAPTCHA
+│                        difficulty. SolverDetector: flags solver-service patterns
+│                        (inhuman solve speed, bulk solve bursts, OCR timing signature).
+│                        CLI: python3 captcha_economics.py [--econ|--timing|--detect]
+│
+├── cred_stuffing_evasion.py  Attacker-side evasion extensions for cred_stuffing.py.
+│                        Mode: totp_aware — handles 2fa_required responses by extracting
+│                          the TOTP secret (simulates stolen seed scenario).
+│                        Mode: captcha_solver — auto-parses the math CAPTCHA challenge
+│                          issued by fake_portal.py and resubmits with captcha_answer.
+│                        Mode: hard_block_rotate — on receiving HTTP 429, rotates source IP
+│                          and resets username window.
+│                        Demonstrates the arms-race: each new portal defense has a
+│                        corresponding attacker adaptation.
+│                        CLI: python3 cred_stuffing_evasion.py [--mode totp_aware|...]
+│
+├── csrf_oauth_sim.py    CSRF protection + OAuth token flow simulation.
+│                        CSRFProtection: double-submit cookie pattern, SameSite enforcement.
+│                        OAuthTokenFlow: simulates authorization-code flow; post-stuffing
+│                        pivot to register a malicious OAuth app, plant a refresh token,
+│                        and maintain persistent access after password reset.
+│                        CSRFDetector: flags state-less cross-origin POST attempts.
+│                        CLI: python3 csrf_oauth_sim.py [--demo]
+│
+├── geoip_sim.py         GeoIP / ASN simulation module (no external API required).
+│                        lookup(ip) → {country, asn, org, is_datacenter, is_vpn,
+│                        is_residential_proxy, risk_score}. Simulates MaxMind-style
+│                        lookups for in-lab IPs. Used by ip_reputation.py to add
+│                        geography signals (unfamiliar country, proxy ASN).
+│                        Shared between fake_portal.py /stats/advanced and IDS Engine 5.
+│                        CLI: python3 geoip_sim.py  (demo scores several IP classes)
+│
+├── industry_targets_sim.py  Industry-specific credential-stuffing target simulations.
+│                        Verticals: gaming, ecommerce, streaming, finance, saas, mobile.
+│                        Each vertical has realistic account schemas, monetization vectors,
+│                        and detection difficulty ratings matching the article's industry
+│                        table. Runs a full stuff→hit→monetize→detect cycle per vertical.
+│                        CLI: python3 industry_targets_sim.py [--vertical gaming|…]
+│                             [--email user@example.com]
+│
+├── ml_detector.py       Adaptive / ML anomaly detection — IDS Engine 8.
+│                        Replaces static CV < 0.15 threshold with an EWMA baseline that
+│                        learns normal inter-request timing and rate from a warm-up window,
+│                        then fires when live observations deviate beyond a configurable
+│                        Z-score. Eliminates the need to pre-tune thresholds for different
+│                        service traffic profiles. Integrated into ids_detector.py as
+│                        Engine 8 (runs alongside Engine 2, not replacing it).
+│                        CLI: python3 ml_detector.py  (self-test: inject bot samples
+│                             into normal traffic, verify adaptive alert fires)
+│
+├── mobile_api_sim.py    Mobile API credential stuffing simulator.
+│                        Simulates attacks against a mobile login endpoint that lacks
+│                        JS-based fingerprinting: spoofs X-Device-ID, X-App-Version,
+│                        and platform headers to mimic emulators or rooted devices.
+│                        --rotate-device cycles device metadata across attempts.
+│                        Demonstrates the mobile blind spot: web IDS engines (CV timing,
+│                        browser fingerprint) do not fire on pure-API traffic.
+│                        CLI: python3 mobile_api_sim.py [--host] [--port]
+│                             [--mode bot|jitter] [--rotate-device]
+│
+├── phishing_sim.py      Post-ATO phishing simulation.
+│                        After a valid login hit, simulates two attack chains:
+│                          1. Trusted-inbox phishing — sends a phishing email from the
+│                             compromised account to harvest credentials from contacts.
+│                          2. MFA bypass — crafts a fake 2FA prompt to collect an OTP
+│                             from the victim in real time (AiTM pattern).
+│                        PhishingDetector: flags same-domain lookalike links, urgency
+│                        keywords, and anomalous sent-mail volume spikes.
+│                        CLI: python3 phishing_sim.py [--demo|--mfa-bypass]
+│                             [--victim email]
+│
+├── post_login_automation.py  Post-login automation simulator.
+│                        Simulates what attackers do after obtaining a valid session:
+│                        navigate dashboards, scrape PII (addresses, saved cards),
+│                        initiate transactions, change account email/phone, and inject
+│                        secondary payloads. Modes: scrape / transact / pivot / inject.
+│                        PostLoginDetector: flags anomalous navigation depth, transaction
+│                        velocity, and settings changes immediately after login.
+│                        CLI: python3 post_login_automation.py [--mode scrape|…]
+│                             [--email …] [--cookie …]
+│
+├── remember_me_abuse.py Remember-me token + persistent session abuse simulation.
+│                        Models three long-term access patterns:
+│                          1. Session cookie / JWT capture and replay
+│                          2. Refresh token generation tied to attacker device
+│                          3. "Remember me" persistent-login token abuse
+│                        RememberMeDetector: flags impossible concurrent sessions,
+│                        device-ID mismatch on token refresh, and stale tokens used
+│                        from a different ASN than their issuance origin.
+│                        CLI: python3 remember_me_abuse.py [--demo]
+│
+├── supply_chain_sim.py  Supply chain pivot + session chaining detection.
+│                        SupplyChainPivotSimulator: compromises a low-value integrated
+│                        third-party SaaS account (e.g. helpdesk, analytics), extracts
+│                        an OAuth token or API key with access to the primary environment,
+│                        then pivots to exfiltrate billing data, customer PII, or internal
+│                        docs. SessionChainingDetector: flags cross-service token reuse
+│                        and integration-triggered access anomalies.
+│                        CLI: python3 supply_chain_sim.py [--run|--chaining-demo|--export]
+│
+├── tls_ja3.py           TLS JA3 fingerprint extraction — IDS Engine 7.
+│                        Extracts JA3 = MD5(SSLVersion,Ciphers,Extensions,Curves,PointFmts)
+│                        from raw TLS ClientHello packets captured by Scapy.
+│                        Maintains a known-bot JA3 hash database (Python requests, urllib,
+│                        curl, httpx) and fires Engine 7 HIGH alert on a match.
+│                        Also detects fingerprint reuse across IPs (proxy pool signal).
+│                        Integrated into ids_detector.py; requires root + Scapy.
+│                        CLI: python3 tls_ja3.py  (self-test on synthetic ClientHello)
+│
+├── totp_2fa.py          TOTP step-up 2FA — RFC 6238, pure Python (no external deps).
+│                        TOTPManager: generate_secret(), get_totp(), verify_totp().
+│                        RiskBased2FAPolicy: triggers step-up when ip_reputation score
+│                        ≥ SUSPECT (25) or session is from an unfamiliar device.
+│                        Integrated into fake_portal.py: after the first login success
+│                        from a suspicious IP, the portal issues a 2fa_required response
+│                        with a per-account TOTP secret. cred_stuffing_evasion.py's
+│                        totp_aware mode demonstrates the stolen-seed bypass.
+│                        CLI: python3 totp_2fa.py  (manager demo + risk policy demo)
+│
+├── username_clustering.py  Username / email clustering detector — IDS Engine 10.
+│                         EmailClusteringTracker: rolling-window tracker (default 300s).
+│                         Detects three clustering patterns:
+│                           • Domain concentration: >70% of attempts share one @domain
+│                             (breach dump from a single service)
+│                           • Sequential numbering: user001, user002, … (bot enumeration)
+│                           • Prefix concentration: many usernames share a short prefix
+│                             (dictionary or permutation list)
+│                         Thread-safe singleton exposed to fake_portal.py via get_tracker().
+│                         Used by IDS Engine 5 via /stats/advanced → username_clustering.
+│                         CLI: python3 username_clustering.py  (3 self-tests)
 └── README.md            This file
 ```
 
@@ -856,7 +1018,7 @@ will fail to decrypt subsequent messages and drop out of the mesh.
 
 ## 9. Defensive Systems Reference
 
-### 9.1 IDS (4 engines + host monitor)
+### 9.1 IDS (10 engines + host monitor)
 
 ```bash
 # Victim VM: start IDS (run before any attack)
@@ -1147,7 +1309,335 @@ Monetization vectors and article mapping:
 | Account resale | Telegram/dark-web listing $0.50–$15 | "sold or bundled into new combo lists" |
 | Password pivot | 30% reuse rate, 6 other services | "pivot — reset passwords on other platforms" |
 | Combo export | `/tmp/verified_hits.txt` | "marketed as verified hits" |
+
+---
  
+### 9.X.5 Account Enumeration Simulation
+ 
+```bash
+# Victim VM: make sure fake_portal.py is running (leaky mode default)
+sudo python3 fake_portal.py
+ 
+# Bot VM: probe /reset-password to pre-filter breach dump
+python3 account_enum_sim.py --host 192.168.100.20 --port 80 --max 50
+ 
+# The output lists confirmed emails → feed directly to cred_stuffing.py:
+python3 cred_stuffing.py --creds-file /tmp/confirmed_accounts.txt --mode jitter
+ 
+# Secure endpoint demo: edit fake_portal.py to set SECURE_RESET=True,
+# then re-run — all responses are uniform and no accounts are confirmed.
+```
+ 
+**Teaching point:** A naive reset endpoint that returns distinct messages for "found" vs "not found" lets attackers pre-filter a million-entry breach dump to only confirmed accounts, improving hit rate by 10–100×. The defense is a timing-safe uniform response.
+ 
+---
+ 
+### 9.X.6 Breach Dump Enricher
+ 
+```bash
+# Enrich the default breach_dump.txt with metadata and priority scoring:
+python3 breach_dump_enricher.py --input breach_dump.txt
+ 
+# Output files:
+#   /tmp/enriched_breach_dump.txt   — with source-service tags and reuse hints
+#   /tmp/priority_creds.txt         — highest-reuse candidates sorted first
+ 
+# Use enriched list with credential stuffing:
+python3 cred_stuffing.py --creds-file /tmp/priority_creds.txt --mode bot
+```
+ 
+**Teaching point:** Professional attackers don't just use raw breach dumps. They merge multiple breaches, de-duplicate, and annotate each pair with the source service and password-reuse probability to maximize hit rate before launching.
+ 
+---
+ 
+### 9.X.7 Browser Bot Simulation + Engine 9
+ 
+```bash
+# Demo: show three automation modes and what each leaks
+python3 browser_bot_sim.py --demo
+ 
+# Attack: run against fake_portal.py in stealth mode (anti-detect)
+python3 browser_bot_sim.py --attack --mode stealth --host 192.168.100.20
+ 
+# Detection: run Engine 9 detector standalone
+python3 browser_bot_sim.py --detect
+ 
+# Teaching experiment:
+#   naive  mode → Engine 9 fires immediately (webdriver artifact)
+#   patched mode → Engine 9 fires on CDP injection marker
+#   stealth mode → Engine 9 silent; Engine 6 (fingerprint reuse) may still fire
+```
+ 
+**IDS Engine 9 signals:**
+ 
+| Signal | Severity | What it catches |
+|---|---|---|
+| `navigator.webdriver = true` | HIGH | Un-patched Selenium/Playwright |
+| CDP injection marker in headers | HIGH | DevTools Protocol injection |
+| Canvas fingerprint entropy < threshold | MED | Spoofed or headless canvas |
+| Screen geometry implausible | MED | Headless default 1024×768 |
+| WebGL vendor = "Brian Paul" / SwiftShader | HIGH | Mesa/llvmpipe (headless GPU) |
+ 
+---
+ 
+### 9.X.8 CAPTCHA Economics
+ 
+```bash
+# Show break-even analysis for different CAPTCHA difficulty levels:
+python3 captcha_economics.py --econ
+ 
+# Show solver timing signatures (human vs OCR vs click farm):
+python3 captcha_economics.py --timing
+ 
+# Run solver detection against simulated solve stream:
+python3 captcha_economics.py --detect
+```
+ 
+**Key findings:** At $0.001/solve (CapMonster), CAPTCHA only stops attacks with a success rate below ~0.05%. Above that, the attacker's revenue exceeds CAPTCHA costs. Solver detection focuses on sub-2-second solves (OCR) and solve-burst velocity (bulk task submission).
+ 
+---
+ 
+### 9.X.9 CSRF and OAuth Token Abuse
+ 
+```bash
+# Full demo: CSRF bypass + OAuth persistent-access plant
+python3 csrf_oauth_sim.py --demo
+ 
+# Teaching points shown:
+#   1. Stateless POST without CSRF token → forged cross-origin action succeeds
+#   2. SameSite=Strict cookie → forged action blocked
+#   3. Malicious OAuth app registered after ATO → survives password reset
+#   4. Refresh token from attacker device → long-term covert access
+```
+ 
+---
+ 
+### 9.X.10 GeoIP / ASN Simulation
+ 
+```bash
+# Demo: score several IP classes
+python3 geoip_sim.py
+ 
+# Used automatically by ip_reputation.py and IDS Engine 5.
+# No MaxMind license or external API call needed — all in-lab.
+ 
+# Signals contributed to /stats/advanced:
+#   unfamiliar_country_pct  — % of logins from non-baseline countries
+#   datacenter_asn_pct      — % of logins from cloud/hosting ASNs
+#   residential_proxy_pct   — % of logins from residential proxy ranges
+```
+ 
+---
+ 
+### 9.X.11 Industry Target Simulations
+ 
+```bash
+# Run full attack-monetize-detect cycle for one vertical:
+python3 industry_targets_sim.py --vertical gaming
+python3 industry_targets_sim.py --vertical ecommerce
+python3 industry_targets_sim.py --vertical streaming
+python3 industry_targets_sim.py --vertical finance
+python3 industry_targets_sim.py --vertical saas
+python3 industry_targets_sim.py --vertical mobile
+ 
+# Run with a specific hit credential:
+python3 industry_targets_sim.py --vertical gaming --email victim@example.com
+```
+ 
+**Industry coverage table** (from article):
+ 
+| Vertical | Primary value | Monetization modeled |
+|---|---|---|
+| Gaming | Skins, currency, linked card | Account resale, item drain |
+| E-commerce | Gift cards, saved card, PII | Order fraud, refund abuse, data harvest |
+| Streaming | Premium access | Shared-account resale |
+| Finance | Balance, identity | Transfer, synthetic ID, chaining |
+| SaaS (B2B) | API keys, billing, PII | Scraping, free-tier abuse, pivot |
+| Mobile | All of the above | Emulator-based stuffing, JS blind spot |
+ 
+---
+ 
+### 9.X.12 ML / Adaptive Anomaly Detection (Engine 8)
+ 
+```bash
+# Self-test: warm up on normal traffic, inject bot samples, verify alert fires
+python3 ml_detector.py
+ 
+# Engine 8 is integrated into ids_detector.py alongside Engine 2.
+# It runs independently — Engine 2 fires on absolute CV threshold,
+# Engine 8 fires on adaptive Z-score deviation from learned baseline.
+ 
+# Tunable constants (edit ml_detector.py):
+#   WARMUP_SAMPLES   = 30     # samples before adaptive mode activates
+#   EWMA_ALPHA       = 0.1    # smoothing factor (lower = slower to adapt)
+#   ALERT_ZSCORE     = 3.0    # standard deviations to trigger alert
+```
+ 
+**Why Engine 8 complements Engine 2:** Engine 2 uses a fixed CV < 0.15 threshold calibrated for this lab's synthetic traffic. A production service with fast mobile clients could have legitimate traffic near that threshold. Engine 8 learns the service's normal distribution and fires relative to it.
+ 
+---
+ 
+### 9.X.13 Mobile API Simulation
+ 
+```bash
+# Victim VM: start fake_portal.py (same target — the /login endpoint is identical)
+sudo python3 fake_portal.py
+ 
+# Bot VM: attack the mobile API surface
+python3 mobile_api_sim.py --host 192.168.100.20 --mode bot
+ 
+# Rotate device metadata across attempts (emulator pool simulation):
+python3 mobile_api_sim.py --host 192.168.100.20 --mode jitter --rotate-device
+ 
+# Teaching point: run both and compare IDS alert behaviour:
+#   browser attack → Engine 2 fires (CV timing), Engine 6 fires (fingerprint reuse)
+#   mobile attack  → neither fires (no JS, no browser headers to fingerprint)
+#   → demonstrates mobile API blind spot documented in the article
+```
+ 
+---
+ 
+### 9.X.14 Post-ATO Phishing Simulation
+ 
+```bash
+# Demo: full trusted-inbox phishing chain after ATO
+python3 phishing_sim.py --demo --victim alice@example.com
+ 
+# MFA bypass (AiTM) simulation:
+python3 phishing_sim.py --mfa-bypass --victim alice@example.com
+ 
+# Output logs (add to .gitignore):
+#   /tmp/phishing_sent.json     — simulated outbound phish log
+#   /tmp/mfa_bypass_log.json    — intercepted OTP records
+```
+ 
+---
+ 
+### 9.X.15 Post-Login Automation
+ 
+```bash
+# Scrape PII from a compromised session:
+python3 post_login_automation.py --mode scrape --cookie "simulated_session"
+ 
+# Initiate a fraudulent transaction:
+python3 post_login_automation.py --mode transact
+ 
+# Change account email/phone (account takeover consolidation):
+python3 post_login_automation.py --mode pivot
+ 
+# Inject a secondary payload into the session:
+python3 post_login_automation.py --mode inject
+```
+ 
+---
+ 
+### 9.X.16 Remember-Me Token Abuse
+ 
+```bash
+# Full demo: session capture, refresh-token plant, remember-me abuse
+python3 remember_me_abuse.py --demo
+ 
+# RememberMeDetector signals:
+#   impossible_concurrent_sessions  — same token used from 2 IPs simultaneously
+#   device_id_mismatch              — token refreshed from a different device
+#   asn_shift                       — token reused from a different network region
+```
+ 
+---
+ 
+### 9.X.17 Supply Chain Pivot Simulation
+ 
+```bash
+# Run full pivot: compromise low-value SaaS → pivot to primary environment
+python3 supply_chain_sim.py --run
+ 
+# Session chaining detection demo:
+python3 supply_chain_sim.py --chaining-demo
+ 
+# Export pivot audit log:
+python3 supply_chain_sim.py --export
+# Output: /tmp/supply_chain_audit.json (add to .gitignore)
+```
+ 
+---
+ 
+### 9.X.18 TLS JA3 Fingerprinting (Engine 7)
+ 
+```bash
+# Engine 7 is integrated into ids_detector.py.
+# It activates automatically when Scapy captures TLS ClientHello packets.
+ 
+# Self-test on synthetic ClientHello packets:
+python3 tls_ja3.py
+ 
+# Known-bot JA3 hashes detected (HIGH alert):
+#   Python requests/urllib, curl, httpx, Go net/http default TLS stack
+ 
+# Fingerprint-reuse alert (MED): same JA3 hash seen from ≥ 3 distinct IPs
+# in a 5-minute window — characteristic of a shared-config proxy pool.
+ 
+# Note: Engine 7 complements Engine 6. Engine 6 catches HTTP-header fingerprint
+# reuse (evadable with --ua-rotate); Engine 7 catches TLS-layer fingerprint reuse
+# (not evadable by rotating User-Agent alone — requires a different TLS stack).
+```
+ 
+---
+ 
+### 9.X.19 TOTP Step-Up 2FA
+ 
+```bash
+# Demo: TOTP generation, verification, and risk-based step-up policy
+python3 totp_2fa.py
+ 
+# Integration: fake_portal.py triggers 2FA when ip_reputation score ≥ 25 (SUSPECT).
+# The portal returns:
+#   HTTP 403  {"status": "2fa_required", "totp_hint": "..."}
+#
+# Legitimate user: enters the 6-digit code → access granted
+# Bot (without TOTP seed): blocked
+ 
+# Arms-race demo:
+python3 cred_stuffing_evasion.py --mode totp_aware
+# → simulates an attacker who has also stolen the TOTP seed (e.g. from a
+#   phishing kit or malware on the victim device)
+```
+ 
+---
+ 
+### 9.X.20 Username Clustering Detector (Engine 10)
+ 
+```bash
+# Self-test: domain concentration, sequential pattern, legitimate traffic
+python3 username_clustering.py
+ 
+# Engine 10 is exposed through fake_portal.py's /stats/advanced endpoint:
+curl http://192.168.100.20/stats/advanced | python3 -m json.tool
+# → "username_clustering": { "anomalous": true/false, "alerts": [...] }
+ 
+# Signals:
+#   DOMAIN CONCENTRATION  — >70% of attempts share one @domain (single-service dump)
+#   SEQUENTIAL PATTERN    — user001, user002, … (brute-force or bot enumeration)
+#   PREFIX CONCENTRATION  — many usernames share a short prefix (dictionary list)
+#   COMMON-BASE USERNAMES — >20% use generic bases: admin, user, test, support, …
+```
+### 9.X.21 IDS Engine Inventory (complete)
+
+| Engine | File | Detects |
+|---|---|---|
+| 1 — Volumetric | `ids_detector.py` | SYN/UDP flood |
+| 2 — Behavioral CV | `ids_detector.py` | Credential stuffing (rigid timing) |
+| 3 — DNS/DGA | `ids_detector.py` | NXDOMAIN burst, high-entropy domains |
+| 4 — DPI/Covert | `ids_detector.py` | Repeated HTTPS polling |
+| 5 — Login Analytics | `ids_detector.py` | Success-rate drop, off-hours surge, unknown-account spike, breached creds |
+| 6 — Cross-IP Fingerprint | `ids_detector.py` + `ip_reputation.py` | Proxy pool with shared HTTP headers |
+| 7 — TLS JA3 | `tls_ja3.py` → `ids_detector.py` | Known-bot TLS stacks, JA3 reuse across IPs |
+| 8 — Adaptive/ML | `ml_detector.py` → `ids_detector.py` | Z-score deviation from EWMA baseline |
+| 9 — Browser Automation | `browser_bot_sim.py` → `ids_detector.py` | webdriver artifact, CDP, headless GPU |
+| 10 — Username Clustering | `username_clustering.py` → `fake_portal.py` | Domain concentration, sequential names |
+| Host | `ids_detector.py` | Ghost process, CPU spike, process name spoof |
+
+---
+
 ### 9.3 Tarpitting (Credential Stuffing Response)
 
 Rather than blocking suspected credential-stuffing bots outright (which reveals detection and lets the attacker tune their jitter), a tarpit diverts them to a slow-response endpoint that artificially delays each reply by several seconds. The bot remains connected but productive throughput approaches zero, increasing the attacker's time-cost per tested credential by orders of magnitude without triggering an obvious block.
@@ -1608,6 +2098,12 @@ New files require the same isolation guarantees as existing offensive modules:
 /tmp/verified_hits.txt
 /tmp/tarpit_state.json
 breach_dump.txt
+/tmp/enriched_breach_dump.txt
+/tmp/priority_creds.txt
+/tmp/confirmed_accounts.txt
+/tmp/supply_chain_audit.json
+/tmp/phishing_sent.json
+/tmp/mfa_bypass_log.json
 ```
 
 ---
