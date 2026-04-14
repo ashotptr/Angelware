@@ -2,7 +2,7 @@
 ====================================================
  AUA CS 232/337 - Botnet Research Project
  Component: Credential Stuffing Attack Module
- Target: fake_portal.py running on 192.168.100.20:80
+ Target: fake_portal.py running on 192.168.100.20:8080
  Environment: ISOLATED VM LAB ONLY
 ====================================================
 
@@ -58,7 +58,7 @@ from datetime import datetime
 
 # ── Configuration ─────────────────────────────────────────────
 TARGET_HOST   = "192.168.100.20"
-TARGET_PORT   = 80
+TARGET_PORT   = 8080
 LOGIN_PATH    = "/login"
 ATTEMPTS_PATH = "/attempts"
 

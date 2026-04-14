@@ -38,7 +38,7 @@ from collections import defaultdict, deque
 from datetime import datetime
 
 try:
-    from scapy.all import sniff, IP, TCP, UDP, DNS, DNSQR, DNSRR, get_if_list
+    from scapy.all import sniff, IP, TCP, UDP, DNS, DNSQR, DNSRR, Raw, get_if_list
     SCAPY_OK = True
 except ImportError:
     print("[IDS] Scapy not installed. Run: pip3 install scapy")
@@ -87,20 +87,20 @@ except ImportError:
 # ── Configuration ──────────────────────────────────────────────
 SYN_THRESHOLD        = 100
 UDP_THRESHOLD        = 200
-CRED_WINDOW          = 20
+CRED_WINDOW          = 8
 CV_BOT_THRESHOLD     = 0.15
 DGA_ENTROPY_THRESH   = 3.8
 NXDOMAIN_BURST       = 10
 HIGH_ENTROPY_BURST   = 5
 CPU_SPIKE_THRESHOLD  = 85.0
-MONITOR_INTERFACE    = "enp0s3"
+MONITOR_INTERFACE    = "lo" #enp0s3
 TARPIT_UNBLOCK_IDLE  = 120
 
 IDS_LOG_FILE         = "/tmp/ids.log"
 
 # Engine 5 -- Login Analytics
-PORTAL_HOST               = "192.168.100.20"
-PORTAL_PORT               = 80
+PORTAL_HOST               = "127.0.0.1" #192.168.100.20
+PORTAL_PORT               = 8080
 ENGINE5_POLL_SEC          = 30
 SUCCESS_RATE_MIN          = 5.0
 MIN_ATTEMPTS_FOR_RATE     = 20
@@ -234,11 +234,15 @@ def compute_cv(timestamps: deque) -> float:
 def process_credential_stuffing(pkt):
     if not (pkt.haslayer(IP) and pkt.haslayer(TCP)):
         return
-    if pkt[TCP].dport != 80:
+    if pkt[TCP].dport != PORTAL_PORT:
         return
 
     try:
-        payload = bytes(pkt[TCP].payload)
+        if pkt.haslayer(Raw):
+            payload = bytes(pkt[Raw].load)
+        else:
+            payload = bytes(pkt[TCP].payload)
+
         if b"POST" in payload and b"/login" in payload:
             src_ip = pkt[IP].src
             now    = time.time()
@@ -271,8 +275,8 @@ def process_credential_stuffing(pkt):
 
                         login_times[src_ip].clear()
 
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[IDS-E2-ERR] {e}")
 
 
 def tarpit_auto_unblock_loop():

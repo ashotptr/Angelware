@@ -259,7 +259,7 @@ def attempt_with_totp(host: str, port: int,
 # ── Teaching experiment runner ────────────────────────────────
 
 def run_evasion_demo(host: str = "192.168.100.20",
-                     port: int = 80,
+                     port: int = 8080,
                      n_attempts: int = 20):
     """
     Demonstrate each evasion technique and its effect.

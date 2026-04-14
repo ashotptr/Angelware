@@ -1037,8 +1037,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Fake Login Portal — AUA Botnet Research Lab"
     )
-    parser.add_argument("--port", type=int, default=80,
-                        help="Listening port (default: 80)")
+    parser.add_argument("--port", type=int, default=8080,
+                        help="Listening port (8080)")
     parser.add_argument("--leaky-reset", action="store_true",
                         help="Make /reset-password reveal account existence "
                              "(insecure mode — for enumeration demo)")

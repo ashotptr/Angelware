@@ -72,7 +72,7 @@ c2_curl() {
     # Usage: c2_curl <json_body>
     curl -s -X POST "http://${C2_IP}:5000/task" \
          -H "Content-Type: application/json" \
-         -H "X-Auth-Token: LAB_RESEARCH_TOKEN_2026" \
+         -H "X-Auth-Token: aw" \
          -d "$1"
 }
 

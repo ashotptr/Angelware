@@ -51,7 +51,7 @@ from typing import Optional
 
 # ── Configuration ─────────────────────────────────────────────
 DEFAULT_HOST = "192.168.100.20"
-DEFAULT_PORT = 80
+DEFAULT_PORT = 8080
 LOGIN_PATH   = "/login"
 
 # ── Known automation artifact header patterns ─────────────────

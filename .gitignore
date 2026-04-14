@@ -17,3 +17,6 @@ breach_dump.txt
 /tmp/supply_chain_audit.json
 /tmp/phishing_sent.json
 /tmp/mfa_bypass_log.json
+venv/
+__pycache__/
+bot_agent
