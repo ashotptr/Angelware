@@ -2113,8 +2113,5 @@ March 12, 2026, https://www.usenix.org/system/files/sec15-paper-asghari.pdf
 66. Incident response plan templates | Red Canary, accessed March 12, 2026, 
 https://redcanary.com/cybersecurity-101/incident-response/incident-response-pl
 an-template/ 
-67. NIST Incident Response: 4-Step Life Cycle, Templates and Tips - Cynet, accessed 
-March 12, 2026, 
-https://www.cynet.com/incident-response/nist-incident-response/ 
 
 *AUA CS 232 / CS 337 Cybersecurity Spring 2026 — Botnet Attack-Defense Research Lab*
