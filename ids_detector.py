@@ -137,6 +137,27 @@ except ImportError:
     _enum_detector = None
     print("[IDS] INFO: account_enum_sim.py not found -- Engine 13 disabled")
 
+# Engine 15 -- Flow-Level Detection (flow_analyzer.py)
+# Source: freeCodeCamp "Build a Real-Time IDS with Python" (Rahalkar, Jan 2025)
+# Adds: per-flow feature extraction, port scan signature (packet_size<100 AND
+#       packet_rate>50), flow-level IsolationForest, JSON alert log.
+try:
+    import flow_analyzer as _e15_mod
+    _e15_mod.get_engine().register_alert_fn(alert)
+    E15_OK = True
+    print("[IDS] Flow-Level Detection: ENABLED (Engine 15)")
+    print(f"[IDS]   Port scan rule: packet_size<{flow_analyzer.SIG_PORT_SCAN_PKT_SIZE}B "
+          f"AND packet_rate>{flow_analyzer.SIG_PORT_SCAN_RATE} pkt/s")
+    print(f"[IDS]   JSON alert log: {flow_analyzer.JSON_ALERT_LOG}")
+    if flow_analyzer._SKLEARN_OK:
+        print(f"[IDS]   IsolationForest: ENABLED (sklearn available)")
+    else:
+        print(f"[IDS]   IsolationForest: DISABLED (pip install scikit-learn)")
+except ImportError:
+    E15_OK = False
+    _e15_mod = None
+    print("[IDS] INFO: flow_analyzer.py not found -- Engine 15 disabled")
+
 # Engine 7 integration patch -- JA3 rotation detector + cooldown wrap
 # Applied just before sniff() in _start_sniffer().
 try:
@@ -1529,6 +1550,8 @@ def packet_handler(pkt):
     process_tls_fingerprint(pkt)    # Engine 7
     process_e11_rst_syn(pkt)        # Engine 11 — RST/SYN scanner (infosec article)
     process_e11_dns(pkt)            # Engine 11 — DNS cross-protocol anomaly
+    if E15_OK and _e15_mod:
+        _e15_mod.process_flow_packet(pkt)   # Engine 15 — flow-level detection
 
 
 # ══════════════════════════════════════════════════════════════
@@ -1612,6 +1635,19 @@ def main():
         print(f"      [ENABLED]  Engine13/AccountEnumeration (MITRE T1589.002)")
     else:
         print("      [DISABLED] account_enum_sim.py not found")
+    print("   15 Flow-Level Detection  [freeCodeCamp article — Rahalkar 2025]")
+    print("      Per-flow feature extraction (packet_size, packet_rate,")
+    print("      byte_rate, flow_duration, tcp_flags, window_size)")
+    print("      Signature: port scan  (packet_size<100B AND packet_rate>50 pkt/s)")
+    print("      Signature: syn_flood  (SYN flag AND packet_rate>100 pkt/s)")
+    print("      Flow-level IsolationForest on [packet_size, packet_rate, byte_rate]")
+    print("      JSON alert log: /tmp/ids_flow_alerts.json  (SIEM-ready NDJSON)")
+    if E15_OK:
+        status = _e15_mod.get_engine().status()
+        print(f"      [ENABLED]  sklearn={status['sklearn_available']}, "
+              f"log={status['json_log']}")
+    else:
+        print("      [DISABLED] flow_analyzer.py not found")
     print("   7+ Engine 7 Patch  (JA3 rotation detector + 2-min cooldown)")
     if E7_PATCH_OK:
         print("      [ENABLED]  ids_detector_patch.patch_ids_detector")
