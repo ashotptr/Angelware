@@ -2107,8 +2107,4 @@ breach_dump.txt
 ```
 
 ---
- 
-63. Post-Mortem of a Zombie: Conficker Cleanup After Six Years - USENIX, accessed 
-March 12, 2026, https://www.usenix.org/system/files/sec15-paper-asghari.pdf
-
 *AUA CS 232 / CS 337 Cybersecurity Spring 2026 — Botnet Attack-Defense Research Lab*
