@@ -2125,7 +2125,5 @@ https://www.cynet.com/incident-response/nist-incident-response/
 Blog, accessed March 12, 2026, 
 https://blog.barracuda.com/2026/01/29/malware-brief-new-wave-botnets-ddos-
 chaos 
-69. Implementing Kademlia: A DHT journey | by Vinaya Mandke | Medium, accessed 
-March 12, 2026, https://medium.com/@vmandke/kademlia-89142a8c2627 
 
 *AUA CS 232 / CS 337 Cybersecurity Spring 2026 — Botnet Attack-Defense Research Lab*
