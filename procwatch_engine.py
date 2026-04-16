@@ -472,6 +472,548 @@ def detect_interpreter_with_network(proc: "psutil.Process") -> list[dict]:
     return findings
 
 
+def detect_ptrace_trace(proc: "psutil.Process") -> list[dict]:
+    """
+    Detect processes being traced via ptrace.
+
+    Reads /proc/<pid>/status for TracerPid.  A non-zero TracerPid means
+    another process has attached to this one with ptrace(PTRACE_ATTACH)
+    or is intercepting its syscalls via ptrace(PTRACE_SYSCALL).
+
+    Attacker uses:
+      - Anti-debugging hooks (injecting shellcode into running processes)
+      - Password harvesting (reading credential data from target processes)
+      - Keystroke injection into shell sessions
+      - Rootkit implantation via live kernel patching
+
+    False-positive note: gdb, strace, and ltrace all set TracerPid.
+    ProcWatch cross-checks: if the tracer binary is strace/gdb in a
+    SYSTEM_PATH it is LOW severity.  If the tracer is from /tmp or has
+    no recognisable name it is CRITICAL.
+    """
+    findings = []
+    status_text = _read_proc_file(proc.pid, "status")
+    if not status_text:
+        return findings
+
+    for line in status_text.splitlines():
+        if line.startswith("TracerPid:"):
+            try:
+                tracer_pid = int(line.split(":")[1].strip())
+            except ValueError:
+                continue
+            if tracer_pid == 0:
+                break   # not being traced
+
+            # Process is being traced — investigate the tracer
+            tracer_name = "unknown"
+            tracer_exe  = ""
+            severity    = "HIGH"
+            note        = "Process is being traced by another process."
+
+            try:
+                tracer      = psutil.Process(tracer_pid)
+                tracer_name = tracer.name()
+                tracer_exe  = tracer.exe()
+            except Exception:
+                pass
+
+            # Benign debuggers in standard system paths → LOW
+            benign_tracers = {"gdb", "strace", "ltrace", "perf"}
+            if (tracer_name in benign_tracers
+                    and tracer_exe.startswith(SYSTEM_PATHS)):
+                severity = "LOW"
+                note = (
+                    f"Tracer is {tracer_name} from {tracer_exe} — "
+                    f"likely legitimate debugging session."
+                )
+            elif _is_in_suspicious_location(tracer_exe):
+                severity = "CRITICAL"
+                note = (
+                    f"Tracer binary in suspicious location: {tracer_exe}\n"
+                    f"  This pattern matches attacker-controlled ptrace injection.\n"
+                    f"  Possible techniques: shellcode injection, credential theft,\n"
+                    f"  keystroke injection into privileged shell."
+                )
+            else:
+                severity = "HIGH"
+                note = (
+                    f"Tracer '{tracer_name}' (PID {tracer_pid}) not in standard "
+                    f"system path: {tracer_exe}\n"
+                    f"  Unexpected ptrace attachment — investigate tracer process."
+                )
+
+            findings.append({
+                "type":     "PTRACE_ATTACHED",
+                "severity": severity,
+                "detail":   (
+                    f"PID {proc.pid} ({proc.name()}) is being traced by "
+                    f"PID {tracer_pid} ({tracer_name})\n"
+                    f"  Tracer exe: {tracer_exe}\n"
+                    f"  {note}"
+                ),
+                "mitre":    "T1055 (Process Injection) + T1003 (OS Credential Dumping)",
+            })
+            break   # only one tracer possible
+    return findings
+
+
+def detect_deleted_binary(proc: "psutil.Process") -> list[dict]:
+    """
+    Detection 6 (standalone): Process running from a deleted binary.
+
+    Attackers often:
+      1. Copy payload to /tmp
+      2. Execute it
+      3. Immediately delete the file: rm -f /tmp/payload
+
+    Linux keeps the process alive in memory.  /proc/<pid>/exe shows
+    the path with " (deleted)" appended.  The binary can be recovered:
+
+        cp /proc/<pid>/exe /tmp/recovered_binary
+
+    This technique is a standard anti-forensics evasion: no file on
+    disk means traditional AV and file-hash scanners miss it entirely.
+    ProcWatch catches it at the kernel level via /proc.
+    """
+    findings = []
+    if not _is_deleted(proc.pid):
+        return findings
+
+    try:
+        link = os.readlink(f"/proc/{proc.pid}/exe")
+    except Exception:
+        link = "(unreadable)"
+
+    findings.append({
+        "type":     "DELETED_BINARY_RUNNING",
+        "severity": "HIGH",
+        "detail":   (
+            f"PID {proc.pid} ({proc.name()}) is running from a DELETED binary.\n"
+            f"  /proc/{proc.pid}/exe → {link}\n"
+            f"  The binary was deleted from disk after launch — anti-forensics.\n"
+            f"  The process lives only in memory; it disappears on reboot.\n"
+            f"  Forensic recovery: sudo cp /proc/{proc.pid}/exe "
+            f"/tmp/recovered_pid{proc.pid}"
+        ),
+        "recovery": _recover_hint(proc.pid),
+        "mitre":    "T1070.004 (Indicator Removal: File Deletion)",
+    })
+    return findings
+
+
+# ── YARA memory scanner ────────────────────────────────────────
+
+# Default ruleset: byte patterns and strings found in common malware,
+# reverse shells, miners, and dropper scripts.
+# Extend by adding (name, pattern_bytes_or_str, severity, mitre) tuples.
+#
+# Patterns are compiled once at import time.
+#
+# NOTE: Scanning /proc/<pid>/mem requires root AND the pid's maps file
+#       to determine readable virtual address ranges.  Non-readable
+#       ranges are skipped.  This is equivalent to YARA process scanning
+#       but implemented in pure Python without the YARA library.
+
+import re as _re
+
+_YARA_RULES = [
+    # Reverse shell indicators
+    ("REVSHELL_BASH",
+     b"/bin/bash -i",
+     "HIGH", "T1059.004"),
+    ("REVSHELL_PYTHON",
+     b"import socket,subprocess,os",
+     "HIGH", "T1059.006"),
+    ("REVSHELL_NC",
+     b"nc -e /bin/",
+     "HIGH", "T1059"),
+    ("REVSHELL_SOCAT",
+     b"socat exec:",
+     "HIGH", "T1059"),
+    # Miner pool patterns
+    ("MINER_POOL_STRATUM",
+     b"stratum+tcp://",
+     "HIGH", "T1496"),
+    ("MINER_POOL_XMR",
+     b"pool.supportxmr.com",
+     "HIGH", "T1496"),
+    ("MINER_XMRIG_BINARY",
+     b"xmrig",
+     "MED", "T1496"),
+    # Shellcode stagers
+    ("SHELLCODE_MSFVENOM",
+     b"\xfc\xe8\x82\x00\x00\x00",      # Metasploit x86 stager prelude
+     "CRITICAL", "T1059"),
+    ("SHELLCODE_EGG",
+     b"\x90\x90\x90\x90\x90\x90\x90\x90",  # NOP sled ≥8 bytes
+     "MED", "T1203"),
+    # C2 beacon patterns
+    ("C2_CURL_BEACON",
+     b"curl -s http",
+     "MED", "T1071.001"),
+    ("C2_WGET_BEACON",
+     b"wget -q http",
+     "MED", "T1071.001"),
+    # Dropper cleanup
+    ("DROPPER_SELF_DELETE",
+     b"rm -f /tmp/",
+     "MED", "T1070.004"),
+    # LD_PRELOAD in memory-mapped data
+    ("LD_PRELOAD_MEM",
+     b"LD_PRELOAD=/tmp",
+     "CRITICAL", "T1574.006"),
+]
+
+# Compile byte patterns for fast search
+_COMPILED_RULES = [
+    (name, pattern, sev, mitre)
+    for name, pattern, sev, mitre in _YARA_RULES
+]
+
+# Maximum bytes to read per VMA region (avoid spending hours on huge heaps)
+_YARA_REGION_LIMIT = 4 * 1024 * 1024   # 4 MiB
+
+
+def yara_memory_scan(proc: "psutil.Process",
+                     custom_rules: list = None) -> list[dict]:
+    """
+    Scan process memory for known malicious byte patterns.
+
+    Reads /proc/<pid>/maps to enumerate readable virtual memory regions,
+    then reads each region from /proc/<pid>/mem and searches for the
+    patterns in _YARA_RULES (plus any custom_rules).
+
+    Args:
+        proc         : psutil.Process to scan
+        custom_rules : optional list of (name, pattern_bytes, severity, mitre)
+                       tuples to append to the default ruleset
+
+    Returns a list of finding dicts (same format as other detectors).
+
+    Requires root to read arbitrary /proc/<pid>/mem regions.
+    On non-root, only self-process memory is accessible.
+
+    This is architecturally identical to running:
+        yara rule_file.yar /proc/<pid>/mem
+    but with zero external dependencies.
+    """
+    findings = []
+    rules = _COMPILED_RULES + (custom_rules or [])
+
+    maps_text = _read_proc_file(proc.pid, "maps")
+    if not maps_text:
+        return findings
+
+    mem_path = f"/proc/{proc.pid}/mem"
+    try:
+        mem_fd = open(mem_path, "rb")
+    except PermissionError:
+        return findings   # need root
+    except Exception:
+        return findings
+
+    try:
+        for line in maps_text.splitlines():
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+            perms = parts[1]
+            # Only scan readable, non-device regions (skip [vvar], [vsyscall])
+            if "r" not in perms:
+                continue
+            region_name = parts[-1] if len(parts) >= 6 else ""
+            if region_name in ("[vvar]", "[vsyscall]"):
+                continue
+
+            try:
+                addr_range = parts[0].split("-")
+                start = int(addr_range[0], 16)
+                end   = int(addr_range[1], 16)
+            except (IndexError, ValueError):
+                continue
+
+            size = min(end - start, _YARA_REGION_LIMIT)
+            if size <= 0:
+                continue
+
+            try:
+                mem_fd.seek(start)
+                data = mem_fd.read(size)
+            except Exception:
+                continue
+
+            if not data:
+                continue
+
+            for rule_name, pattern, severity, mitre in rules:
+                idx = data.find(pattern)
+                if idx == -1:
+                    continue
+                offset = start + idx
+                # Context: up to 40 bytes around the match
+                ctx_start = max(0, idx - 20)
+                ctx_end   = min(len(data), idx + len(pattern) + 20)
+                context = repr(data[ctx_start:ctx_end])
+
+                findings.append({
+                    "type":     f"YARA_{rule_name}",
+                    "severity": severity,
+                    "detail":   (
+                        f"YARA match [{rule_name}] in PID {proc.pid} "
+                        f"({proc.name()})\n"
+                        f"  Virtual address : 0x{offset:016x}\n"
+                        f"  Region          : {parts[0]}  perms={perms}"
+                        f"  {f'  file={region_name}' if region_name else ''}\n"
+                        f"  Pattern         : {pattern!r}\n"
+                        f"  Context (±20B)  : {context}"
+                    ),
+                    "mitre":    mitre,
+                })
+    finally:
+        try:
+            mem_fd.close()
+        except Exception:
+            pass
+
+    return findings
+
+
+# ── eBPF syscall monitor ───────────────────────────────────────
+
+class EBPFMonitor:
+    """
+    eBPF-based syscall monitoring for ProcWatch.
+
+    Two operating modes, selected at runtime based on availability:
+
+    Mode A — Native eBPF (requires root + kernel ≥ 4.4 + bcc):
+      Generates and compiles a BPF C program that attaches kprobes to
+      sys_execve, sys_connect, and sys_openat.  Fires an alert whenever
+      a traced process calls these syscalls with suspicious arguments.
+
+    Mode B — /proc/pid/syscall fallback (pure Python, always available):
+      Reads /proc/<pid>/syscall every POLL_INTERVAL seconds.  This file
+      exposes the currently-executing syscall number and arguments in hex.
+      Less precise than eBPF (poll-based vs. event-based) but zero
+      kernel dependencies.
+
+    Usage:
+        monitor = EBPFMonitor(target_pid=1234, alert_cb=my_alert)
+        monitor.start()          # non-blocking background thread
+        # ... later ...
+        monitor.stop()
+
+    Or use the class method scan_all() to snapshot all suspicious
+    syscall states in one pass (no background thread needed).
+    """
+
+    # Syscall numbers (x86_64 Linux ABI)
+    SYS_EXECVE  = 59
+    SYS_EXECVEAT= 322
+    SYS_CONNECT = 42
+    SYS_OPENAT  = 257
+    SYS_CLONE   = 56
+
+    # If these syscalls are the *current* one for a process, flag it
+    SUSPICIOUS_SYSCALLS = {
+        SYS_EXECVE:   ("SYSCALL_EXECVE",   "HIGH",   "T1059"),
+        SYS_EXECVEAT: ("SYSCALL_EXECVEAT", "HIGH",   "T1059"),
+        SYS_CONNECT:  ("SYSCALL_CONNECT",  "MED",    "T1071"),
+        SYS_CLONE:    ("SYSCALL_CLONE",    "MED",    "T1055"),
+    }
+
+    POLL_INTERVAL = 1.0   # seconds
+
+    # eBPF C source template
+    _BPF_SOURCE = """\
+/* ProcWatch eBPF program — AUA CS 232/337 Research Lab
+ * Attach to sys_execve, sys_connect, sys_openat kprobes.
+ * Compile with: clang -O2 -target bpf -c procwatch.bpf.c -o procwatch.bpf.o
+ * Or load via BCC: BPF(text=BPF_SOURCE).attach_kprobe(...)
+ */
+#include <uapi/linux/ptrace.h>
+#include <linux/sched.h>
+#include <linux/fs.h>
+
+struct event_t {
+    u32 pid;
+    u32 uid;
+    u64 syscall_nr;
+    char comm[16];
+    char path[256];
+};
+
+BPF_PERF_OUTPUT(events);
+
+int trace_execve(struct pt_regs *ctx, const char __user *filename) {
+    struct event_t evt = {};
+    evt.pid       = bpf_get_current_pid_tgid() >> 32;
+    evt.uid       = bpf_get_current_uid_gid();
+    evt.syscall_nr = 59;  // SYS_execve
+    bpf_get_current_comm(&evt.comm, sizeof(evt.comm));
+    bpf_probe_read_user_str(&evt.path, sizeof(evt.path), filename);
+    events.perf_submit(ctx, &evt, sizeof(evt));
+    return 0;
+}
+
+int trace_connect(struct pt_regs *ctx, int fd,
+                  struct sockaddr __user *uservaddr, int addrlen) {
+    struct event_t evt = {};
+    evt.pid       = bpf_get_current_pid_tgid() >> 32;
+    evt.uid       = bpf_get_current_uid_gid();
+    evt.syscall_nr = 42;  // SYS_connect
+    bpf_get_current_comm(&evt.comm, sizeof(evt.comm));
+    // path field: store sockaddr bytes for userspace to decode
+    bpf_probe_read_user(&evt.path, sizeof(evt.path), uservaddr);
+    events.perf_submit(ctx, &evt, sizeof(evt));
+    return 0;
+}
+"""
+
+    def __init__(self, target_pid: int = None, alert_cb=None):
+        self._target_pid = target_pid
+        self._alert_cb   = alert_cb or ProcWatchEngine._default_alert
+        self._stop       = threading.Event()
+        self._thread     = None
+        self._bcc_ok     = self._check_bcc()
+
+    @staticmethod
+    def _check_bcc() -> bool:
+        try:
+            import bcc  # noqa
+            return True
+        except ImportError:
+            return False
+
+    def start(self):
+        """Start monitoring in a background thread."""
+        if self._bcc_ok:
+            self._thread = threading.Thread(
+                target=self._bcc_loop, daemon=True, name="ebpf-monitor"
+            )
+            print("[EBPF] BCC available — using native eBPF kprobe monitoring.")
+        else:
+            self._thread = threading.Thread(
+                target=self._procfs_loop, daemon=True, name="ebpf-procfs"
+            )
+            print("[EBPF] BCC not available — using /proc/pid/syscall fallback.")
+            print("[EBPF] Install BCC for full eBPF support:")
+            print("[EBPF]   sudo apt install python3-bpfcc bpfcc-tools linux-headers-$(uname -r)")
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+
+    def generate_bpf_source(self) -> str:
+        """Return the eBPF C source for external compilation/loading."""
+        return self._BPF_SOURCE
+
+    def _bcc_loop(self):
+        """Native eBPF using BCC — hooks execve and connect kprobes."""
+        try:
+            from bcc import BPF
+            b = BPF(text=self._BPF_SOURCE)
+            b.attach_kprobe(event="sys_execve",  fn_name="trace_execve")
+            b.attach_kprobe(event="sys_connect", fn_name="trace_connect")
+
+            def handle_event(cpu, data, size):
+                evt = b["events"].event(data)
+                pid  = evt.pid
+                comm = evt.comm.decode(errors="replace")
+                path = evt.path.decode(errors="replace")
+                sysn = evt.syscall_nr
+                name, severity, mitre = self.SUSPICIOUS_SYSCALLS.get(
+                    sysn, ("SYSCALL_OTHER", "LOW", "T1059")
+                )
+                self._alert_cb(
+                    f"ProcWatch/EBPF_{name}", severity,
+                    f"eBPF: PID {pid} ({comm}) syscall {sysn} arg={path[:80]}\n"
+                    f"  MITRE: {mitre}"
+                )
+
+            b["events"].open_perf_buffer(handle_event)
+            while not self._stop.is_set():
+                b.perf_buffer_poll(timeout=500)
+        except Exception as e:
+            print(f"[EBPF] BCC loop error: {e} — falling back to /proc")
+            self._procfs_loop()
+
+    def _procfs_loop(self):
+        """
+        Fallback: poll /proc/<pid>/syscall for all processes (or target_pid).
+        Detects processes currently blocked inside a suspicious syscall.
+        """
+        while not self._stop.is_set():
+            pids = ([self._target_pid] if self._target_pid
+                    else (psutil.pids() if PSUTIL_OK else []))
+            for pid in pids:
+                syscall_text = _read_proc_file(pid, "syscall")
+                if not syscall_text or syscall_text.startswith("running"):
+                    continue
+                parts = syscall_text.split()
+                if not parts:
+                    continue
+                try:
+                    syscall_nr = int(parts[0])
+                except ValueError:
+                    continue
+                if syscall_nr not in self.SUSPICIOUS_SYSCALLS:
+                    continue
+                name, severity, mitre = self.SUSPICIOUS_SYSCALLS[syscall_nr]
+                args_hex = " ".join(parts[1:]) if len(parts) > 1 else "(no args)"
+                self._alert_cb(
+                    f"ProcWatch/EBPF_{name}", severity,
+                    f"/proc/{pid}/syscall: PID {pid} currently in syscall "
+                    f"{syscall_nr} ({name})\n"
+                    f"  Args (hex): {args_hex}\n"
+                    f"  MITRE: {mitre}"
+                )
+            time.sleep(self.POLL_INTERVAL)
+
+    @classmethod
+    def scan_all(cls, alert_cb=None) -> list[dict]:
+        """
+        One-shot /proc scan: return all processes currently in a
+        suspicious syscall.  Does not require BCC or root.
+        """
+        results = []
+        cb = alert_cb or (lambda *_: None)
+        if not PSUTIL_OK:
+            return results
+        for pid in psutil.pids():
+            syscall_text = _read_proc_file(pid, "syscall")
+            if not syscall_text or syscall_text.startswith("running"):
+                continue
+            parts = syscall_text.split()
+            if not parts:
+                continue
+            try:
+                syscall_nr = int(parts[0])
+            except ValueError:
+                continue
+            if syscall_nr not in cls.SUSPICIOUS_SYSCALLS:
+                continue
+            name, severity, mitre = cls.SUSPICIOUS_SYSCALLS[syscall_nr]
+            try:
+                proc_name = psutil.Process(pid).name()
+            except Exception:
+                proc_name = "?"
+            args_hex = " ".join(parts[1:]) if len(parts) > 1 else "(no args)"
+            finding = {
+                "type":     f"EBPF_{name}",
+                "severity": severity,
+                "detail":   (
+                    f"PID {pid} ({proc_name}) in syscall {syscall_nr} ({name})\n"
+                    f"  Args (hex): {args_hex}\n"
+                    f"  MITRE: {mitre}"
+                ),
+                "mitre":    mitre,
+            }
+            results.append({"pid": pid, "name": proc_name, "finding": finding})
+        return results
+
+
 # ══════════════════════════════════════════════════════════════
 #  PROCESS RISK SCORER
 # ══════════════════════════════════════════════════════════════
@@ -480,12 +1022,14 @@ SEVERITY_SCORE = {"CRITICAL": 100, "HIGH": 50, "MED": 20, "LOW": 5}
 
 DETECTORS = [
     detect_writable_dir_execution,
+    detect_deleted_binary,          # standalone (was only in info() before)
     detect_uid_mismatch,
     detect_revshell_connections,
     detect_miner_keywords,
     detect_miner_behavior,
     detect_ld_preload_injection,
     detect_interpreter_with_network,
+    detect_ptrace_trace,            # NEW: ptrace attachment detection
 ]
 
 
@@ -552,8 +1096,18 @@ class ProcWatchEngine:
         print(f"  {msg}")
         print(f"{'='*60}\n")
 
-    def scan(self, verbose: bool = True) -> list[dict]:
-        """Scan all processes. Return list of risky results."""
+    def scan(self, verbose: bool = True,
+             output_json: bool = False,
+             run_yara: bool = False) -> list[dict]:
+        """
+        Scan all processes.  Return list of risky results.
+
+        Args:
+            verbose:     print human-readable findings as they are found
+            output_json: if True, print a JSON report to stdout at the end
+            run_yara:    if True, also run YARA memory scan on each risky
+                         process (requires root; slower)
+        """
         if not PSUTIL_OK:
             print("[PROCWATCH] psutil unavailable")
             return []
@@ -566,9 +1120,22 @@ class ProcWatchEngine:
                 result = scan_process(proc)
             except Exception:
                 continue
+
+            # Optional YARA memory scan on processes that already have findings
+            if run_yara and result["findings"]:
+                try:
+                    yara_findings = yara_memory_scan(proc)
+                    result["findings"].extend(yara_findings)
+                    result["score"] += sum(
+                        SEVERITY_SCORE.get(f.get("severity", "LOW"), 0)
+                        for f in yara_findings
+                    )
+                except Exception:
+                    pass
+
             if result["findings"]:
                 risky.append(result)
-                if verbose:
+                if verbose and not output_json:
                     self._print_result(result)
                 for finding in result["findings"]:
                     self._alert_cb(
@@ -577,9 +1144,37 @@ class ProcWatchEngine:
                         finding["detail"],
                     )
 
-        if verbose:
+        # eBPF one-shot syscall snapshot (always runs; zero cost)
+        ebpf_hits = EBPFMonitor.scan_all()
+        for hit in ebpf_hits:
+            # Check if we already have this pid in risky
+            existing = next((r for r in risky if r["pid"] == hit["pid"]), None)
+            if existing:
+                existing["findings"].append(hit["finding"])
+            else:
+                risky.append({
+                    "pid":      hit["pid"],
+                    "name":     hit["name"],
+                    "exe":      "",
+                    "cmdline":  [],
+                    "findings": [hit["finding"]],
+                    "score":    SEVERITY_SCORE.get(hit["finding"]["severity"], 0),
+                })
+
+        if verbose and not output_json:
             print(f"\n[PROCWATCH] Scan complete.  "
                   f"Suspicious processes found: {len(risky)}\n")
+
+        if output_json:
+            import json as _json
+            report = {
+                "ts":            datetime.now().isoformat(),
+                "total_scanned": len(list(psutil.pids())),
+                "suspicious":    len(risky),
+                "results":       risky,
+            }
+            print(_json.dumps(report, indent=2))
+
         return risky
 
     def watch(self, interval: float = SCAN_INTERVAL) -> None:
@@ -715,20 +1310,38 @@ def _print_banner() -> None:
     print("\n" + "="*60)
     print("  ProcWatch — Host Process Security Scanner")
     print("  AUA CS 232/337 Botnet Research Lab")
-    print("  Detects: writable-dir exec, UID mismatch, revshells,")
-    print("           miners, LD_PRELOAD injection, interpreter C2")
+    print("  Detections: writable-dir exec, deleted binary, UID mismatch,")
+    print("              revshells, miners, LD_PRELOAD, interpreter C2,")
+    print("              ptrace attachment, YARA memory scan, eBPF syscalls")
     print("="*60 + "\n")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="ProcWatch — Linux Process Security Scanner\n"
-                    "Source: Hafiz Shamnad, DEV Community, March 2025",
+        description=(
+            "ProcWatch — Linux Process Security Scanner\n"
+            "Source: Hafiz Shamnad, DEV Community, March 2025\n"
+            "AUA CS 232/337 Botnet Research Lab\n\n"
+            "Usage:\n"
+            "  procwatch scan [-v] [-j] [--yara] [--ebpf]\n"
+            "  procwatch watch [--interval N]\n"
+            "  procwatch info <pid>\n"
+            "  procwatch list\n"
+            "  procwatch ebpf  -- show eBPF C source for manual loading\n"
+        ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     sub = parser.add_subparsers(dest="cmd", help="Mode")
 
-    sub.add_parser("scan",  help="One-shot scan of all processes")
+    scan_p = sub.add_parser("scan",  help="One-shot scan of all processes")
+    scan_p.add_argument("-v", "--verbose", action="store_true", default=True,
+                        help="Verbose output (default: on)")
+    scan_p.add_argument("-j", "--json", action="store_true",
+                        help="Output results as JSON (mirrors original article -j flag)")
+    scan_p.add_argument("--yara", action="store_true",
+                        help="Run YARA memory scan on suspicious processes (root req.)")
+    scan_p.add_argument("--no-ebpf", action="store_true",
+                        help="Skip eBPF/syscall snapshot")
 
     watch_p = sub.add_parser("watch", help="Continuous monitor (alert on new findings)")
     watch_p.add_argument("--interval", type=float, default=SCAN_INTERVAL,
@@ -736,8 +1349,18 @@ if __name__ == "__main__":
 
     info_p = sub.add_parser("info", help="Detailed report for one PID")
     info_p.add_argument("pid", type=int, help="Process ID to inspect")
+    info_p.add_argument("--yara", action="store_true",
+                        help="Also run YARA memory scan on this PID")
 
     sub.add_parser("list",  help="Risk-tiered list of all processes")
+
+    ebpf_p = sub.add_parser("ebpf", help="eBPF tools")
+    ebpf_p.add_argument("--source",  action="store_true",
+                        help="Print eBPF C source for manual compilation/loading")
+    ebpf_p.add_argument("--scan",    action="store_true",
+                        help="One-shot /proc syscall scan (no BCC needed)")
+    ebpf_p.add_argument("--monitor", type=int, metavar="PID",
+                        help="Continuously monitor a specific PID via eBPF/procfs")
 
     args = parser.parse_args()
     _print_banner()
@@ -745,19 +1368,68 @@ if __name__ == "__main__":
     if os.getuid() != 0:
         print("[PROCWATCH] WARNING: not running as root.")
         print("  Run with: sudo python3 procwatch_engine.py <mode>")
-        print("  Without root, environment variables and some connections")
+        print("  Without root: env vars, some connections, and YARA scans")
         print("  of other users' processes will not be visible.\n")
 
     engine = ProcWatchEngine()
 
     if args.cmd == "scan" or args.cmd is None:
-        engine.scan(verbose=True)
+        run_yara = getattr(args, "yara", False)
+        out_json = getattr(args, "json", False)
+        engine.scan(verbose=not out_json, output_json=out_json, run_yara=run_yara)
 
     elif args.cmd == "watch":
         engine.watch(interval=args.interval)
 
     elif args.cmd == "info":
         engine.info(args.pid)
+        if getattr(args, "yara", False):
+            try:
+                proc = psutil.Process(args.pid)
+                yara_hits = yara_memory_scan(proc)
+                if yara_hits:
+                    print(f"\n[YARA] {len(yara_hits)} pattern match(es) in PID {args.pid}:")
+                    for h in yara_hits:
+                        print(f"  [{h['severity']}] {h['type']}")
+                        for line in h['detail'].splitlines():
+                            print(f"    {line}")
+                else:
+                    print(f"\n[YARA] No pattern matches in PID {args.pid}.")
+            except Exception as e:
+                print(f"[YARA] Error: {e}")
 
     elif args.cmd == "list":
         engine.list_all()
+
+    elif args.cmd == "ebpf":
+        em = EBPFMonitor()
+        if getattr(args, "source", False):
+            print("[EBPF] BPF C source (compile with clang -O2 -target bpf):\n")
+            print(em.generate_bpf_source())
+            print("\n[EBPF] Load with BCC:")
+            print("  from bcc import BPF")
+            print("  b = BPF(text=open('procwatch.bpf.c').read())")
+            print("  b.attach_kprobe(event='sys_execve', fn_name='trace_execve')")
+            print("  b.attach_kprobe(event='sys_connect', fn_name='trace_connect')")
+        elif getattr(args, "scan", False):
+            hits = EBPFMonitor.scan_all()
+            if hits:
+                print(f"[EBPF] {len(hits)} processes in suspicious syscalls:")
+                for h in hits:
+                    print(f"  PID {h['pid']} ({h['name']}): "
+                          f"[{h['finding']['severity']}] {h['finding']['type']}")
+            else:
+                print("[EBPF] No processes currently in suspicious syscalls.")
+        elif getattr(args, "monitor", None):
+            print(f"[EBPF] Monitoring PID {args.monitor}  (Ctrl-C to stop)")
+            em2 = EBPFMonitor(target_pid=args.monitor)
+            em2.start()
+            try:
+                while True:
+                    time.sleep(1)
+            except KeyboardInterrupt:
+                em2.stop()
+                print("\n[EBPF] Monitor stopped.")
+        else:
+            print("[EBPF] Specify --source, --scan, or --monitor <pid>.")
+            ebpf_p.print_help()

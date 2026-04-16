@@ -126,6 +126,28 @@ except ImportError:
     PROCWATCH_OK = False
     print("[IDS] INFO: procwatch_engine.py not found -- Engine 12 disabled")
 
+# Engine 13 -- Account Enumeration (EnumerationDetector)
+try:
+    from account_enum_sim import EnumerationDetector as _EnumDet
+    _enum_detector = _EnumDet()
+    ENUM_OK = True
+    print("[IDS] Account Enumeration detector: ENABLED (Engine 13)")
+except ImportError:
+    ENUM_OK = False
+    _enum_detector = None
+    print("[IDS] INFO: account_enum_sim.py not found -- Engine 13 disabled")
+
+# Engine 7 integration patch -- JA3 rotation detector + cooldown wrap
+# Applied just before sniff() in _start_sniffer().
+try:
+    from ids_detector_patch import patch_ids_detector as _e7_patch
+    E7_PATCH_OK = True
+    print("[IDS] Engine 7 patch (JA3 rotation + cooldown): ENABLED")
+except ImportError:
+    E7_PATCH_OK = False
+    _e7_patch = None
+    print("[IDS] INFO: ids_detector_patch.py not found -- Engine 7 rotation/cooldown disabled")
+
 
 # ── Configuration ──────────────────────────────────────────────
 SYN_THRESHOLD        = 100
@@ -1356,9 +1378,69 @@ def _e12_procwatch_loop():
         time.sleep(E12_SCAN_INTERVAL)
 
 
-# ══════════════════════════════════════════════════════════════
-#  HOST-BASED ENGINE: CRYPTOJACKING + GHOST PROCESS + NAME SPOOF
-# ══════════════════════════════════════════════════════════════
+def _e13_enum_summary_loop():
+    """
+    Engine 13: Account enumeration monitor.
+
+    Polls the fake_portal /stats/advanced endpoint (same pattern as Engine 5)
+    and feeds reset-password probe data into the EnumerationDetector.
+    The detector fires when it sees:
+      - High volume of probes from one IP in a short window
+      - High ratio of not-found responses (breach dump enumeration)
+      - Sequential or domain-clustered email patterns (bot list)
+
+    Falls back to processing raw /attempts data if /stats/advanced is
+    unavailable or does not include enumeration fields.
+    """
+    if not ENUM_OK or _enum_detector is None:
+        return
+
+    print(f"[IDS-E13] Account enumeration detector started "
+          f"(polls {PORTAL_HOST}:{PORTAL_PORT} every {ENGINE5_POLL_SEC}s)")
+
+    _e13_seen_probes: set = set()   # dedup: (ip, email, timestamp bucket)
+
+    while True:
+        time.sleep(ENGINE5_POLL_SEC)
+        try:
+            url = f"http://{PORTAL_HOST}:{PORTAL_PORT}/attempts"
+            with urllib.request.urlopen(url, timeout=3) as resp:
+                data = json.loads(resp.read().decode())
+        except Exception:
+            continue
+
+        # /attempts returns a list of {ip, email, status, ts} dicts
+        # (or a dict with an 'attempts' list — handle both)
+        attempts = data if isinstance(data, list) else data.get("attempts", [])
+
+        for entry in attempts:
+            # Only care about reset-password probes (Engine 13 scope)
+            endpoint = entry.get("endpoint", entry.get("path", ""))
+            if "reset" not in endpoint.lower():
+                continue
+
+            ip        = entry.get("ip",    entry.get("src_ip", ""))
+            email     = entry.get("email", entry.get("username", ""))
+            status    = entry.get("status", "unknown")
+            ts_raw    = entry.get("ts",    entry.get("timestamp", 0))
+            # Bucket timestamps to 5-second intervals for dedup
+            ts_bucket = int(float(ts_raw) / 5) if ts_raw else 0
+            key = (ip, email, ts_bucket)
+            if key in _e13_seen_probes:
+                continue
+            _e13_seen_probes.add(key)
+
+            # Feed into detector; it manages its own windows and thresholds
+            _enum_detector.probe(
+                src_ip=ip,
+                email=email,
+                found=(status.lower() not in ("not_found", "404", "no_account")),
+                alert_cb=alert,
+            )
+
+        # Prune dedup set to prevent unbounded growth (keep last 10 000)
+        if len(_e13_seen_probes) > 10_000:
+            _e13_seen_probes.clear()
 
 SYSTEM_PROCESS_WHITELIST = {
     "kworker", "ksoftirqd", "migration", "rcu_sched",
@@ -1509,12 +1591,32 @@ def main():
     print(f"      Log dir: {E11_LOG_DIR}   DHCP release: {'ENABLED' if E11_ENABLE_DHCP_RELEASE else 'dry-run'}")
     print("   12 ProcWatch Host Process Scanner  [NEW — ProcWatch article]")
     print("      Writable-dir execution (/tmp, /dev/shm, /var/tmp, …)")
+    print("      Deleted binary still running  (anti-forensics)")
     print("      UID/eUID mismatch (SUID escalation in progress)")
     print("      Root process running from /home/* directory")
     print(f"      Reverse-shell ports {sorted(E12_REVSHELL_PORTS)} ESTABLISHED")
     print("      Cryptominer keywords (xmrig, monero, stratum, pool, …)")
     print("      LD_PRELOAD injection (user-space rootkit)")
     print("      Interpreter + network + no terminal (revshell pattern)")
+    print("      ptrace attachment detection")
+    print("      YARA memory pattern scan  (sudo + --yara flag)")
+    print("      eBPF syscall snapshot  (execve/connect/clone in /proc/pid/syscall)")
+    if PROCWATCH_OK:
+        print(f"      [ENABLED]  procwatch_engine.ProcWatchEngine")
+    else:
+        print("      [DISABLED] procwatch_engine.py not found")
+    print("   13 Account Enumeration  [EnumerationDetector]")
+    print("      Probes on /reset-password endpoint")
+    print("      High not-found ratio, sequential email patterns")
+    if ENUM_OK:
+        print(f"      [ENABLED]  Engine13/AccountEnumeration (MITRE T1589.002)")
+    else:
+        print("      [DISABLED] account_enum_sim.py not found")
+    print("   7+ Engine 7 Patch  (JA3 rotation detector + 2-min cooldown)")
+    if E7_PATCH_OK:
+        print("      [ENABLED]  ids_detector_patch.patch_ids_detector")
+    else:
+        print("      [DISABLED] ids_detector_patch.py not found")
     print("   H  Host          -- Ghost process + name spoof + CPU spike")
     print("=" * 60)
 
@@ -1536,15 +1638,24 @@ def main():
     threading.Thread(target=engine6_loop,           daemon=True, name="e6-fp-correlation").start()
     threading.Thread(target=_e11_summary_loop,      daemon=True, name="e11-rst-summary").start()
     threading.Thread(target=_e12_procwatch_loop,    daemon=True, name="e12-procwatch").start()
+    if ENUM_OK:
+        threading.Thread(target=_e13_enum_summary_loop,
+                         daemon=True, name="e13-enum").start()
 
     if TARPIT_ENABLED:
         threading.Thread(target=tarpit_auto_unblock_loop,
                          daemon=True, name="tarpit-unblock").start()
 
+    # Apply Engine 7 patch (JA3 rotation detector + cooldown) to packet_handler
+    _active_handler = packet_handler
+    if E7_PATCH_OK:
+        _active_handler = _e7_patch(packet_handler, alert)
+        print("[IDS] Engine 7 patch applied to packet_handler.")
+
     print(f"\n[IDS] Sniffing on {MONITOR_INTERFACE}... (Ctrl+C to stop)\n")
     try:
         sniff(iface=MONITOR_INTERFACE,
-              prn=packet_handler,
+              prn=_active_handler,
               store=False)
     except KeyboardInterrupt:
         pass

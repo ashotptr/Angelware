@@ -356,8 +356,140 @@ class RememberMeAbuseSimulator:
         _write_log(TOKEN_LOG, entry)
         return {"user": user, "new_token": new_tok}
 
+    def scenario_d_rotation_attack(self, target_email: str,
+                                    rm: "SecureRememberMe") -> dict:
+        """
+        Scenario D: Token Rotation Race Condition.
+
+        In systems WITHOUT rotation:
+          Attacker captures the remember-me cookie once and reuses it
+          indefinitely.  The victim's password change does nothing.
+          The cookie is valid until the TTL expires (often 30–90 days).
+
+        In systems WITH rotation (like SecureRememberMe):
+          Each verification invalidates the old token and issues a new one.
+          If the attacker and the legitimate user both hold the old token:
+            - Whoever presents it FIRST wins and gets the new token.
+            - The other party's next access FAILS (token already rotated).
+          This creates a detectable race condition:
+            - One of the two parties will see an unexpected validation failure.
+            - A validation failure on a recently-issued token → alert IDS.
+
+        This scenario demonstrates:
+          1. How the race plays out (attacker wins the first use)
+          2. How the legitimate user is implicitly logged out
+          3. How the defender can detect the race (Engine 11 fires on
+             duplicate-rotation attempts from different IPs)
+        """
+        print("\n── Scenario D: Token Rotation Race Condition ─────────")
+        print(f"  Target: {target_email}")
+        print(f"  System: rotation ENABLED = {ROTATION_ENABLED}")
+        print()
+
+        # Step 1: Issue a token to the legitimate user
+        leg_ip = "203.0.113.10"    # legitimate user's home IP
+        atk_ip = "10.50.60.70"     # attacker's IP (different country)
+        sel, val = rm.issue(target_email, src_ip=leg_ip, device_fp="leg_device")
+        print(f"  [1] Legitimate user logs in from {leg_ip}")
+        print(f"      Token issued: {sel[:8]}…")
+        print()
+
+        # Step 2: Attacker captures the token (via ATO credential stuffing,
+        #          network sniff, or buying from a resale market)
+        # --- In this simulation we simply copy sel/val ---
+        atk_sel, atk_val = sel, val
+        print(f"  [2] Attacker captures token: {atk_sel[:8]}… (sold on Telegram)")
+        print()
+
+        # Step 3: Attacker uses the token FIRST (faster, automated)
+        time.sleep(0.05)
+        atk_user, atk_new = rm.verify_and_rotate(
+            atk_sel, atk_val,
+            src_ip=atk_ip,
+            device_fp="atk_device"
+        )
+        if atk_user:
+            print(f"  [3] Attacker presents token from {atk_ip}")
+            print(f"      ✓ Access GRANTED as: {atk_user}")
+            if atk_new:
+                print(f"      New token issued (old one now DEAD): "
+                      f"{atk_new[0][:8]}…")
+        else:
+            print(f"  [3] Attacker token REJECTED (already used)")
+        print()
+
+        # Step 4: Legitimate user now tries the same original token
+        #         (they still have the old cookie in their browser)
+        time.sleep(0.05)
+        leg_user, leg_new = rm.verify_and_rotate(
+            sel, val,
+            src_ip=leg_ip,
+            device_fp="leg_device"
+        )
+        if leg_user:
+            print(f"  [4] Legitimate user presents token from {leg_ip}")
+            print(f"      ✓ Access GRANTED (attacker was too slow)")
+        else:
+            print(f"  [4] Legitimate user presents token from {leg_ip}")
+            print(f"      ✗ REJECTED — token already rotated by attacker!")
+            print(f"      The legitimate user is now implicitly logged out.")
+            print(f"      → This is detectable: a validation FAILURE on a")
+            print(f"        recently-issued token from a known-good device.")
+            print(f"        Engine 11 should alert on this pattern.")
+        print()
+
+        # Step 5: Detection — the stolen-token rotation leaves a fingerprint
+        # IDS can detect:
+        #   (a) The original token was issued to IP A, but first presented
+        #       from IP B (a different country) — impossible travel.
+        #   (b) The legitimate user's NEXT login attempt will have to use
+        #       password auth, creating an unusual re-auth event.
+        if not leg_user and atk_new:
+            alert = {
+                "engine":       "Engine11/RotationRace",
+                "severity":     "HIGH",
+                "user":         target_email,
+                "atk_ip":       atk_ip,
+                "leg_ip":       leg_ip,
+                "ts":           datetime.now().isoformat(),
+                "message": (
+                    f"TOKEN ROTATION RACE: {target_email}\n"
+                    f"  Token was issued to {leg_ip} but first rotated "
+                    f"from {atk_ip}\n"
+                    f"  The original holder ({leg_ip}) was implicitly "
+                    f"logged out.\n"
+                    f"  Sequence: issue({leg_ip}) → rotate({atk_ip}) "
+                    f"→ reject({leg_ip})\n"
+                    f"  Indicates stolen remember-me cookie used before "
+                    f"the legitimate owner.\n"
+                    f"  Action: revoke ALL tokens for this user, "
+                    f"force password reset.\n"
+                    f"  MITRE: T1539 (Steal Web Session Cookie) + "
+                    f"T1550.004 (Use Alternate Auth Material)"
+                ),
+            }
+            print(f"  [IDS-Engine11/RotationRace] HIGH: {alert['message']}")
+            _write_log(TOKEN_LOG, alert)
+        else:
+            alert = None
+
+        result = {
+            "scenario":    "rotation_race",
+            "target":      target_email,
+            "atk_won":     atk_user is not None,
+            "leg_locked":  leg_user is None,
+            "alert_fired": alert is not None,
+        }
+        print(f"  ── Summary ──")
+        print(f"     Attacker won race   : {result['atk_won']}")
+        print(f"     Legitimate locked out: {result['leg_locked']}")
+        print(f"     Alert fired         : {result['alert_fired']}")
+        print(f"  Defense: bind token to issuing IP (IP pinning) OR")
+        print(f"           alert on issuance-IP ≠ first-use-IP pattern.")
+        return result
+
     def scenario_c_parallel_sessions(self, email: str,
-                                      rm: SecureRememberMe) -> dict:
+                                      rm: "SecureRememberMe") -> dict:
         print("\n── Scenario C: Parallel Session Abuse ────────────────")
         # Issue 3 independent tokens (legitimate + 2 attacker buyers)
         tokens = []
@@ -385,6 +517,56 @@ class RememberMeAbuseSimulator:
 # ══════════════════════════════════════════════════════════════
 #  Part 3: PERSISTENT SESSION DETECTOR (IDS Engine 11)
 # ══════════════════════════════════════════════════════════════
+
+# ══════════════════════════════════════════════════════════════
+#  GEO-IMPOSSIBILITY HELPERS (Signal 3)
+# ══════════════════════════════════════════════════════════════
+
+import math as _math
+
+# IP prefix → (latitude, longitude, country, city)
+# Covers lab IPs, simulated attacker ranges, and common datacenter blocks.
+# Extend as needed.  Order matters: more specific prefixes first.
+_GEO_TABLE = [
+    # Lab / private ranges  (Armenia, Yerevan)
+    ("192.168.100.", 40.18,  44.51, "Armenia",     "Yerevan"),
+    ("192.168.",     40.18,  44.51, "Armenia",     "Yerevan"),
+    # RFC-1918 10.0–10.49  → Russia, Moscow (simulation)
+    ("10.0.",        55.75,  37.62, "Russia",      "Moscow"),
+    ("10.1.",        55.75,  37.62, "Russia",      "Moscow"),
+    # RFC-1918 10.50–10.99 → Netherlands (buyer simulation)
+    ("10.50.",       52.37,  4.90,  "Netherlands", "Amsterdam"),
+    ("10.51.",       52.37,  4.90,  "Netherlands", "Amsterdam"),
+    # Tor exit nodes (approximation — Netherlands)
+    ("185.220.",     52.37,  4.90,  "Netherlands", "Amsterdam"),
+    ("185.107.",     52.37,  4.90,  "Netherlands", "Amsterdam"),
+    # Comcast US residential
+    ("68.42.",       41.85, -87.65, "United States", "Chicago"),
+    ("73.0.",        37.77, -122.4, "United States", "San Francisco"),
+    # Generic fallback
+    ("0.",            0.0,   0.0,   "Unknown",     "Unknown"),
+]
+
+
+def _geo_lookup(ip: str) -> dict:
+    """Return {lat, lon, country, city} for a given IP."""
+    for prefix, lat, lon, country, city in _GEO_TABLE:
+        if ip.startswith(prefix):
+            return {"lat": lat, "lon": lon, "country": country, "city": city}
+    return {"lat": 0.0, "lon": 0.0, "country": "Unknown", "city": "Unknown"}
+
+
+def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Great-circle distance between two lat/lon points in kilometres."""
+    R = 6371.0
+    dlat = _math.radians(lat2 - lat1)
+    dlon = _math.radians(lon2 - lon1)
+    a = (_math.sin(dlat / 2) ** 2
+         + _math.cos(_math.radians(lat1))
+         * _math.cos(_math.radians(lat2))
+         * _math.sin(dlon / 2) ** 2)
+    return R * 2 * _math.asin(_math.sqrt(min(1.0, a)))
+
 
 class PersistentSessionDetector:
     """
@@ -421,24 +603,35 @@ class PersistentSessionDetector:
                all_active_tokens: list) -> Optional[dict]:
         """
         Called on every successful remember-me validation.
-        Returns an alert dict or None.
+        Evaluates four signals and returns the highest-severity alert, or None.
+
+        Signal 1: IP change between issuance and use
+                  (handled inside SecureRememberMe.verify_and_rotate;
+                   logged there, not re-evaluated here to avoid double-firing)
+        Signal 2: Too many active tokens (> MAX_TOKENS_PER_USER)
+        Signal 3: Geographic impossibility — two uses from locations
+                  whose straight-line distance divided by elapsed time
+                  exceeds IMPOSSIBLE_TRAVEL_KM_PER_SEC (~900 km/h)
+        Signal 4: Off-hours reactivation (02:00–05:00 local time,
+                  first or second use of the token)
         """
-        now  = time.time()
-        hour = datetime.fromtimestamp(now).hour
+        now   = time.time()
+        hour  = datetime.fromtimestamp(now).hour
         alert = None
+        geo_now = _geo_lookup(src_ip)
 
         with self._lock:
             self._usage[user_email].append({
-                "ts":  now,
-                "ip":  src_ip,
-                "sel": selector[:8],
+                "ts":     now,
+                "ip":     src_ip,
+                "sel":    selector[:8],
+                "lat":    geo_now["lat"],
+                "lon":    geo_now["lon"],
+                "country": geo_now["country"],
             })
             history = list(self._usage[user_email])
 
-        # Signal 1: IP change between issuance and use
-        # (handled inside SecureRememberMe by logging issuing IP)
-
-        # Signal 2: Too many active tokens
+        # ── Signal 2: Too many active tokens ─────────────────────
         if len(all_active_tokens) > self.MAX_TOKENS_PER_USER:
             alert = {
                 "engine":   "Engine11/TokenCount",
@@ -456,7 +649,58 @@ class PersistentSessionDetector:
                 ),
             }
 
-        # Signal 3: Off-hours reactivation
+        # ── Signal 3: Geographic impossibility ───────────────────
+        # Compare current access against every prior access in the
+        # rolling history.  If the required travel speed between any
+        # two successive accesses exceeds IMPOSSIBLE_TRAVEL_KM_PER_SEC
+        # (0.25 km/s ≈ 900 km/h, max commercial aircraft), the pair is
+        # physically impossible and indicates account sharing or ATO.
+        if len(history) >= 2:
+            prev = history[-2]   # second-to-last entry
+            time_delta_sec = now - prev["ts"]
+            if time_delta_sec > 0:   # sanity guard
+                dist_km = _haversine_km(
+                    prev["lat"], prev["lon"],
+                    geo_now["lat"], geo_now["lon"],
+                )
+                required_speed = dist_km / time_delta_sec  # km/s
+                if required_speed > self.IMPOSSIBLE_TRAVEL_KM_PER_SEC:
+                    elapsed_min = time_delta_sec / 60
+                    speed_kmh   = required_speed * 3600
+                    geo_alert = {
+                        "engine":        "Engine11/ImpossibleTravel",
+                        "severity":      "HIGH",
+                        "user":          user_email,
+                        "dist_km":       round(dist_km, 1),
+                        "elapsed_min":   round(elapsed_min, 1),
+                        "speed_kmh":     round(speed_kmh, 1),
+                        "prev_ip":       prev["ip"],
+                        "prev_country":  prev["country"],
+                        "curr_ip":       src_ip,
+                        "curr_country":  geo_now["country"],
+                        "ts":            datetime.now().isoformat(),
+                        "message": (
+                            f"IMPOSSIBLE TRAVEL: {user_email}\n"
+                            f"  Previous access: {prev['ip']} "
+                            f"({prev['country']})  {elapsed_min:.1f} min ago\n"
+                            f"  Current  access: {src_ip} "
+                            f"({geo_now['country']})\n"
+                            f"  Distance: {dist_km:.0f} km  "
+                            f"in {elapsed_min:.1f} min  "
+                            f"= {speed_kmh:.0f} km/h\n"
+                            f"  Max possible (aircraft): "
+                            f"{self.IMPOSSIBLE_TRAVEL_KM_PER_SEC * 3600:.0f} km/h\n"
+                            f"  Conclusion: two people are using this account "
+                            f"simultaneously.\n"
+                            f"  Action: revoke all tokens, force re-auth, "
+                            f"notify user.\n"
+                            f"  MITRE: T1550.004 (Web Session Cookie)"
+                        ),
+                    }
+                    if not alert:
+                        alert = geo_alert
+
+        # ── Signal 4: Off-hours reactivation ─────────────────────
         if hour in range(2, 5) and len(history) <= 2:
             off_alert = {
                 "engine":   "Engine11/OffHoursReactivation",
@@ -468,8 +712,8 @@ class PersistentSessionDetector:
                 "message": (
                     f"OFF-HOURS TOKEN USE: {user_email} remember-me "
                     f"reactivated at {hour:02d}:xx from {src_ip}\n"
-                    f"  First-or-second use of this token at 02:00-05:00\n"
-                    f"  Common pattern: attacker in different timezone\n"
+                    f"  First-or-second use of this token at 02:00–05:00\n"
+                    f"  Common pattern: attacker operating in a distant timezone\n"
                     f"  MITRE: T1550.004"
                 ),
             }
@@ -484,8 +728,14 @@ class PersistentSessionDetector:
 
     def get_stats(self) -> dict:
         return {
-            "total_alerts": len(self._alerts),
+            "total_alerts":  len(self._alerts),
             "users_watched": len(self._usage),
+            "alert_breakdown": {
+                "TokenCount":           sum(1 for a in self._alerts if "TokenCount" in a["engine"]),
+                "ImpossibleTravel":     sum(1 for a in self._alerts if "ImpossibleTravel" in a["engine"]),
+                "OffHoursReactivation": sum(1 for a in self._alerts if "OffHoursReactivation" in a["engine"]),
+                "RotationRace":         sum(1 for a in self._alerts if "RotationRace" in a["engine"]),
+            },
         }
 
 
@@ -523,10 +773,34 @@ def _run_demo():
         all_active_tokens=tokens,
     )
 
+    # Scenario D: Token rotation race condition
+    rm_d = SecureRememberMe()
+    sim.scenario_d_rotation_attack("carol@corp.com", rm_d)
+
+    # Demo: Signal 3 — geographic impossibility
+    print("\n── Signal 3 Demo: Geographic Impossibility ──────────────")
+    rm_geo = SecureRememberMe()
+    sel_g, val_g = rm_geo.issue("eve@example.com", src_ip="192.168.100.20")
+    det_geo = PersistentSessionDetector()
+    # First use from Armenia (192.168.100.x)
+    det_geo.check("eve@example.com", "192.168.100.20",
+                  selector=sel_g, all_active_tokens=[])
+    # Second use 90 seconds later from Netherlands — 4000+ km / 90s = impossible
+    time.sleep(0.05)  # (simulated — we just manipulate the timestamp directly)
+    # Manually backdate the first entry to simulate 90s elapsed
+    with det_geo._lock:
+        det_geo._usage["eve@example.com"][0]["ts"] -= 90
+        det_geo._usage["eve@example.com"][0]["lat"] = 40.18   # Armenia
+        det_geo._usage["eve@example.com"][0]["lon"] = 44.51
+        det_geo._usage["eve@example.com"][0]["country"] = "Armenia"
+    det_geo.check("eve@example.com", "10.50.60.70",
+                  selector=sel_g, all_active_tokens=[])
+
     # Defense demonstration
     print("\n── Defense: Revoke on password change ────────────────")
     rm.revoke_all("alice@example.com")
     rm.revoke_all("admin@example.com")
+    rm_d.revoke_all("carol@corp.com")
     print("  All persistent sessions cleared.")
     print("  Attackers who relied on remember-me cookies are now locked out.")
 

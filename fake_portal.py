@@ -1031,24 +1031,168 @@ def _render_login_page():
 
 # ── Entry point ───────────────────────────────────────────────
 
+def _generate_self_signed_cert(cert_path: str, key_path: str,
+                               hostname: str = "192.168.100.10") -> bool:
+    """
+    Generate a self-signed TLS certificate and private key for the portal.
+
+    Used by --tls to enable HTTPS, which is required for:
+      - Engine 7 (JA3 TLS fingerprinting via ids_detector_patch.py)
+      - TLS JA3 mimicry testing in covert_bot.py
+      - Realistic credential stuffing simulation (HTTPS targets)
+
+    Tries pyOpenSSL first, falls back to the openssl(1) CLI, then to the
+    Python ssl module's built-in adhoc cert capability.
+
+    Returns True if cert files were written successfully.
+    """
+    import subprocess, os
+
+    # Method 1: pyOpenSSL (most control, best for labs)
+    try:
+        from OpenSSL import crypto
+        key  = crypto.PKey()
+        key.generate_key(crypto.TYPE_RSA, 2048)
+
+        cert = crypto.X509()
+        cert.get_subject().C  = "AM"
+        cert.get_subject().ST = "Yerevan"
+        cert.get_subject().L  = "AUA"
+        cert.get_subject().O  = "AUA CS232 Research Lab"
+        cert.get_subject().CN = hostname
+        cert.set_serial_number(1)
+        cert.gmtime_adj_notBefore(0)
+        cert.gmtime_adj_notAfter(365 * 24 * 60 * 60)   # 1 year
+        cert.set_issuer(cert.get_subject())
+        cert.set_pubkey(key)
+
+        # Subject Alternative Names — needed for Chrome/modern TLS stacks
+        san = f"IP:{hostname}, DNS:{hostname}".encode()
+        cert.add_extensions([
+            crypto.X509Extension(b"subjectAltName", False, san),
+            crypto.X509Extension(b"basicConstraints", True, b"CA:FALSE"),
+        ])
+        cert.sign(key, "sha256")
+
+        with open(cert_path, "wb") as f:
+            f.write(crypto.dump_certificate(crypto.FILETYPE_PEM, cert))
+        with open(key_path, "wb") as f:
+            f.write(crypto.dump_privatekey(crypto.FILETYPE_PEM, key))
+
+        print(f"[TLS] Self-signed cert generated via pyOpenSSL")
+        print(f"[TLS]   Cert: {cert_path}")
+        print(f"[TLS]   Key:  {key_path}")
+        print(f"[TLS]   CN/SAN: {hostname}  (valid 365 days)")
+        return True
+
+    except ImportError:
+        pass
+
+    # Method 2: openssl CLI
+    try:
+        subj = (f"/C=AM/ST=Yerevan/L=AUA/O=AUA CS232"
+                f"/CN={hostname}")
+        ext  = f"subjectAltName=IP:{hostname}"
+        result = subprocess.run([
+            "openssl", "req", "-x509", "-newkey", "rsa:2048",
+            "-keyout", key_path, "-out", cert_path,
+            "-days", "365", "-nodes",
+            "-subj", subj,
+            "-addext", ext,
+        ], capture_output=True)
+        if result.returncode == 0:
+            print(f"[TLS] Self-signed cert generated via openssl CLI")
+            print(f"[TLS]   Cert: {cert_path}  Key: {key_path}")
+            return True
+        else:
+            print(f"[TLS] openssl CLI failed: {result.stderr.decode()[:120]}")
+    except FileNotFoundError:
+        pass
+
+    print("[TLS] WARNING: Could not generate cert (pyOpenSSL and openssl CLI missing).")
+    print("[TLS]   Install pyOpenSSL:  pip install pyopenssl --break-system-packages")
+    print("[TLS]   Or:                 sudo apt install openssl")
+    print("[TLS]   Falling back to Flask development adhoc SSL context.")
+    return False
+
+
 if __name__ == "__main__":
     import argparse, sys
 
     parser = argparse.ArgumentParser(
-        description="Fake Login Portal — AUA Botnet Research Lab"
+        description=(
+            "Fake Login Portal — AUA Botnet Research Lab\n\n"
+            "HTTPS (--tls) is required for Engine 7 JA3 fingerprinting.\n"
+            "Without --tls, Engine 7 sees no TLS ClientHellos."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--port", type=int, default=8080,
-                        help="Listening port (8080)")
+                        help="Listening port (default: 8080 HTTP, 8443 with --tls)")
     parser.add_argument("--leaky-reset", action="store_true",
                         help="Make /reset-password reveal account existence "
                              "(insecure mode — for enumeration demo)")
+
+    # --tls: Enable HTTPS for Engine 7 (JA3 TLS fingerprinting)
+    tls_grp = parser.add_argument_group(
+        "TLS / HTTPS",
+        "Enable HTTPS so Engine 7 (ids_detector_patch.py) can capture\n"
+        "and classify TLS ClientHello JA3 fingerprints from attackers."
+    )
+    tls_grp.add_argument("--tls", action="store_true",
+                         help="Enable HTTPS (generates self-signed cert if needed)")
+    tls_grp.add_argument("--tls-cert", metavar="PATH",
+                         default="/tmp/portal_cert.pem",
+                         help="Path to TLS certificate PEM (default: /tmp/portal_cert.pem)")
+    tls_grp.add_argument("--tls-key", metavar="PATH",
+                         default="/tmp/portal_key.pem",
+                         help="Path to TLS private key PEM (default: /tmp/portal_key.pem)")
+    tls_grp.add_argument("--tls-host", metavar="IP",
+                         default="192.168.100.10",
+                         help="Hostname/IP for cert CN/SAN (default: 192.168.100.10)")
+
     args = parser.parse_args()
 
     _LEAKY_RESET_MODE = args.leaky_reset
 
+    # Resolve port default: 8443 when TLS is on and user didn't override
+    port = args.port
+    if args.tls and port == 8080:
+        port = 8443
+
+    # Prepare TLS context
+    ssl_context = None
+    if args.tls:
+        import os as _os
+        cert_ok = (_os.path.isfile(args.tls_cert)
+                   and _os.path.isfile(args.tls_key))
+        if not cert_ok:
+            cert_ok = _generate_self_signed_cert(
+                args.tls_cert, args.tls_key, args.tls_host
+            )
+        if cert_ok:
+            import ssl as _ssl
+            ssl_context = _ssl.SSLContext(_ssl.PROTOCOL_TLS_SERVER)
+            ssl_context.load_cert_chain(args.tls_cert, args.tls_key)
+            # Restrict to TLS 1.2+ — older versions have no JA3 extension fields
+            ssl_context.minimum_version = _ssl.TLSVersion.TLSv1_2
+        else:
+            # Fall back to Flask adhoc (werkzeug generates a temp cert)
+            ssl_context = "adhoc"
+            print("[TLS] Using Flask adhoc SSL context (pyOpenSSL recommended)")
+
+    proto = "https" if args.tls else "http"
     print("=" * 60)
     print(" Fake Login Portal — AUA Botnet Research Lab")
-    print(f" Listening on 0.0.0.0:{args.port}")
+    print(f" Listening on {proto}://0.0.0.0:{port}")
+    if args.tls:
+        print(f" TLS:            ENABLED  (Engine 7 JA3 fingerprinting active)")
+        print(f" TLS cert:       {args.tls_cert}")
+        print(f" TLS key:        {args.tls_key}")
+        print(f" TLS host:       {args.tls_host}")
+        print(f" Engine 7:       run  sudo python3 ids_detector_patch.py  to capture")
+    else:
+        print(f" TLS:            DISABLED  (use --tls for Engine 7 JA3 support)")
     print(f" Tarpit:         {'ENABLED' if TARPIT_ENABLED else 'DISABLED'}")
     if TARPIT_ENABLED:
         print(f" Tarpit delay:   {tarpit_state.TARPIT_DELAY} +/- "
@@ -1060,6 +1204,7 @@ if __name__ == "__main__":
     print(f" Extensions:     {'ENABLED' if EXTENSIONS_ENABLED else 'DISABLED'}")
     if EXTENSIONS_ENABLED:
         print(f"   Engine 9 (browser automation artifact detection)")
+        print(f"   Engine 13 (account enumeration — Engine13/AccountEnumeration)")
         print(f"   CSRF tokens on /login form")
         print(f"   POST /reset-password  ({'LEAKY' if _LEAKY_RESET_MODE else 'SECURE'} mode)")
         print(f"   POST /api/mobile/login  (Device-ID rate limiting)")
@@ -1071,19 +1216,22 @@ if __name__ == "__main__":
     print(f" Reset mode:     {'LEAKY (--leaky-reset)' if _LEAKY_RESET_MODE else 'SECURE (uniform response)'}")
     print()
     print(" Endpoints:")
-    print("   GET/POST /login            Main credential stuffing target")
-    print("   POST     /reset-password   Account enumeration demo")
-    print("   POST     /api/mobile/login Mobile API blind-spot demo")
-    print("   POST     /oauth/authorize  OAuth token planting demo")
-    print("   POST     /oauth/token      Token exchange / refresh")
-    print("   POST     /oauth/revoke     Token revocation defense")
-    print("   GET      /attempts         Attempt log + tarpit summary")
-    print("   POST     /attempts/reset   Clear state between runs")
-    print("   GET      /tarpit/status    Graph 3 TPR counter")
-    print("   GET      /stats/advanced   All IDS Engine 5 signals")
-    print("   GET      /stats/extensions New-module stats (debug)")
-    print("   GET      /2fa/status       Step-up 2FA admin")
-    print("   GET      /clustering/status Username clustering admin")
+    print(f"   GET/POST {proto}://0.0.0.0:{port}/login")
+    print(f"   POST     {proto}://0.0.0.0:{port}/reset-password")
+    print(f"   POST     {proto}://0.0.0.0:{port}/api/mobile/login")
+    print(f"   POST     {proto}://0.0.0.0:{port}/oauth/authorize")
+    print(f"   POST     {proto}://0.0.0.0:{port}/oauth/token")
+    print(f"   POST     {proto}://0.0.0.0:{port}/oauth/revoke")
+    print(f"   GET      {proto}://0.0.0.0:{port}/attempts")
+    print(f"   POST     {proto}://0.0.0.0:{port}/attempts/reset")
+    print(f"   GET      {proto}://0.0.0.0:{port}/tarpit/status")
+    print(f"   GET      {proto}://0.0.0.0:{port}/stats/advanced")
+    print(f"   GET      {proto}://0.0.0.0:{port}/stats/extensions")
+    print(f"   GET      {proto}://0.0.0.0:{port}/2fa/status")
+    print(f"   GET      {proto}://0.0.0.0:{port}/clustering/status")
     print("=" * 60)
 
-    app.run(host="0.0.0.0", port=args.port, debug=False)
+    if ssl_context:
+        app.run(host="0.0.0.0", port=port, debug=False, ssl_context=ssl_context)
+    else:
+        app.run(host="0.0.0.0", port=port, debug=False)

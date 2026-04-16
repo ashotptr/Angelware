@@ -731,9 +731,20 @@ class TCPDNSAnomalyDetector:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="RST/SYN/DNS Anomaly Detector — AUA Botnet Research Lab\n"
-                    "Implements: 'Traffic Anomaly Detection – TCP and DNS' "
-                    "(Rishi Narang, Infosec, 2012)",
+        description=(
+            "RST/SYN/DNS Anomaly Detector — AUA Botnet Research Lab\n"
+            "Implements: 'Traffic Anomaly Detection – TCP and DNS'\n"
+            "(Rishi Narang, Infosec, June 2012)\n\n"
+            "Feature 1 (article): SYN/RST flag counting (Cases 1 & 2)\n"
+            "Feature 2 (article): Log-file analysis for top active IP\n"
+            "Feature 3 (article): DHCP lease release on confirmed scanner\n"
+            "Feature 4 (article): P2P mesh coordination (--mesh, --mesh-host)\n"
+            "                     'Let the scripts interact with each other\n"
+            "                      on different hosts and isolate the malicious\n"
+            "                      IP address as a network of analysis.'\n"
+            "DNS anomalies:       Surge, NXDOMAIN burst, DNS:TCP ratio,\n"
+            "                     recursive burst, resolve-rate drop"
+        ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--interface",  default=DEFAULT_INTERFACE,
@@ -750,6 +761,21 @@ if __name__ == "__main__":
                         help=f"RST packets/window to confirm scanner (default: {DEFAULT_RST_THRESHOLD})")
     parser.add_argument("--syn-threshold", type=int, default=DEFAULT_SYN_THRESHOLD,
                         help=f"SYN packets/window to confirm scanner (default: {DEFAULT_SYN_THRESHOLD})")
+
+    # P2P mesh flags (Article Feature 4)
+    mesh_grp = parser.add_argument_group(
+        "P2P Mesh (Article Feature 4)",
+        "Coordinate scanner detection across multiple hosts.\n"
+        "Run rst_detector.py with --mesh on each victim VM.\n"
+        "Requires rst_p2p_mesh.py in the same directory."
+    )
+    mesh_grp.add_argument("--mesh", action="store_true",
+                          help="Enable P2P mesh coordination (rst_p2p_mesh.py)")
+    mesh_grp.add_argument("--mesh-host", metavar="IP", default=None,
+                          help="This node's IP address for the mesh (e.g., 192.168.100.20)")
+    mesh_grp.add_argument("--mesh-quorum", type=int, default=2,
+                          help="Peer agreements needed to trigger CONSENSUS_ISOLATE (default: 2)")
+
     args = parser.parse_args()
 
     if args.analyze_logs:
@@ -760,12 +786,55 @@ if __name__ == "__main__":
         print("[RST-DETECTOR] WARNING: not running as root — raw socket capture may fail.")
         print("               Run with: sudo python3 rst_detector.py")
 
+    # ── Optionally start the P2P mesh node ─────────────────────────────
+    mesh_node = None
+    if args.mesh:
+        if not args.mesh_host:
+            print("[RST-DETECTOR] --mesh requires --mesh-host <this-vm-ip>")
+            sys.exit(1)
+        try:
+            from rst_p2p_mesh import RSTMeshNode
+            def _mesh_isolate_cb(scanner_ip, summary):
+                print(f"\n[MESH-CONSENSUS] *** ISOLATE {scanner_ip} ***")
+                print(f"  Peers agreed: {summary['peers']}")
+                print(f"  Avg confidence: {summary['avg_conf']:.0%}")
+
+            mesh_node = RSTMeshNode(
+                local_ip=args.mesh_host,
+                quorum=args.mesh_quorum,
+                isolate_cb=_mesh_isolate_cb,
+            )
+            mesh_node.start()
+            print(f"[RST-DETECTOR] P2P mesh ENABLED — "
+                  f"node {args.mesh_host}  quorum={args.mesh_quorum}")
+        except ImportError:
+            print("[RST-DETECTOR] WARNING: rst_p2p_mesh.py not found — mesh disabled.")
+            print("[RST-DETECTOR]   Ensure rst_p2p_mesh.py is in the same directory.")
+
+    # Wire the mesh's report_scanner as the alert callback for the detectors
+    def _alert_with_mesh(engine: str, severity: str, msg: str) -> None:
+        # Default print
+        ts = datetime.now().strftime("%H:%M:%S")
+        print(f"\n[{ts}] ALERT [{severity}] {engine}\n  {msg}\n")
+        # Forward confirmed scanner IPs to the mesh
+        if mesh_node and ("SCANNER" in msg or "Case" in msg):
+            import re
+            m = re.search(r"\b(\d{1,3}(?:\.\d{1,3}){3})\b", msg)
+            if m:
+                conf = 1.0 if severity == "HIGH" else 0.6
+                mesh_node.report_scanner(m.group(1), confidence=conf)
+
     detector = TCPDNSAnomalyDetector(
         log_dir=args.log_dir,
         interface=args.interface,
         enable_dhcp=args.enable_dhcp_release,
+        alert_cb=_alert_with_mesh if args.mesh else None,
     )
     detector.rst_counter.threshold = args.rst_threshold
     detector.syn_counter.threshold = args.syn_threshold
 
-    detector.start(duration=args.duration)
+    try:
+        detector.start(duration=args.duration)
+    finally:
+        if mesh_node:
+            mesh_node.stop()

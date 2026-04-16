@@ -234,14 +234,21 @@ class AccountEnumerationBot:
 
 class EnumerationDetector:
     """
-    Detects account enumeration campaigns on the /reset-password
-    endpoint. Integrated into fake_portal.py.
+    IDS Engine 13: Detects account enumeration campaigns on the
+    /reset-password endpoint. Integrated into fake_portal.py.
+
+    Previously unnumbered in the IDS taxonomy; formally assigned
+    Engine 13 to complete the Engine 1–14 numbering sequence.
+    (Engine 14 = BreachIntelDetector in breach_dump_enricher.py)
 
     Signals:
       1. High volume of reset requests from one IP in a time window
       2. High ratio of "not found" responses (breach dump pattern)
       3. Sequential or domain-clustered email patterns (bot list)
     """
+
+    ENGINE_ID             = 13
+    ENGINE_NAME           = "Engine13/AccountEnumeration"
 
     RATE_THRESHOLD        = 10    # requests per IP per WINDOW
     NOT_FOUND_RATIO_THRESH = 0.70  # 70% not-found → breach dump
@@ -305,7 +312,7 @@ class EnumerationDetector:
 
         if alert and alert_cb:
             self._alerts += 1
-            alert_cb("Enumeration/PasswordReset", "HIGH", alert)
+            alert_cb(self.ENGINE_NAME, "HIGH", alert)
 
         return alert
 
