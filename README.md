@@ -2110,8 +2110,6 @@ breach_dump.txt
  
 63. Post-Mortem of a Zombie: Conficker Cleanup After Six Years - USENIX, accessed 
 March 12, 2026, https://www.usenix.org/system/files/sec15-paper-asghari.pdf
-65. Credential Stuffing: What It Is, How It Works, & 7 Ways to Prevent It - Frontegg, 
-accessed March 12, 2026, https://frontegg.com/blog/credential-stuffing 
 66. Incident response plan templates | Red Canary, accessed March 12, 2026, 
 https://redcanary.com/cybersecurity-101/incident-response/incident-response-pl
 an-template/ 
