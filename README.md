@@ -2116,9 +2116,5 @@ an-template/
 67. NIST Incident Response: 4-Step Life Cycle, Templates and Tips - Cynet, accessed 
 March 12, 2026, 
 https://www.cynet.com/incident-response/nist-incident-response/ 
-68. Malware Brief: New wave of botnets driving DDoS chaos | Barracuda Networks 
-Blog, accessed March 12, 2026, 
-https://blog.barracuda.com/2026/01/29/malware-brief-new-wave-botnets-ddos-
-chaos 
 
 *AUA CS 232 / CS 337 Cybersecurity Spring 2026 — Botnet Attack-Defense Research Lab*
