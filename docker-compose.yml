@@ -1,0 +1,318 @@
+# ================================================================
+#  AUA CS 232/337 - Botnet Research Lab
+#  Docker Compose: Containerised Multi-Service Honeypot
+#  Source: JHU HotSoS '24 §3.2 Docker-compose Structure
+# ================================================================
+#
+#  Usage:
+#    docker-compose up -d          # start all containers
+#    docker-compose logs -f        # live log stream
+#    docker-compose down           # stop + remove containers
+#
+#  Mirrors the paper's architecture:
+#   ┌──────────────┐  ┌──────────┐  ┌──────────┐  ┌────────┐
+#   │ cowrie (SSH) │  │  apache  │  │   smtp   │  │  ldap  │
+#   │  :2222→22   │  │  :80     │  │ :2525→25 │  │  :389  │
+#   └──────────────┘  └──────────┘  └──────────┘  └────────┘
+#         ↑                 ↑              ↑             ↑
+#         └─────────────────┴──────────────┴─────────────┘
+#                          syslog (:5140 UDP)
+#                              ↓
+#                    syslog_aggregator container
+#
+#  Network: 192.168.100.0/24  (matches VM lab addressing)
+#  Admin port: 12315  (reserved, not exposed — Doc 2 §3.1)
+# ================================================================
+
+version: "3.9"
+
+networks:
+  lab_net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: "192.168.100.0/24"
+
+volumes:
+  cowrie_logs:
+  apache_logs:
+  smtp_logs:
+  ldap_logs:
+  rdp_logs:
+  syslog_central:
+  mysql_data:
+
+services:
+
+  # ── Syslog aggregator (must start first) ─────────────────────
+  # Doc 2 §3.1: "The Syslog service captures and centralises activity
+  # logs from each container, enabling us to analyse bot interactions."
+  syslog:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.syslog
+    image: aua-lab/syslog:latest
+    container_name: syslog_aggregator
+    command: python3 syslog_aggregator.py
+    volumes:
+      - syslog_central:/var/log/syslog-central
+      - .:/app
+    ports:
+      - "5140:5140/udp"       # receive from all containers
+      - "5140:5140/tcp"
+    networks:
+      lab_net:
+        ipv4_address: "192.168.100.5"
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "200k"
+        max-file: "10"
+
+  # ── Cowrie SSH/Telnet honeypot (Doc 2 §3.3) ──────────────────
+  cowrie:
+    image: cowrie/cowrie:latest
+    container_name: cowrie_ssh
+    volumes:
+      - ./cowrie.cfg:/cowrie/etc/cowrie.cfg:ro
+      - cowrie_logs:/cowrie/var/log/cowrie
+    ports:
+      - "22:2222"             # port 22 → cowrie 2222
+      - "23:2323"             # port 23 → cowrie 2323 (Telnet)
+    networks:
+      lab_net:
+        ipv4_address: "192.168.100.20"
+    environment:
+      - COWRIE_SYSLOG_HOST=192.168.100.5
+      - COWRIE_SYSLOG_PORT=5140
+    depends_on:
+      - syslog
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "200k"
+        max-file: "10"
+
+  # ── Apache 2.4.49 web honeypot (CVE-2021-41773) (Doc 2 §3.3) ─
+  # "We built a simple blog site using Apache 2.4.49. This version
+  #  has vulnerability CVE-2021-41773. The site does not handle errors
+  #  so that bots can see more valid information."
+  apache:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.apache
+    image: aua-lab/apache-honeypot:latest
+    container_name: apache_honeypot
+    volumes:
+      - apache_logs:/var/log/apache2
+      - ./fake_portal.py:/app/fake_portal.py:ro
+    ports:
+      - "80:80"
+      - "443:443"
+    networks:
+      lab_net:
+        ipv4_address: "192.168.100.21"
+    environment:
+      - SYSLOG_HOST=192.168.100.5
+      - SYSLOG_PORT=5140
+    depends_on:
+      - syslog
+      - mysql
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "200k"
+        max-file: "10"
+
+  # ── MySQL backend for Apache blog (Doc 2 §3.3) ───────────────
+  # "We use a blog.sql file to initialise MySQL, including importing
+  #  initial blog and user information."
+  # Deliberately configured with a weak root password to surface
+  # SQL injection and credential-based attack patterns.
+  mysql:
+    image: mysql:5.7
+    container_name: mysql_honeypot
+    environment:
+      MYSQL_ROOT_PASSWORD: "honeypot123"     # weak on purpose — bait
+      MYSQL_DATABASE: "corporate_blog"
+      MYSQL_USER: "blog_user"
+      MYSQL_PASSWORD: "blog_pass"
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./docker/blog.sql:/docker-entrypoint-initdb.d/blog.sql:ro
+    networks:
+      lab_net:
+        ipv4_address: "192.168.100.22"
+    # MySQL NOT exposed externally — only reachable from Apache container
+    expose:
+      - "3306"
+    restart: unless-stopped
+
+  # ── SMTP honeypot / Mailoney (Doc 2 §3.3) ───────────────────
+  # "We deployed Mailoney, a honeypot that mimics real mail servers
+  #  to divert and monitor malicious activities and collect phishing emails."
+  smtp:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.smtp
+    image: aua-lab/smtp-honeypot:latest
+    container_name: smtp_mailoney
+    command: python3 multi_service_honeypot.py --ports 25 --bind 0.0.0.0
+    volumes:
+      - smtp_logs:/var/log/mailoney
+      - .:/app
+    ports:
+      - "2525:25"             # non-standard port — stops casual human access
+    networks:
+      lab_net:
+        ipv4_address: "192.168.100.23"
+    environment:
+      - SYSLOG_HOST=192.168.100.5
+      - SYSLOG_PORT=5140
+    depends_on:
+      - syslog
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "200k"
+        max-file: "10"
+
+  # ── LDAP honeypot (Doc 2 §3.3) ────────────────────────────────
+  # "We adapted a component from an open-source honeypots project to
+  #  develop a customised LDAP service. Every login attempt is recorded."
+  ldap:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.ldap
+    image: aua-lab/ldap-honeypot:latest
+    container_name: ldap_honeypot
+    command: python3 multi_service_honeypot.py --ports 389 --bind 0.0.0.0
+    volumes:
+      - ldap_logs:/var/log/syslog-ng
+      - .:/app
+    ports:
+      - "389:389"
+    networks:
+      lab_net:
+        ipv4_address: "192.168.100.24"
+    environment:
+      - SYSLOG_HOST=192.168.100.5
+      - SYSLOG_PORT=5140
+    depends_on:
+      - syslog
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "200k"
+        max-file: "10"
+
+  # ── RDP honeypot (Doc 2 §3.3) ─────────────────────────────────
+  # "We crafted a custom Docker container for RDP. We strategically
+  #  incorporated packages including older Xfce4, introducing CVE-2022-45062."
+  rdp:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.rdp
+    image: aua-lab/rdp-honeypot:latest
+    container_name: rdp_honeypot
+    command: python3 multi_service_honeypot.py --ports 3389 --bind 0.0.0.0
+    volumes:
+      - rdp_logs:/var/log/rdp
+      - .:/app
+    ports:
+      - "3389:3389"
+    networks:
+      lab_net:
+        ipv4_address: "192.168.100.25"
+    environment:
+      - SYSLOG_HOST=192.168.100.5
+      - SYSLOG_PORT=5140
+    depends_on:
+      - syslog
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "200k"
+        max-file: "10"
+
+  # ── FTP honeypot (Doc 1 §handle_connection) ──────────────────
+  ftp:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.ftp
+    image: aua-lab/ftp-honeypot:latest
+    container_name: ftp_honeypot
+    command: python3 multi_service_honeypot.py --ports 21 --bind 0.0.0.0
+    volumes:
+      - .:/app
+    ports:
+      - "21:21"
+    networks:
+      lab_net:
+        ipv4_address: "192.168.100.26"
+    environment:
+      - SYSLOG_HOST=192.168.100.5
+      - SYSLOG_PORT=5140
+    depends_on:
+      - syslog
+    restart: unless-stopped
+
+  # ── C2 server (Phase 1) ────────────────────────────────────────
+  c2:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.python
+    image: aua-lab/c2:latest
+    container_name: c2_server
+    command: python3 c2_server.py
+    volumes:
+      - .:/app
+    ports:
+      - "5000:5000"
+      - "5001:5001"           # dead-drop endpoint
+    networks:
+      lab_net:
+        ipv4_address: "192.168.100.10"
+    restart: unless-stopped
+
+  # ── IDS detector ───────────────────────────────────────────────
+  ids:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.python
+    image: aua-lab/ids:latest
+    container_name: ids_detector
+    command: python3 ids_detector.py
+    volumes:
+      - .:/app
+      - /tmp:/tmp
+    network_mode: host           # needs raw-socket access for Scapy
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    restart: unless-stopped
+
+  # ── Victim portal ──────────────────────────────────────────────
+  victim:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.python
+    image: aua-lab/victim:latest
+    container_name: fake_portal
+    command: python3 fake_portal.py
+    volumes:
+      - .:/app
+    ports:
+      - "8080:8080"
+    networks:
+      lab_net:
+        ipv4_address: "192.168.100.20"
+    depends_on:
+      - syslog
+    restart: unless-stopped
