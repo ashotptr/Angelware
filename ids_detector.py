@@ -59,6 +59,8 @@ import subprocess
 import urllib.request
 import json
 import psutil
+import ids_detector_patch_e14 as _e14
+_e14.apply(globals())
 from collections import defaultdict, deque
 from datetime import datetime
 

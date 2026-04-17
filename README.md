@@ -363,6 +363,129 @@ botnet_lab/
 │                         Thread-safe singleton exposed to fake_portal.py via get_tracker().
 │                         Used by IDS Engine 5 via /stats/advanced → username_clustering.
 │                         CLI: python3 username_clustering.py  (3 self-tests)
+├── throttle_engine.py        API throttling — Token Bucket + Leaky Bucket.
+│                             Implements the two algorithms described in
+│                             Article 1 (DreamFactory, April 2025) that
+│                             are NOT present in fake_portal.py:
+│                               TokenBucketThrottle  — bursts allowed,
+│                                 average rate enforced; DELAYS requests.
+│                               LeakyBucketThrottle  — constant output rate,
+│                                 queue overflow → reject (HTTP 429).
+│                               IPRateWindow         — sliding-window rate
+│                                 limiter matching the article's table.
+│                               ThrottleMiddleware   — WSGI wrapper for Flask.
+│                             Distinction: fake_portal.py does RATE LIMITING
+│                             (reject immediately at N). This module does
+│                             THROTTLING (delay, not reject — softer UX).
+│                             CLI: python3 throttle_engine.py --demo
+│
+├── scapy_tools.py            Standalone Scapy network tools.
+│                             Implements the Python tools from Article 3
+│                             ("Forging and Sniffing Packets with Scapy")
+│                             not already present as Python utilities:
+│                               ping_host(ip)        — ICMP sr1() echo
+│                               ping_sweep(base,s,e) — discover live hosts
+│                               syn_port_scan(ip, ports) — OPEN/CLOSED/
+│                                 FILTERED via SYN scan + response analysis
+│                               arp_spoof_send(...)  — gratuitous ARP reply
+│                               arp_spoof_detect(iface) — MAC-change alert
+│                               save_pcap / load_pcap — wrpcap/rdpcap
+│                               packet_sniffer(iface, n) — real-time summary
+│                             (The lab already has C-based scanning in
+│                              mirai_scanner.c, IDS Scapy sniffing in
+│                              ids_detector.py, and pcap capture support in
+│                              packet_capture.py — this fills the Python
+│                              standalone tool gap.)
+│                             CLI: sudo python3 scapy_tools.py <mode>
+│                             Modes: ping / sweep / scan / arp-spoof /
+│                                    arp-detect / sniff / save-pcap / load-pcap
+│
+├── procwatch_reporter.py     Process viewer / monitor (Article 2).
+│                             Implements the tabular process VIEWER from
+│                             "How to Make a Process Monitor in Python"
+│                             (The Python Code, thepythoncode.com).
+│                             Distinct from procwatch_engine.py (security
+│                             SCANNER for suspicious processes — that one
+│                             focuses on malicious behaviour; this one
+│                             focuses on VISIBILITY of all processes).
+│                             Fields: pid, name, create_time, cores,
+│                               cpu_usage, status, nice, memory_usage (USS),
+│                               read_bytes, write_bytes, n_threads, username.
+│                             Pandas-optional: falls back to plain-text table.
+│                             --suspicious: overlays ProcWatch security tiers.
+│                             CLI: python3 procwatch_reporter.py [-c cols]
+│                                  [-s sort] [--descending] [-n N] [-u]
+│
+├── breach_dump_generator.py  Generates the missing breach_dump.txt.
+│                             Many modules require breach_dump.txt but it
+│                             is .gitignored and not committed.  This tool
+│                             produces 250+ realistic email:password pairs:
+│                               3   valid credentials (match fake_portal.py)
+│                               40  sequential usernames → Engine 10 trigger
+│                               60  single-domain concentration → E10 trigger
+│                               147+ organic mixed-domain entries (noise)
+│                             CLI: python3 breach_dump_generator.py
+│                                  python3 breach_dump_generator.py --check
+│                                  python3 breach_dump_generator.py --count 500
+│
+├── ids_detector_patch_e14.py Engine 14 wire-up for ids_detector.py.
+│                             BreachIntelDetector is fully coded in
+│                             breach_dump_enricher.py but ids_detector.py
+│                             never imported it.  This patch file provides:
+│                               apply(globals())  — monkey-patch a running
+│                                 ids_detector module at import time.
+│                               Three PATCH_A/B/C code blocks to manually
+│                                 insert into ids_detector.py.
+│                             Integration: add to end of ids_detector.py:
+│                               import ids_detector_patch_e14 as _e14
+│                               _e14.apply(globals())
+│
+├── fake_portal_biometrics.py Behavioral biometrics integration for
+│                             fake_portal.py (closes the largest gap).
+│                             behavioral_biometrics.py is fully implemented
+│                             with an exact integration guide in its docstring
+│                             but fake_portal.py never used it.
+│                             Provides:
+│                               BIOMETRICS_JS       — keyboard+mouse collector
+│                               get_biometrics_result() — call from /login
+│                               should_escalate()   — CAPTCHA/2FA gating
+│                               apply(app, globals()) — auto-wire via import
+│                             Integration: add to end of fake_portal.py:
+│                               import fake_portal_biometrics as _bio
+│                               _bio.apply(app, globals())
+│                             This enables typing-cadence and mouse-movement
+│                             bot detection that survives --ua-rotate and
+│                             Sec-Fetch header spoofing (cred_stuffing_evasion).
+│
+├── rst_p2p_mesh.py           (was already implemented; now documented here)
+│                             UDP multicast P2P coordination for rst_detector.
+│                             Each host running Engine 11 can broadcast
+│                             SCANNER_ALERT via mDNS group 224.0.0.251:7779.
+│                             Quorum of 2 peers agreeing → CONSENSUS_ISOLATE
+│                             fires DHCP isolation.  HMAC-SHA256 auth.
+│                             Standalone demo:
+│                               Terminal 1: sudo python3 rst_p2p_mesh.py
+│                                           --host 192.168.100.20
+│                               Terminal 2: sudo python3 rst_p2p_mesh.py
+│                                           --host 192.168.100.11
+│                                           --inject 192.168.100.50
+│
+├── blog.sql                  Honeypot MySQL schema (was implemented,
+│                             not documented).  Mirrors Cowrie lab §3.3.
+│                             Deliberately includes SQL injection surface
+│                             and bait credentials for scanner honeypot.
+│                             Load on victim VM:
+│                               sudo mysql < blog.sql
+│
+├── syslog_aggregator.py      Collects syslog from all VMs into a unified
+│                             timeline for the IR report.  Run on a host
+│                             with access to all VMs (or on the victim VM):
+│                               python3 syslog_aggregator.py
+│
+├── multi_service_honeypot.py Multi-service honeypot: HTTP, FTP, SMTP,
+│                             MySQL banners on one VM to maximise attacker
+│                             interaction surface.  Extends honeypot_setup.py.
+│                               python3 multi_service_honeypot.py
 └── README.md            This file
 ```
 

@@ -72,6 +72,8 @@ import json
 import random
 import logging
 import threading
+import fake_portal_biometrics as _bio
+_bio.apply(app, globals())
 from datetime import datetime
 from collections import defaultdict, deque
 from flask import Flask, request, jsonify, render_template_string
