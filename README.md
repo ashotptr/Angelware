@@ -2107,23 +2107,4 @@ breach_dump.txt
 ```
 
 ---
- 
-63. Post-Mortem of a Zombie: Conficker Cleanup After Six Years - USENIX, accessed 
-March 12, 2026, https://www.usenix.org/system/files/sec15-paper-asghari.pdf 
-64. API Rate Limiting vs. Throttling: Key Differences - Blog, accessed March 12, 2026, 
-https://blog.dreamfactory.com/your-blog-postapi-rate-limiting-vs.-throttling-key
--differences-title-here 
-65. Credential Stuffing: What It Is, How It Works, & 7 Ways to Prevent It - Frontegg, 
-accessed March 12, 2026, https://frontegg.com/blog/credential-stuffing 
-66. Incident response plan templates | Red Canary, accessed March 12, 2026, 
-https://redcanary.com/cybersecurity-101/incident-response/incident-response-pl
-an-template/ 
-67. NIST Incident Response: 4-Step Life Cycle, Templates and Tips - Cynet, accessed 
-March 12, 2026, 
-https://www.cynet.com/incident-response/nist-incident-response/ 
-68. Malware Brief: New wave of botnets driving DDoS chaos | Barracuda Networks 
-Blog, accessed March 12, 2026, 
-https://blog.barracuda.com/2026/01/29/malware-brief-new-wave-botnets-ddos-
-chaos 
-
 *AUA CS 232 / CS 337 Cybersecurity Spring 2026 — Botnet Attack-Defense Research Lab*
