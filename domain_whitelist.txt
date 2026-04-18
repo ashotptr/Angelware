@@ -1,0 +1,10 @@
+cloudflare.net
+microsoft.com
+google.com
+googleapis.com
+gstatic.com
+apple.com
+akamaiedge.net
+fastly.net
+amazonaws.com
+windowsupdate.com

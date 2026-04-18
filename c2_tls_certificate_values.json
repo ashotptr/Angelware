@@ -1,0 +1,32 @@
+{
+    "Cobalt Strike": [
+        "146473198"
+    ],
+    "Metasploit Framework": [
+        "MetasploitSelfSignedCA"
+    ],
+    "Covenant": [
+        "Covenant"
+    ],
+    "Mythic": [
+        "Mythic"
+    ],
+    "PoshC2": [
+        "P18055077"
+    ],
+    "Sliver": [
+        "multiplayer+operators"
+    ],
+    "Brute Ratel C4": [
+        "BruteRatelC4"
+    ],
+    "Havoc C2": [
+        "havoc"
+    ],
+    "Nighthawk": [
+        "nighthawk"
+    ],
+    "SilverC2": [
+        "silver"
+    ]
+}

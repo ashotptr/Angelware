@@ -1,0 +1,61 @@
+# ============================================================
+#  Angelware — C2 Analyzer Configuration
+#  Equivalent to C2Detective's config/config.yml
+# ============================================================
+
+# ── API keys for enrichment services (leave empty to disable) ──
+api_keys:
+  abuseipdb:  ""    # https://www.abuseipdb.com/account/api
+  virustotal: ""    # https://www.virustotal.com/gui/my-apikey
+  shodan:     ""    # https://account.shodan.io/
+
+# ── API URLs (override only if needed, e.g. for proxies) ───────
+api_urls:
+  abuseipdb:  "https://api.abuseipdb.com/api/v2/check"
+  threatfox:  "https://threatfox-api.abuse.ch/api/v1/"
+  virustotal: "https://www.virustotal.com/vtapi/v2/"
+  shodan:     "https://api.shodan.io/"
+  alienvault: "https://otx.alienvault.com/api/v1/indicators/"
+  urlhaus:    "https://urlhaus-api.abuse.ch/v1/"
+  circl_bgp:  "https://bgpranking-ng.circl.lu/json/asn"
+
+# ── Enrichment services (set to true to enable) ────────────────
+enrichment_services:
+  abuseipdb:   false   # needs API key
+  threatfox:   false   # free, no key needed
+  virustotal:  false   # needs API key
+  shodan:      false   # needs API key
+  alienvault:  false   # free with registration
+  urlhaus:     false   # free, no key needed
+  circl_bgp:   false   # free, no key needed
+
+# ── Detection thresholds ────────────────────────────────────────
+thresholds:
+  MAX_FREQUENCY:       10     # % of total packets — beaconing alert
+  MAX_DURATION:        14000  # seconds — long connection alert (~3.9h)
+  MAX_HTTP_SIZE:       50000  # bytes — big HTTP body alert
+  MAX_SUBDOMAIN_LENGTH: 30    # chars — DNS tunneling alert
+
+# ── Feed update URLs ────────────────────────────────────────────
+feeds:
+  tor_node_list:      "https://www.dan.me.uk/torlist/"
+  tor_exit_node_list: "https://www.dan.me.uk/torlist/?exit"
+  crypto_domains:     "https://blocklistproject.github.io/Lists/alt-version/crypto-nl.txt"
+
+# ── Local cache / DB file paths (relative to project root) ──────
+file_paths:
+  tor_node_cache:              "c2_iocs/tor_nodes.json"
+  crypto_domain_cache:         "c2_iocs/crypto_domains.json"
+  c2_tls_cert_db:              "c2_iocs/c2_tls_certificate_values.json"
+  c2_threat_feed_db:           "c2_iocs/c2_threat_feed.db"
+  domain_whitelist:            "config/domain_whitelist.txt"
+  report_template:             "templates/c2_report.html"
+
+# ── Output ──────────────────────────────────────────────────────
+output:
+  default_dir: "reports"
+  write_extracted_data: true   # extracted_data.json
+  write_detected_iocs:  true   # detected_iocs.json
+  write_enriched_iocs:  false  # enriched_iocs.json (only when enrichment enabled)
+  create_html_report:   true
+  create_pdf_report:    false  # requires wkhtmltopdf installed
