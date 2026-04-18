@@ -21,6 +21,7 @@
 12. [Incident Response Report](#12-incident-response-report)
 13. [Video Presentation Guide](#13-video-presentation-guide)
 14. [Ethics & Safety Checklist](#14-ethics--safety-checklist)
+15. [Offline C2 Analysis (C2Detective Integration)](#15-offline-c2-analysis-c2detective-integration)
 
 ---
 
@@ -486,6 +487,35 @@ botnet_lab/
 │                             MySQL banners on one VM to maximise attacker
 │                             interaction surface.  Extends honeypot_setup.py.
 │                               python3 multi_service_honeypot.py
+│
+├── packet_capture.py    Queue-buffered live packet capture for IDS
+├── pcap_ioc_extractor.py    Offline pcap IOC extraction (C2Detective port)
+├── tor_detector.py          Tor node/exit node traffic detection
+├── c2_tls_cert_detector.py  C2 TLS certificate field matching
+├── dns_tunnel_detector.py   DNS tunneling + crypto domain detection
+├── http_behavior_detector.py Big HTTP body, beaconing, long connection detection
+├── ioc_enricher.py          External IOC enrichment (6 services)
+├── c2_threat_feed.py        C2 threat feed — Feodo Tracker, URLhaus, ThreatFox
+├── detection_scorer.py      Aggregate detection scoring + domain whitelist
+├── pcap_report.py           HTML + PDF per-capture analysis report generator
+│
+├── c2_analyzer.py       ── Offline C2 analysis entry point (C2Detective port)
+│                           Orchestrates all 13 detection engines against a pcap.
+│                           New: --packet-capture live mode, --update-ja3-rules,
+│                           cache staleness warnings at startup.
+├── c2_ioc_updater.py    ── IOC cache manager (NEW — see Section 15)
+│                           Ports all three C2Detective updater scripts and adds
+│                           the Proofpoint ET JA3 rules updater that was absent.
+│                           python3 c2_ioc_updater.py --all
+├── c2_analyzer.yml      ── Config for c2_analyzer (sniffing + ja3_rules added)
+│
+├── c2_iocs/             ── IOC cache directory (created on first --update-all)
+│   ├── tor_nodes.json              Tor relay + exit node list (dan.me.uk)
+│   ├── crypto_domains.json         Crypto/cryptojacking domain blocklist
+│   ├── ja3_rules.json              Proofpoint ET JA3 rules (NEW)
+│   ├── c2_tls_certificate_values.json  Known C2 framework TLS values
+│   └── c2_threat_feed.db           SQLite: Feodo Tracker, URLhaus, ThreatFox
+│
 └── README.md            This file
 ```
 
@@ -670,8 +700,7 @@ This is the single command that orchestrates the full lab — all three phases, 
 cd ~/lab
 chmod +x run_full_lab.sh
 
-# Run the full lab (all phases)
-sudo ./run_full_lab.sh
+sudo ./run_full_lab.sh           # full run (all phases + offline C2 analysis)
 
 # Or run a single phase (both space and = forms work):
 sudo ./run_full_lab.sh --phase 1     # Phase 1: star C2 + all payloads + DPI
@@ -689,9 +718,10 @@ sudo ./run_full_lab.sh --clean
 | Isolation check | Verifies `ping 8.8.8.8` fails | ~5s |
 | C2 server start | Flask C2 up on port 5000 | ~5s |
 | Fake portal start | Flask login target on victim:80 | ~5s |
-| IDS start | 3-engine Scapy IDS on victim | ~5s |
+| IDS start | 10-engine Scapy IDS on victim | ~5s |
 | Cowrie start | SSH/Telnet honeypot on victim:2222/2323 | ~10s |
 | Bot registration | Both C bots connect to C2, heartbeats begin | ~10s |
+| **Traffic capture start** | tcpdump on victim VM begins recording | ~2s |
 | **SYN Flood** | 20s attack → IDS fires volumetric alert | ~25s |
 | **UDP Flood** | 15s attack → IDS fires volumetric alert | ~20s |
 | **Slowloris** | 30s attack → Apache thread exhaustion | ~35s |
@@ -704,8 +734,9 @@ sudo ./run_full_lab.sh --clean
 | **Phase 2 covert** | Dead-drop command → bot polls and executes | ~75s |
 | **Phase 3 P2P** | 5-node DHT mesh → inject → kill seed → survive | ~60s |
 | Graph generation | 3 PNG graphs to `/tmp/botnet_graphs/` | ~5s |
+| **Offline C2 analysis** | c2_analyzer.py on captured pcap | ~30s |
 
-**Total runtime:** ~8–10 minutes
+**Total runtime:** ~10–12 minutes
 
 ### Output files after full run:
 
@@ -713,11 +744,15 @@ sudo ./run_full_lab.sh --clean
 /tmp/botnet_graphs/graph1_dpi_vs_portblocking.png
 /tmp/botnet_graphs/graph2_persistence_paradox.png
 /tmp/botnet_graphs/graph3_ids_accuracy.png
-./incident_report.md                 (NIST SP 800-61r3 IR report — written to current directory)
-./graph1_measured_data.json          (real TTD measurements from DPI engine)
-/tmp/c2_server.log                   (C2 activity log)
-/tmp/ids.log                         (IDS alerts — on victim VM)
-~/.cowrie/var/log/cowrie/cowrie.json (honeypot log — on victim VM)
+/tmp/incident_report.md               (NIST SP 800-61r3 IR report)
+/tmp/lab_capture.pcap                 (raw traffic captured during Phase 1)
+/tmp/c2_analysis/detected_iocs.json   (offline C2 analysis findings)
+/tmp/c2_analysis/extracted_data.json  (IOCs extracted from pcap)
+/tmp/c2_analysis/c2_analysis_report.html  (HTML analysis report)
+./graph1_measured_data.json           (real TTD measurements from DPI engine)
+/tmp/c2_server.log                    (C2 activity log)
+/tmp/ids.log                          (IDS alerts — on victim VM)
+~/.cowrie/var/log/cowrie/cowrie.json  (honeypot log — on victim VM)
 ```
 
 ---
@@ -2227,6 +2262,206 @@ breach_dump.txt
 /tmp/supply_chain_audit.json
 /tmp/phishing_sent.json
 /tmp/mfa_bypass_log.json
+```
+
+---
+
+## 15. Offline C2 Analysis (C2Detective Integration)
+
+This section documents the three new files added to close the gaps between Angelware and the [C2Detective](https://github.com/martinkubecka/C2Detective) reference implementation. The additions are purely additive — no existing file behaviour changes.
+
+### What was missing
+
+After exhaustive comparison of both codebases, four gaps were identified:
+
+| Gap | C2Detective had it | Angelware status before fix |
+|---|---|---|
+| Proofpoint ET JA3 rules updater | `iocs/ja3/update_ja3_rules.py` | `tls_ja3.py` used a hardcoded dict only |
+| `-p` live-capture → analysis pipeline | `-p` / `--packet-capture` flag | `packet_capture.py` was IDS-only, not wired into `c2_analyzer.py` |
+| IOC cache staleness warnings | Warns at 30 min / 24 h | No staleness checking anywhere |
+| `run_full_lab.sh` calling `c2_analyzer.py` | N/A (separate tool) | Attack and analysis pipelines were completely disconnected |
+
+### New files
+
+#### `c2_ioc_updater.py` — IOC Cache Manager
+
+Consolidates all three C2Detective updater scripts into one importable module and adds the **JA3 rules updater** that was entirely absent from Angelware.
+
+```bash
+# Update all three caches at once:
+python3 c2_ioc_updater.py --all
+
+# Update individually:
+python3 c2_ioc_updater.py --tor
+python3 c2_ioc_updater.py --crypto
+python3 c2_ioc_updater.py --ja3      # NEW — Proofpoint ET JA3 rules
+
+# Check cache age without updating:
+python3 c2_ioc_updater.py --status
+```
+
+Cache locations (relative to project root):
+
+| Cache | Path | Update frequency |
+|---|---|---|
+| Tor node list | `c2_iocs/tor_nodes.json` | Every 30 min (dan.me.uk rate limit) |
+| Crypto domain list | `c2_iocs/crypto_domains.json` | Every 24 h |
+| Proofpoint ET JA3 rules | `c2_iocs/ja3_rules.json` | Every 24 h |
+
+The JA3 rules are automatically merged into `JA3Detector.known_bad` at analysis time — the hardcoded hashes in `tls_ja3.py` remain as a baseline and the Proofpoint rules extend them. Running without the cache file is safe: the detector falls back to the hardcoded set.
+
+#### `c2_analyzer.py` — Additions to existing entry point
+
+Three new behaviours added to the existing file (all other behaviour unchanged):
+
+**1. Proofpoint ET JA3 rules (`--update-ja3-rules` / `--ujr`)**
+
+```bash
+python3 c2_analyzer.py --update-ja3-rules   # fetch and cache live rules
+python3 c2_analyzer.py --update-all         # now includes JA3 rules
+```
+
+At analysis time, the cached Proofpoint rules are merged into the JA3 detector alongside the existing hardcoded hashes. This means the detector can identify C2 frameworks (Cobalt Strike Malleable profiles, Sliver, etc.) beyond the small set of library fingerprints in the original code.
+
+**2. Live packet capture (`-p` / `--packet-capture`)**
+
+```bash
+# Capture 120 s on enp0s3, then analyse immediately:
+python3 c2_analyzer.py --packet-capture
+
+# With all detection modules:
+python3 c2_analyzer.py -p -s -w --dga --threat-feed -o /tmp/analysis/
+```
+
+Configure the capture in `config/c2_analyzer.yml` under the `sniffing:` section:
+
+```yaml
+sniffing:
+  interface: enp0s3        # ip a to find yours
+  filter:    ""            # optional BPF: "tcp port 443"
+  timeout:   120           # capture duration in seconds
+  filename:  live_capture.pcap
+```
+
+The captured pcap is written to the output directory and fed directly into the analysis pipeline — identical to C2Detective's `-p` mode.
+
+**3. Cache staleness warnings**
+
+Every `c2_analyzer.py` analysis run now prints staleness status for all three caches before starting, and exits with a clear instruction if a required cache is missing:
+
+```
+[HH:MM:SS] [INFO]   Tor node list cache is up-to-date (12 min old)
+[HH:MM:SS] [INFO]   Crypto domain list cache is up-to-date (2.1h old)
+[HH:MM:SS] [WARNING] JA3 rules (Proofpoint ET) cache is 26.4h old —
+                     recommend refresh (python3 c2_analyzer.py --update-ja3-rules)
+```
+
+View cache status without running analysis:
+
+```bash
+python3 c2_analyzer.py --cache-status
+```
+
+#### `c2_analyzer.yml` — Two new sections
+
+The config previously had no `sniffing:` section and no `ja3_rules` entries. Both are now present with safe defaults:
+
+```yaml
+feeds:
+  # … existing entries …
+  ja3_rules: "https://rules.emergingthreats.net/open/suricata-5.0/rules/ja3-rules.txt"
+
+file_paths:
+  # … existing entries …
+  ja3_rules_cache: "c2_iocs/ja3_rules.json"
+
+sniffing:
+  interface: enp0s3
+  filter:    ""
+  timeout:   120
+  filename:  live_capture.pcap
+```
+
+#### `run_full_lab.sh` — Integration of offline analysis
+
+Two new functions added. All existing functions are unchanged.
+
+**`start_traffic_capture()`** — starts a background `tcpdump` on the victim VM at the beginning of Phase 1. The filter excludes SSH management traffic so the pcap contains only attack and C2 traffic.
+
+**`run_c2_analysis()`** — called after `generate_all_graphs()` at the end of the full run (and at the end of `--phase 1`):
+1. Stops tcpdump and flushes the pcap
+2. Copies the pcap from the victim VM via SCP
+3. Checks IOC cache staleness
+4. Runs `c2_analyzer.py -i lab_capture.pcap -s -w --dga --threat-feed --quiet`
+5. Prints a one-line detection summary to the terminal
+
+The expected detections against a full Phase 1 run:
+
+| Detection engine | What triggers it |
+|---|---|
+| Excessive beaconing | Bot heartbeat intervals (C2 `/heartbeat` every ~30s) |
+| Malicious JA3 fingerprints | `python-requests` and `urllib` bots |
+| DNS Tunneling | Long DGA subdomain labels |
+| DGA domains | `dga.py` generated names |
+| Crypto domains | Any cryptomining beacon if present |
+| C2 threat feed (IPs) | C2 server IP if in Feodo Tracker |
+
+### First-time setup for c2_analyzer
+
+```bash
+# 1. Install dependencies (on C2 VM, requires temporary internet access):
+pip3 install pyyaml tldextract requests dgad
+
+# 2. Initialise all IOC caches:
+python3 c2_analyzer.py --update-all
+
+# 3. Verify caches are present:
+python3 c2_analyzer.py --cache-status
+
+# 4. Run a test analysis against any pcap:
+python3 c2_analyzer.py -i /tmp/lab_capture.pcap -s --dga
+```
+
+### Manual analysis workflow (without run_full_lab.sh)
+
+```bash
+# Option A: analyse an existing pcap
+python3 c2_analyzer.py -i /path/to/capture.pcap -s -w --dga --threat-feed -o reports/
+
+# Option B: capture live then analyse
+python3 c2_analyzer.py --packet-capture --dga --threat-feed -o reports/
+
+# Option C: analyse with full IOC enrichment (requires API keys in c2_analyzer.yml)
+python3 c2_analyzer.py -i capture.pcap --dga --threat-feed --enrich -o reports/
+
+# Generate PDF report (requires wkhtmltopdf):
+python3 c2_analyzer.py -i capture.pcap --dga --pdf -o reports/
+```
+
+### c2_iocs/ directory structure
+
+The first `--update-all` creates this layout automatically:
+
+```
+c2_iocs/
+├── tor_nodes.json               # all + exit nodes (dan.me.uk)
+├── crypto_domains.json          # BlocklistProject crypto list
+├── ja3_rules.json               # Proofpoint ET JA3 rules (NEW)
+├── c2_tls_certificate_values.json  # Cobalt Strike, Metasploit, Sliver, etc.
+└── c2_threat_feed.db            # SQLite: Feodo Tracker, URLhaus, ThreatFox
+```
+
+Add all generated cache files to `.gitignore` — they are live threat intelligence, not source artifacts.
+
+### Additional `.gitignore` entries for Section 15
+
+```
+/tmp/lab_capture.pcap
+/tmp/c2_analysis/
+c2_iocs/tor_nodes.json
+c2_iocs/crypto_domains.json
+c2_iocs/ja3_rules.json
+c2_iocs/c2_threat_feed.db
 ```
 
 ---

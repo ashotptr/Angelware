@@ -41,6 +41,9 @@ feeds:
   tor_node_list:      "https://www.dan.me.uk/torlist/"
   tor_exit_node_list: "https://www.dan.me.uk/torlist/?exit"
   crypto_domains:     "https://blocklistproject.github.io/Lists/alt-version/crypto-nl.txt"
+  # NEW: Proofpoint Emerging Threats JA3 rules (absent from original config)
+  # Fetched and cached by: python3 c2_analyzer.py --update-ja3-rules
+  ja3_rules:          "https://rules.emergingthreats.net/open/suricata-5.0/rules/ja3-rules.txt"
 
 # ── Local cache / DB file paths (relative to project root) ──────
 file_paths:
@@ -50,6 +53,17 @@ file_paths:
   c2_threat_feed_db:           "c2_iocs/c2_threat_feed.db"
   domain_whitelist:            "config/domain_whitelist.txt"
   report_template:             "templates/c2_report.html"
+  # NEW: Proofpoint ET JA3 rules cache (absent from original config)
+  ja3_rules_cache:             "c2_iocs/ja3_rules.json"
+
+# ── Live packet capture (NEW — for -p / --packet-capture flag) ──
+# Mirrors C2Detective's 'sniffing' config section.
+# Used only when running: python3 c2_analyzer.py --packet-capture
+sniffing:
+  interface: enp0s3        # change to your VM interface (ip a to find it)
+  filter:    ""            # optional BPF filter, e.g. "tcp port 80 or port 443"
+  timeout:   120           # capture duration in seconds
+  filename:  live_capture.pcap   # written inside the --output directory
 
 # ── Output ──────────────────────────────────────────────────────
 output:

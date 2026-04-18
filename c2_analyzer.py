@@ -24,6 +24,11 @@ What this adds to Angelware (all 13 missing features):
  12. Aggregate detection scoring (DetectionScorer)
  13. HTML + PDF per-capture analysis report (PcapReportGenerator)
 
+New additions ported from C2Detective (previously missing):
+ 14. Live packet capture → immediate offline analysis pipeline (-p flag)
+ 15. Proofpoint ET JA3 rules updater and cache (--update-ja3-rules flag)
+ 16. IOC cache staleness warnings at startup (mirrors C2Detective behaviour)
+
 Usage:
   # First-time setup — update all threat intelligence caches:
   python3 c2_analyzer.py --update-all
@@ -36,14 +41,19 @@ Usage:
   python3 c2_analyzer.py -i capture.pcap --threat-feed
   python3 c2_analyzer.py -i capture.pcap -o reports/ --pdf
 
+  # Live capture then analyse (NEW — from C2Detective -p flag):
+  python3 c2_analyzer.py --packet-capture            # uses config sniffing section
+  python3 c2_analyzer.py -p -s -e                    # capture + stats + enrich
+
   # Update specific caches:
   python3 c2_analyzer.py --update-tor
   python3 c2_analyzer.py --update-crypto
-  python3 c2_analyzer.py --update-threat-feed
+  python3 c2_analyzer.py --update-ja3-rules          # NEW
+  python3 c2_analyzer.py --update-all                # includes JA3 rules now
 
 Compatible with: Linux (requires tshark for TLS cert extraction;
-  ja3 CLI for JA3 digests; wkhtmltopdf for PDF; all optional — the
-  tool degrades gracefully if any external tool is missing)
+  wkhtmltopdf for PDF; all optional — the tool degrades gracefully
+  if any external tool is missing)
 """
 
 import argparse
@@ -70,9 +80,16 @@ from c2_threat_feed         import C2ThreatFeed, C2FeedUpdater
 from detection_scorer       import DetectionScorer, DomainWhitelist
 from pcap_report            import PcapReportGenerator
 
+# NEW: unified IOC updater (adds JA3 rules updater + staleness checks)
+from c2_ioc_updater import (
+    TorNodesUpdater, JA3RulesUpdater,
+    warn_if_stale, print_status as _ioc_status,
+    TOR_MAX_AGE_SEC, CRYPTO_MAX_AGE_SEC, JA3_MAX_AGE_SEC,
+)
+
 # Also import Angelware's existing JA3 detector
 try:
-    from tls_ja3 import JA3Detector, KNOWN_BOT_JA3
+    from tls_ja3 import JA3Detector, KNOWN_BAD_JA3
     _HAS_JA3_ENGINE = True
 except ImportError:
     _HAS_JA3_ENGINE = False
@@ -109,24 +126,124 @@ def _load_config(path: str) -> Dict:
         return yaml.safe_load(fh) or {}
 
 
-# ── Update helpers ────────────────────────────────────────────────────────────
+# ── Staleness checks (NEW — mirrors C2Detective's startup warnings) ────────────
+
+def _check_all_caches(cfg: Dict) -> None:
+    """
+    Warn if any IOC cache is stale before starting analysis.
+    C2Detective warns about Tor (30 min), crypto (24 h), JA3 (24 h).
+    Previously Angelware had no staleness checking at all.
+    """
+    fp = cfg.get("file_paths", {})
+
+    def _abs(key, default):
+        return os.path.join(_HERE, fp.get(key, default))
+
+    warn_if_stale(
+        _abs("tor_node_cache", "c2_iocs/tor_nodes.json"),
+        TOR_MAX_AGE_SEC,
+        "Tor node list",
+        "--update-tor",
+    )
+    warn_if_stale(
+        _abs("crypto_domain_cache", "c2_iocs/crypto_domains.json"),
+        CRYPTO_MAX_AGE_SEC,
+        "Crypto domain list",
+        "--update-crypto",
+    )
+    warn_if_stale(
+        _abs("ja3_rules_cache", "c2_iocs/ja3_rules.json"),
+        JA3_MAX_AGE_SEC,
+        "JA3 rules (Proofpoint ET)",
+        "--update-ja3-rules",
+    )
+
+
+# ── Update helpers ─────────────────────────────────────────────────────────────
 
 def _update_tor(cfg: Dict):
-    cache = cfg.get("file_paths", {}).get(
-        "tor_node_cache", "c2_iocs/tor_nodes.json"
-    )
-    TorUpdater(os.path.join(_HERE, cache)).update(force=True)
+    fp    = cfg.get("file_paths", {})
+    feeds = cfg.get("feeds", {})
+    cache = os.path.join(_HERE, fp.get("tor_node_cache", "c2_iocs/tor_nodes.json"))
+    TorNodesUpdater(
+        cache_path=cache,
+        all_nodes_url=feeds.get("tor_node_list"),
+        exit_nodes_url=feeds.get("tor_exit_node_list"),
+    ).update(force=True)
 
 
 def _update_crypto(cfg: Dict):
-    cache = cfg.get("file_paths", {}).get(
-        "crypto_domain_cache", "c2_iocs/crypto_domains.json"
-    )
-    CryptoDomainUpdater(os.path.join(_HERE, cache)).update(force=True)
+    fp    = cfg.get("file_paths", {})
+    feeds = cfg.get("feeds", {})
+    cache = os.path.join(_HERE, fp.get("crypto_domain_cache", "c2_iocs/crypto_domains.json"))
+    CryptoDomainUpdater(
+        cache_path=cache,
+        url=feeds.get("crypto_domains"),
+    ).update(force=True)
+
+
+def _update_ja3(cfg: Dict):
+    """Update Proofpoint ET JA3 rules cache. NEW — was absent from Angelware."""
+    fp    = cfg.get("file_paths", {})
+    feeds = cfg.get("feeds", {})
+    cache = os.path.join(_HERE, fp.get("ja3_rules_cache", "c2_iocs/ja3_rules.json"))
+    JA3RulesUpdater(
+        cache_path=cache,
+        url=feeds.get("ja3_rules"),
+    ).update(force=True)
 
 
 def _update_threat_feed():
     C2FeedUpdater().update_all()
+
+
+# ── Live packet capture (NEW — from C2Detective's -p / --packet-capture flag) ──
+
+def _do_live_capture(cfg: Dict, output_dir: str) -> str:
+    """
+    Sniff packets on the configured interface for the configured timeout,
+    write to a pcap file, and return the file path for analysis.
+
+    Configuration comes from the 'sniffing' section of c2_analyzer.yml:
+      sniffing:
+        interface: enp0s3
+        filter: ""          # optional BPF filter
+        timeout: 120        # seconds
+        filename: live_capture.pcap
+
+    This mirrors C2Detective's PacketCapture class and the -p pipeline:
+      PacketCapture(sniffing_cfg, output_dir).capture_packets() → filepath
+    The existing Angelware packet_capture.py is a queue-based live IDS sniffer;
+    this path writes to a pcap file and feeds it to offline analysis.
+    """
+    sniff_cfg = cfg.get("sniffing", {})
+    iface     = sniff_cfg.get("interface", "enp0s3")
+    filt      = sniff_cfg.get("filter", "")
+    timeout   = int(sniff_cfg.get("timeout", 120))
+    filename  = sniff_cfg.get("filename", "live_capture.pcap")
+
+    os.makedirs(output_dir, exist_ok=True)
+    output_path = os.path.join(output_dir, filename)
+
+    print(f"[{_ts()}] [INFO]  Capturing packets on '{iface}' for {timeout}s …")
+    logging.info(f"Live capture on {iface} for {timeout}s → {output_path}")
+
+    try:
+        from scapy.all import sniff as scapy_sniff, wrpcap
+    except ImportError:
+        print(f"[{_ts()}] [ERROR] Scapy not installed — "
+              "cannot perform live capture. Install with: pip3 install scapy")
+        sys.exit(1)
+
+    kwargs: dict = dict(iface=iface, timeout=timeout)
+    if filt:
+        kwargs["filter"] = filt
+
+    packets = scapy_sniff(**kwargs)
+    wrpcap(output_path, packets)
+    print(f"[{_ts()}] [INFO]  Captured {len(packets)} packets → {output_path}")
+    logging.info(f"Captured {len(packets)} packets to {output_path}")
+    return output_path
 
 
 # ── Main analysis pipeline ────────────────────────────────────────────────────
@@ -150,6 +267,9 @@ def analyse(
         print(f"[{_ts()}] [ERROR] File not found: {input_file}")
         sys.exit(1)
 
+    # NEW: check IOC cache staleness before analysis
+    _check_all_caches(config)
+
     thresholds = config.get("thresholds", {})
     fp         = config.get("file_paths", {})
     feeds      = config.get("feeds", {})
@@ -162,6 +282,8 @@ def analyse(
     crypto_cache    = _path("crypto_domain_cache",  "c2_iocs/crypto_domains.json")
     cert_db         = _path("c2_tls_cert_db",       "c2_iocs/c2_tls_certificate_values.json")
     feed_db         = _path("c2_threat_feed_db",    "c2_iocs/c2_threat_feed.db")
+    # NEW: path for Proofpoint ET JA3 rules cache
+    ja3_rules_cache = _path("ja3_rules_cache",      "c2_iocs/ja3_rules.json")
 
     os.makedirs(output_dir, exist_ok=True)
 
@@ -245,11 +367,25 @@ def analyse(
     for h in cert_hits:
         detection_results["aggregated_ip_addresses"].update([h.get("src_ip",""), h.get("dst_ip","")])
 
-    # 5. JA3 fingerprints (via Angelware's existing tls_ja3.py)
+    # 5. JA3 fingerprints
+    # NEW: augment Angelware's hardcoded KNOWN_BAD_JA3 with live Proofpoint ET rules
     ja3_hits: List = []
     if _HAS_JA3_ENGINE:
         try:
             ja3_engine = JA3Detector()
+            # Merge updatable Proofpoint rules into the detector's known-bad set
+            updater = JA3RulesUpdater(ja3_rules_cache)
+            proofpoint_rules = updater.load()
+            if proofpoint_rules:
+                for rule in proofpoint_rules:
+                    h = rule.get("hash", "")
+                    t = rule.get("type", "Proofpoint ET")
+                    if h and h not in ja3_engine.known_bad:
+                        ja3_engine.known_bad[h] = {
+                            "tool":   t,
+                            "risk":   "HIGH",
+                            "reason": f"Proofpoint Emerging Threats: {t}",
+                        }
             ja3_hits = ja3_engine.scan_digests(extractor.ja3_digests)
             detection_results["ja3_matches"] = ja3_hits
         except Exception as e:
@@ -410,7 +546,7 @@ def analyse(
     print()
 
 
-# ── CLI ──────────────────────────────────────────────────────────────────────
+# ── CLI ───────────────────────────────────────────────────────────────────────
 
 def parse_args():
     ap = argparse.ArgumentParser(
@@ -423,9 +559,14 @@ def parse_args():
     ap.add_argument("-c", "--config",   metavar="FILE", default=DEFAULT_CONFIG,
                     help=f"Config file (default: {DEFAULT_CONFIG})")
 
-    # Input
-    ap.add_argument("-i", "--input",    metavar="FILE",
-                    help="Input .pcap / .cap / .pcapng file to analyse")
+    # Input (mutually exclusive: pcap file OR live capture)
+    input_group = ap.add_mutually_exclusive_group()
+    input_group.add_argument("-i", "--input",  metavar="FILE",
+                             help="Input .pcap / .cap / .pcapng file to analyse")
+    # NEW: live capture flag — mirrors C2Detective's -p / --packet-capture
+    input_group.add_argument("-p", "--packet-capture", action="store_true",
+                             help="Capture live packets then analyse "
+                                  "(configure interface/timeout in config sniffing section)")
 
     # Output
     ap.add_argument("-o", "--output",   metavar="DIR", default="reports",
@@ -448,13 +589,20 @@ def parse_args():
     # Update options
     update = ap.add_argument_group("update options")
     update.add_argument("--update-all",         action="store_true",
-                        help="Update Tor nodes, crypto domains, and threat feed")
+                        help="Update Tor nodes, crypto domains, threat feed, and JA3 rules")
     update.add_argument("--update-tor",         action="store_true",
                         help="Update Tor node / exit node cache")
     update.add_argument("--update-crypto",      action="store_true",
                         help="Update crypto/cryptojacking domain blocklist")
     update.add_argument("--update-threat-feed", action="store_true",
                         help="Update C2 threat feed DB (Feodo/URLhaus/ThreatFox)")
+    # NEW: JA3 rules update flag
+    update.add_argument("--update-ja3-rules", "--ujr", action="store_true",
+                        dest="update_ja3_rules",
+                        help="Update Proofpoint ET JA3 rules cache")
+    # NEW: cache status flag
+    update.add_argument("--cache-status",       action="store_true",
+                        help="Print IOC cache staleness status and exit")
 
     return ap.parse_args(args=None if sys.argv[1:] else ["--help"])
 
@@ -470,11 +618,17 @@ def main():
                                 "c2_analyzer.log"),
     )
 
+    # ── Cache status ──────────────────────────────────────────────────────────
+    if args.cache_status:
+        _ioc_status(config)
+        return
+
     # ── Update modes ──────────────────────────────────────────────────────────
     if args.update_all:
         _update_tor(config)
         _update_crypto(config)
         _update_threat_feed()
+        _update_ja3(config)          # NEW: JA3 rules now included in --update-all
         return
 
     if args.update_tor:
@@ -489,13 +643,23 @@ def main():
         _update_threat_feed()
         return
 
-    # ── Analysis mode ─────────────────────────────────────────────────────────
-    if not args.input:
-        print("[ERROR] -i / --input is required for analysis mode.")
+    # NEW: JA3 rules update
+    if args.update_ja3_rules:
+        _update_ja3(config)
+        return
+
+    # ── Live capture mode (NEW — from C2Detective -p pipeline) ────────────────
+    if args.packet_capture:
+        input_file = _do_live_capture(config, args.output)
+    elif args.input:
+        input_file = args.input
+    else:
+        print("[ERROR] Specify an input file (-i) or use live capture (-p).")
         sys.exit(1)
 
+    # ── Analysis mode ─────────────────────────────────────────────────────────
     analyse(
-        input_file       = args.input,
+        input_file       = input_file,
         config           = config,
         output_dir       = args.output,
         print_stats      = args.stats,
