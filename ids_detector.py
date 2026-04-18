@@ -65,6 +65,18 @@ from collections import defaultdict, deque
 from datetime import datetime
 
 try:
+    import ids_engine_slowloris as _e16
+    _e16.register(alert)
+    E16_OK = True
+except ImportError:
+    E16_OK = False
+    print("[IDS] INFO: ids_engine_slowloris.py not found -- Engine 16 disabled")
+
+# In packet_handler(), alongside the other process_* calls:
+if E16_OK:
+    _e16.process_packet(pkt)
+
+try:
     from scapy.all import sniff, IP, TCP, UDP, DNS, DNSQR, DNSRR, Raw, get_if_list
     SCAPY_OK = True
 except ImportError:
