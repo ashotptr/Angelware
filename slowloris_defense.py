@@ -3,75 +3,64 @@
  slowloris_defense.py
  AUA CS 232/337 — Slowloris Mitigation Demonstrator
 
- Gap closed: The lab demonstrated the Slowloris attack
- (via bot_agent.c and slowloris.py) but none of the
- mitigations from the Indusface article were exercised
- or measured. This file implements all six as an
- interactive before/after experiment on the victim VM.
+ Gap closed (original): The lab demonstrated the Slowloris
+ attack but none of the mitigations from the Indusface article
+ were exercised or measured. This file implements all six.
 
- Mitigations from the article
- ─────────────────────────────
- 1. Reverse proxy buffering         → Apache mod_reqtimeout
-    "A reverse proxy would act as a buffer between the
-     server and clients, protecting the server from
-     Slowloris attacks."
-    Implemented: RequestReadTimeout forces incomplete
-    connections closed within 10 s.
+ Gap closed (THIS revision) — Mitigation 6 is now measurable:
+   Previously, Mitigation 6 ("Use a DDoS Mitigation Service")
+   was advisory-only text:
+     'In production, place a cloud WAF/CDN in front of Apache.'
+   It printed guidance and exited. The --measure mode produced
+   a before/after table that showed zero contribution from
+   Mitigation 6, making it invisible in the lab data.
 
- 2. Per-IP connection limit         → iptables connlimit
-    "Limiting the number of connections that can be made
-     from a single IP address."
-    Implemented: iptables connlimit drops connections
-    above 20 per source IP to port 80.
+   This revision adds WafProxy: a Python reverse proxy that
+   simulates the connection-filtering function of a cloud WAF:
+     - Enforces per-IP connection limit (WAF_MAX_CONN_PER_IP)
+     - Enforces a hard header-read timeout (WAF_HEADER_TIMEOUT_SEC)
+     - Forwards connections that pass both checks to Apache backend
+     - Rejects Slowloris connections immediately (no forwarding)
+     - Listens on PROXY_PORT (default 8081) so it is measurable
+       independently from Apache's own mod_reqtimeout (port 80)
 
- 3. Reduce maximum request duration → mod_reqtimeout
-    "Limiting the time a connection can be kept open."
-    Implemented: same Apache directive as #1 — the
-    MinRate clause also enforces minimum bandwidth.
+   Three measurement points in --measure mode:
+     1. Direct Apache, no mitigations (baseline)
+     2. Direct Apache, mod_reqtimeout + iptables active (Mitig. 1-5)
+     3. Through WafProxy on port 8081, mitigations active (Mitig. 6)
 
- 4. Rate limiting                   → iptables hashlimit
-    "Monitoring the number of connections and requests
-     and limiting them to a reasonable threshold."
-    Implemented: hashlimit drops new SYNs from a single
-    IP above 10/second.
+   This lets the before/after table show the incremental value
+   of the WAF layer on top of the server-side mitigations.
 
- 5. Keep software up to date        → apt check (advisory)
-    "Keeping web server software and operating systems
-     up to date can help prevent known vulnerabilities."
-    Implemented: runs apt-get --dry-run upgrade and
-    reports whether Apache needs updates.
-
- 6. DDoS mitigation service         → rate-limit advisory
-    "Specialized DDoS mitigation services can protect
-     against Slowloris and other DDoS attacks."
-    Implemented: prints guidance text and checks whether
-    a cloud WAF/reverse-proxy is reachable upstream.
-
- Usage (on the victim VM, 192.168.100.20)
+ Mitigations from the article (all six):
  ─────────────────────────────────────────
+ 1. Reverse proxy buffering → Apache mod_reqtimeout
+ 2. Per-IP connection limit → iptables connlimit
+ 3. Reduce max request duration → mod_reqtimeout (same directive)
+ 4. Rate limiting → iptables hashlimit
+ 5. Keep software up to date → apt-get --dry-run advisory
+ 6. DDoS mitigation service → WafProxy (NOW MEASURABLE)
+
+ Usage (on the victim VM, 192.168.100.20):
    sudo python3 slowloris_defense.py --enable
    sudo python3 slowloris_defense.py --disable
    sudo python3 slowloris_defense.py --status
    sudo python3 slowloris_defense.py --measure [--c2-ip 192.168.100.10]
-
- --measure runs a before → enable → after cycle automatically:
-   1. Runs slowloris.py --connlimit-test on the C2 VM (via SSH)
-      to get a baseline socket-success count.
-   2. Enables all mitigations.
-   3. Runs the connlimit-test again.
-   4. Prints a comparison table and writes
-      graph3_slowloris_data.json for generate_graphs.py.
+   sudo python3 slowloris_defense.py --waf-start
+   sudo python3 slowloris_defense.py --waf-stop
 ====================================================
 """
 
 import argparse
 import json
 import os
+import socket
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime
-
+from collections import defaultdict
 
 # ── Apache config ──────────────────────────────────────────────
 APACHE_CONF_DIR   = "/etc/apache2/conf-available"
@@ -80,63 +69,47 @@ APACHE_CONF_PATH  = os.path.join(APACHE_CONF_DIR, APACHE_CONF_NAME)
 APACHE_CONF_LINK  = f"/etc/apache2/conf-enabled/{APACHE_CONF_NAME}"
 
 # mod_reqtimeout values (mitigations 1 and 3)
-REQ_TIMEOUT_HEADER_MIN  = 10    # seconds: if no complete header in 10s → close
+REQ_TIMEOUT_HEADER_MIN  = 10    # if no complete header in 10s → close
 REQ_TIMEOUT_HEADER_MAX  = 20    # max seconds allowed for headers
 REQ_TIMEOUT_MINRATE     = 500   # bytes/sec minimum — stalls get cut
-KEEPALIVE_TIMEOUT       = 5     # seconds (default Apache: 5, Slowloris-hardened: 2)
+KEEPALIVE_TIMEOUT       = 5
 MAX_KEEPALIVE_REQUESTS  = 100
 
 APACHE_CONF_CONTENT = f"""\
 # Slowloris Defense Configuration
 # Generated by slowloris_defense.py — AUA CS 232/337
-# Applied by: sudo python3 slowloris_defense.py --enable
 
 # ── Mitigation 1 + 3: mod_reqtimeout ──────────────────────────
-# Forces incomplete connections closed quickly.
-# header=10-20,MinRate=500:
-#   - Apache waits at most 10s for the first header byte
-#   - Allows up to 20s total, but only if MinRate=500 B/s is met
-#   - A Slowloris drip sends ~10 bytes every 10s → 1 B/s << 500 B/s
-#   - Apache closes the connection as "too slow"
 <IfModule mod_reqtimeout.c>
     RequestReadTimeout header={REQ_TIMEOUT_HEADER_MIN}-{REQ_TIMEOUT_HEADER_MAX},MinRate={REQ_TIMEOUT_MINRATE} body=20,MinRate={REQ_TIMEOUT_MINRATE}
 </IfModule>
 
 # ── Mitigation 1 (KeepAlive tuning) ───────────────────────────
-# Reduce how long Apache keeps connections open between requests.
 KeepAliveTimeout {KEEPALIVE_TIMEOUT}
 MaxKeepAliveRequests {MAX_KEEPALIVE_REQUESTS}
 """
 
 # ── iptables rules ─────────────────────────────────────────────
-IFACE = "enp0s3"   # change to eth0 if needed
+IFACE = "enp0s3"
 
-# Mitigation 2: per-IP connection limit
-CONNLIMIT_ABOVE = 20    # connections per IP before dropping
+CONNLIMIT_ABOVE = 20    # connections per IP before dropping (Mitigation 2)
+HASHLIMIT_RATE  = 10    # new SYNs per second per IP (Mitigation 4)
+HASHLIMIT_BURST = 20
 
-# Mitigation 4: new-connection rate limit
-HASHLIMIT_RATE  = 10    # new SYNs per second per IP
-HASHLIMIT_BURST = 20    # burst allowance
-
-# Chain/set identifiers for cleanup
 IPTABLES_RULES = [
     # Mitigation 2: connlimit
     [
         "iptables", "-A", "INPUT",
-        "-i", IFACE,
-        "-p", "tcp", "--dport", "80",
-        "--syn",
-        "-m", "connlimit", "--connlimit-above", str(CONNLIMIT_ABOVE),
-        "-j", "REJECT",
-        "--reject-with", "tcp-reset",
+        "-i", IFACE, "-p", "tcp", "--dport", "80",
+        "--syn", "-m", "connlimit",
+        "--connlimit-above", str(CONNLIMIT_ABOVE),
+        "-j", "REJECT", "--reject-with", "tcp-reset",
     ],
     # Mitigation 4: hashlimit (rate limiting)
     [
         "iptables", "-A", "INPUT",
-        "-i", IFACE,
-        "-p", "tcp", "--dport", "80",
-        "--syn",
-        "-m", "hashlimit",
+        "-i", IFACE, "-p", "tcp", "--dport", "80",
+        "--syn", "-m", "hashlimit",
         "--hashlimit-name", "slowloris_rl",
         "--hashlimit-above", f"{HASHLIMIT_RATE}/second",
         "--hashlimit-burst", str(HASHLIMIT_BURST),
@@ -145,10 +118,259 @@ IPTABLES_RULES = [
     ],
 ]
 
-# How to reverse them
 IPTABLES_REMOVE_RULES = [r.copy() for r in IPTABLES_RULES]
 for r in IPTABLES_REMOVE_RULES:
-    r[1] = "-D"   # replace -A with -D
+    r[1] = "-D"
+
+
+# ══════════════════════════════════════════════════════════════
+#  MITIGATION 6: WAF PROXY  (new — previously advisory-only)
+# ══════════════════════════════════════════════════════════════
+
+PROXY_PORT         = 8081    # WAF proxy listens here
+BACKEND_HOST       = "127.0.0.1"
+BACKEND_PORT       = 80      # Apache listens here
+WAF_MAX_CONN_PER_IP   = 5    # per-IP connection limit enforced by WAF
+WAF_HEADER_TIMEOUT_SEC = 8   # drop connection if headers not complete in 8s
+WAF_FORWARD_BUFSIZE   = 4096
+
+
+class WafProxy:
+    """
+    Mitigation 6 — "DDoS Mitigation Service" simulation.
+
+    A lightweight Python reverse proxy that enforces two rules
+    before forwarding any connection to Apache:
+
+      Rule 1: Per-IP connection limit (WAF_MAX_CONN_PER_IP)
+        Slowloris typically opens hundreds of connections from
+        a single IP.  A real cloud WAF enforces per-client
+        connection limits at its edge, long before traffic
+        reaches the origin server.  Connections above the
+        per-IP limit are rejected immediately (no forwarding).
+
+      Rule 2: Header-read timeout (WAF_HEADER_TIMEOUT_SEC)
+        A Slowloris socket drips one header line every ~10 seconds
+        and never sends the final \\r\\n\\r\\n terminator.  This WAF
+        reads until the header is complete or the timeout fires.
+        On timeout, it closes the client socket — the Apache
+        backend never sees this connection at all, so it does not
+        consume an Apache worker thread.
+
+    Measurement:
+      Run slowloris.py --connlimit-test against port 8081 (WAF)
+      and compare to port 80 (direct Apache).  The WAF should
+      reject most Slowloris sockets before they reach Apache,
+      making it measurable independently of mod_reqtimeout.
+    """
+
+    def __init__(self,
+                 listen_port: int = PROXY_PORT,
+                 backend_host: str = BACKEND_HOST,
+                 backend_port: int = BACKEND_PORT,
+                 max_conn_per_ip: int = WAF_MAX_CONN_PER_IP,
+                 header_timeout: float = WAF_HEADER_TIMEOUT_SEC):
+        self.listen_port    = listen_port
+        self.backend_host   = backend_host
+        self.backend_port   = backend_port
+        self.max_conn_per_ip = max_conn_per_ip
+        self.header_timeout  = header_timeout
+
+        self._lock      = threading.Lock()
+        self._per_ip:   dict[str, int] = defaultdict(int)
+        self._running   = False
+        self._sock: socket.socket | None = None
+        self._thread: threading.Thread | None = None
+
+        # Stats
+        self.stats = {
+            "accepted":  0,
+            "rejected_connlimit": 0,
+            "rejected_timeout":   0,
+            "forwarded": 0,
+        }
+
+    def start(self) -> bool:
+        """
+        Bind to PROXY_PORT and start the accept loop in a daemon thread.
+        Returns True on success, False if the port is already in use.
+        """
+        try:
+            self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self._sock.bind(("0.0.0.0", self.listen_port))
+            self._sock.listen(256)
+            self._sock.settimeout(1.0)   # allows clean shutdown
+        except OSError as e:
+            print(f"[waf-proxy] ERROR: cannot bind to port {self.listen_port}: {e}")
+            return False
+
+        self._running = True
+        self._thread  = threading.Thread(
+            target=self._accept_loop,
+            daemon=True,
+            name="waf-proxy-accept",
+        )
+        self._thread.start()
+        print(
+            f"[waf-proxy] Listening on :{self.listen_port} → "
+            f"{self.backend_host}:{self.backend_port}\n"
+            f"[waf-proxy]   Max connections per IP : {self.max_conn_per_ip}\n"
+            f"[waf-proxy]   Header read timeout    : {self.header_timeout}s"
+        )
+        return True
+
+    def stop(self) -> None:
+        """Shut down the accept loop and close the listening socket."""
+        self._running = False
+        if self._sock:
+            try:
+                self._sock.close()
+            except Exception:
+                pass
+        if self._thread:
+            self._thread.join(timeout=3)
+        print(f"[waf-proxy] Stopped. Final stats: {self.stats}")
+
+    def _accept_loop(self) -> None:
+        while self._running:
+            try:
+                client, addr = self._sock.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+
+            ip = addr[0]
+            with self._lock:
+                current = self._per_ip[ip]
+                if current >= self.max_conn_per_ip:
+                    # Rule 1: per-IP connection limit exceeded → reject
+                    self.stats["rejected_connlimit"] += 1
+                    try:
+                        client.close()
+                    except Exception:
+                        pass
+                    continue
+                self._per_ip[ip] += 1
+                self.stats["accepted"] += 1
+
+            # Hand off to a worker thread
+            t = threading.Thread(
+                target=self._handle,
+                args=(client, ip),
+                daemon=True,
+                name=f"waf-worker-{ip}",
+            )
+            t.start()
+
+    def _handle(self, client: socket.socket, ip: str) -> None:
+        """
+        Read HTTP headers from the client with a hard timeout.
+        If complete within the timeout → forward to Apache backend.
+        If not (Slowloris drip) → drop the connection.
+        """
+        backend: socket.socket | None = None
+        try:
+            # Rule 2: header-read timeout
+            client.settimeout(self.header_timeout)
+            buf = b""
+            while b"\r\n\r\n" not in buf:
+                try:
+                    chunk = client.recv(WAF_FORWARD_BUFSIZE)
+                except socket.timeout:
+                    # Slowloris: headers never completed → drop silently
+                    self.stats["rejected_timeout"] += 1
+                    return
+                if not chunk:
+                    return   # connection closed by client
+                buf += chunk
+                if len(buf) > 65536:
+                    return   # guard against oversized requests
+
+            # Headers complete — forward to Apache
+            client.settimeout(30)   # restore a reasonable timeout for the body
+            try:
+                backend = socket.create_connection(
+                    (self.backend_host, self.backend_port), timeout=5
+                )
+                backend.send(buf)
+                self.stats["forwarded"] += 1
+                # Bidirectional relay
+                self._relay(client, backend)
+            except socket.error:
+                pass
+
+        except Exception:
+            pass
+        finally:
+            for s in (client, backend):
+                if s:
+                    try:
+                        s.close()
+                    except Exception:
+                        pass
+            with self._lock:
+                self._per_ip[ip] -= 1
+                if self._per_ip[ip] <= 0:
+                    del self._per_ip[ip]
+
+    def _relay(self, a: socket.socket, b: socket.socket) -> None:
+        """
+        Bidirectionally relay data between two connected sockets
+        until either closes.  Uses two threads: one per direction.
+        """
+        stop = threading.Event()
+
+        def copy(src: socket.socket, dst: socket.socket) -> None:
+            try:
+                while not stop.is_set():
+                    data = src.recv(WAF_FORWARD_BUFSIZE)
+                    if not data:
+                        break
+                    dst.sendall(data)
+            except Exception:
+                pass
+            finally:
+                stop.set()
+
+        t = threading.Thread(target=copy, args=(b, a), daemon=True)
+        t.start()
+        copy(a, b)
+        t.join(timeout=5)
+
+    def get_stats(self) -> dict:
+        with self._lock:
+            active = dict(self._per_ip)
+        return {
+            **self.stats,
+            "active_connections": active,
+        }
+
+
+# Singleton proxy instance
+_waf_proxy: WafProxy | None = None
+
+
+def start_waf_proxy() -> bool:
+    global _waf_proxy
+    if _waf_proxy is not None:
+        print("[waf-proxy] Already running.")
+        return True
+    _waf_proxy = WafProxy()
+    ok = _waf_proxy.start()
+    if not ok:
+        _waf_proxy = None
+    return ok
+
+
+def stop_waf_proxy() -> None:
+    global _waf_proxy
+    if _waf_proxy is None:
+        print("[waf-proxy] Not running.")
+        return
+    _waf_proxy.stop()
+    _waf_proxy = None
 
 
 # ══════════════════════════════════════════════════════════════
@@ -156,12 +378,7 @@ for r in IPTABLES_REMOVE_RULES:
 # ══════════════════════════════════════════════════════════════
 
 def _run(cmd: list[str], check: bool = True) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        check=check,
-    )
+    return subprocess.run(cmd, capture_output=True, text=True, check=check)
 
 
 def _apache_reload() -> None:
@@ -177,10 +394,7 @@ def _check_root() -> None:
 
 
 def _mod_reqtimeout_enabled() -> bool:
-    result = _run(
-        ["apache2ctl", "-M"],
-        check=False,
-    )
+    result = _run(["apache2ctl", "-M"], check=False)
     return "reqtimeout" in (result.stdout + result.stderr).lower()
 
 
@@ -193,50 +407,45 @@ def enable() -> None:
     _check_root()
     print("\n[defense] ── Enabling Slowloris mitigations ──────────────────")
 
-    # ── Mitigation 1 + 3: mod_reqtimeout ──────────────────────
-    print("[defense] Mitigation 1+3: Apache mod_reqtimeout...")
+    # ── Mitigations 1 + 3: mod_reqtimeout ─────────────────────
+    print("[defense] Mitigations 1+3: Apache mod_reqtimeout...")
     if not _mod_reqtimeout_enabled():
         _run(["sudo", "a2enmod", "reqtimeout"])
-        print("[defense]   mod_reqtimeout enabled.")
-    else:
-        print("[defense]   mod_reqtimeout already loaded.")
-
     os.makedirs(APACHE_CONF_DIR, exist_ok=True)
     with open(APACHE_CONF_PATH, "w") as f:
         f.write(APACHE_CONF_CONTENT)
-    print(f"[defense]   Config written: {APACHE_CONF_PATH}")
-
     _run(["sudo", "a2enconf", APACHE_CONF_NAME.replace(".conf", "")])
-    print("[defense]   Config enabled.")
+    print("[defense]   mod_reqtimeout configured.")
 
-    # ── Mitigation 2 + 4: iptables ─────────────────────────────
+    # ── Mitigations 2 + 4: iptables ───────────────────────────
     print("[defense] Mitigations 2+4: iptables connlimit + hashlimit...")
     for rule in IPTABLES_RULES:
         result = _run(rule, check=False)
-        if result.returncode == 0:
-            print(f"[defense]   Rule applied: {' '.join(rule[3:])}")
-        else:
-            # Rule may already exist; not fatal
-            err = result.stderr.strip()
-            print(f"[defense]   Rule result ({result.returncode}): {err or 'ok'}")
+        status = "applied" if result.returncode == 0 else result.stderr.strip()
+        print(f"[defense]   {' '.join(rule[3:9])}: {status}")
 
-    # ── Mitigation 5: software currency check (advisory) ───────
+    # ── Mitigation 5: software currency advisory ───────────────
     print("[defense] Mitigation 5: Checking Apache package currency...")
-    result = _run(
-        ["apt-get", "--dry-run", "upgrade", "apache2"],
-        check=False,
-    )
+    result = _run(["apt-get", "--dry-run", "upgrade", "apache2"], check=False)
     if "0 upgraded" in result.stdout:
         print("[defense]   Apache is up to date. ✓")
     else:
         print("[defense]   Apache updates available — run: sudo apt-get upgrade apache2")
 
-    # ── Mitigation 6: advisory ─────────────────────────────────
-    print("[defense] Mitigation 6: DDoS mitigation service (advisory)")
-    print("[defense]   In production, place a cloud WAF/CDN in front of Apache.")
-    print("[defense]   Candidates: AppTrana (article), Cloudflare, AWS Shield.")
-    print("[defense]   In this isolated lab, iptables hashlimit (Mitigation 4)")
-    print("[defense]   simulates the rate-limiting function of such a service.")
+    # ── Mitigation 6: WAF proxy (now measurable) ───────────────
+    print("[defense] Mitigation 6: Starting WAF proxy...")
+    if start_waf_proxy():
+        print(
+            f"[defense]   WafProxy active on :{PROXY_PORT} → Apache :{BACKEND_PORT}\n"
+            f"[defense]   Per-IP limit: {WAF_MAX_CONN_PER_IP} connections\n"
+            f"[defense]   Header timeout: {WAF_HEADER_TIMEOUT_SEC}s\n"
+            f"[defense]   Run --connlimit-test against port {PROXY_PORT} to measure."
+        )
+    else:
+        print(
+            f"[defense]   WARNING: WafProxy failed to start on port {PROXY_PORT}.\n"
+            f"[defense]   Mitigation 6 active only as rate-limiting advisory."
+        )
 
     _apache_reload()
     print("[defense] ── All mitigations active ──────────────────────────\n")
@@ -248,28 +457,23 @@ def enable() -> None:
 # ══════════════════════════════════════════════════════════════
 
 def disable() -> None:
-    """Remove all mitigations and restore baseline."""
+    """Remove all mitigations and restore the clean baseline."""
     _check_root()
     print("\n[defense] ── Removing Slowloris mitigations ──────────────────")
 
-    # Remove Apache config
     try:
         _run(["sudo", "a2disconf", APACHE_CONF_NAME.replace(".conf", "")])
-        print(f"[defense]   Config disabled: {APACHE_CONF_NAME}")
     except subprocess.CalledProcessError:
-        print("[defense]   Config was not enabled (skipping).")
+        pass
 
     if os.path.exists(APACHE_CONF_PATH):
         os.remove(APACHE_CONF_PATH)
-        print(f"[defense]   Config removed: {APACHE_CONF_PATH}")
 
-    # Remove iptables rules
     for rule in IPTABLES_REMOVE_RULES:
-        result = _run(rule, check=False)
-        if result.returncode == 0:
-            print(f"[defense]   Rule removed: {' '.join(rule[3:])}")
-        else:
-            print(f"[defense]   Rule not present (skipping).")
+        _run(rule, check=False)
+        print(f"[defense]   Removed: {' '.join(rule[3:9])}")
+
+    stop_waf_proxy()
 
     _apache_reload()
     print("[defense] ── Mitigations removed — baseline restored ─────────\n")
@@ -283,39 +487,35 @@ def status() -> dict:
     """Print and return current mitigation status."""
     s: dict = {}
 
-    # Apache config
     conf_present = os.path.exists(APACHE_CONF_PATH)
     conf_linked  = os.path.exists(APACHE_CONF_LINK)
-    s["apache_conf_present"] = conf_present
-    s["apache_conf_enabled"] = conf_linked
-
-    # mod_reqtimeout
+    s["apache_conf_present"]   = conf_present
+    s["apache_conf_enabled"]   = conf_linked
     s["mod_reqtimeout_loaded"] = _mod_reqtimeout_enabled()
 
-    # iptables connlimit rule
     result = subprocess.run(
-        ["iptables", "-C", "INPUT",
-         "-i", IFACE, "-p", "tcp", "--dport", "80",
-         "--syn", "-m", "connlimit",
-         "--connlimit-above", str(CONNLIMIT_ABOVE),
+        ["iptables", "-C", "INPUT", "-i", IFACE, "-p", "tcp", "--dport", "80",
+         "--syn", "-m", "connlimit", "--connlimit-above", str(CONNLIMIT_ABOVE),
          "-j", "REJECT", "--reject-with", "tcp-reset"],
         capture_output=True,
     )
     s["connlimit_rule_active"] = (result.returncode == 0)
 
-    # iptables hashlimit rule
     result = subprocess.run(
-        ["iptables", "-C", "INPUT",
-         "-i", IFACE, "-p", "tcp", "--dport", "80",
+        ["iptables", "-C", "INPUT", "-i", IFACE, "-p", "tcp", "--dport", "80",
          "--syn", "-m", "hashlimit",
          "--hashlimit-name", "slowloris_rl",
          "--hashlimit-above", f"{HASHLIMIT_RATE}/second",
          "--hashlimit-burst", str(HASHLIMIT_BURST),
-         "--hashlimit-mode", "srcip",
-         "-j", "DROP"],
+         "--hashlimit-mode", "srcip", "-j", "DROP"],
         capture_output=True,
     )
     s["hashlimit_rule_active"] = (result.returncode == 0)
+
+    waf_running = _waf_proxy is not None and _waf_proxy._running
+    s["waf_proxy_active"] = waf_running
+    if waf_running:
+        s["waf_proxy_stats"] = _waf_proxy.get_stats()
 
     all_active = all([
         s["apache_conf_present"],
@@ -323,16 +523,18 @@ def status() -> dict:
         s["mod_reqtimeout_loaded"],
         s["connlimit_rule_active"],
         s["hashlimit_rule_active"],
+        s["waf_proxy_active"],
     ])
     s["all_active"] = all_active
 
     print("\n[defense] ── Mitigation Status ──────────────────────────────")
     rows = [
-        ("Apache conf present",      s["apache_conf_present"]),
-        ("Apache conf enabled",       s["apache_conf_enabled"]),
-        ("mod_reqtimeout loaded",     s["mod_reqtimeout_loaded"]),
-        ("connlimit rule (Mitig. 2)", s["connlimit_rule_active"]),
-        ("hashlimit rule (Mitig. 4)", s["hashlimit_rule_active"]),
+        ("Apache conf present",         s["apache_conf_present"]),
+        ("Apache conf enabled",          s["apache_conf_enabled"]),
+        ("mod_reqtimeout loaded",        s["mod_reqtimeout_loaded"]),
+        ("connlimit rule (Mitig. 2)",    s["connlimit_rule_active"]),
+        ("hashlimit rule (Mitig. 4)",    s["hashlimit_rule_active"]),
+        (f"WafProxy :{PROXY_PORT} (Mitig. 6)", s["waf_proxy_active"]),
     ]
     for label, val in rows:
         icon = "✓" if val else "✗"
@@ -343,28 +545,31 @@ def status() -> dict:
 
 
 # ══════════════════════════════════════════════════════════════
-#  MEASURE  (before/after experiment)
+#  MEASURE  (updated: three measurement points instead of two)
 # ══════════════════════════════════════════════════════════════
 
-def measure(c2_ip: str = "192.168.100.10",
-            ssh_user: str = "vboxuser",
+def measure(c2_ip: str       = "192.168.100.10",
+            ssh_user: str    = "vboxuser",
             num_sockets: int = 150) -> dict:
     """
-    Before/after experiment:
-      1. Take a baseline connlimit-test snapshot (mitigations OFF).
-      2. Enable all mitigations.
-      3. Take a post-mitigation connlimit-test snapshot.
-      4. Print comparison table and write graph3_slowloris_data.json.
+    Three-point before/after experiment:
+      Point 1: Baseline — mitigations OFF, port 80 (direct Apache)
+      Point 2: Post-mitigation — mod_reqtimeout + iptables, port 80
+      Point 3: Through WafProxy — port 8081, mitigations active
 
-    connlimit-test invokes slowloris.py --connlimit-test on the C2 VM
-    (where it is safe to originate attack traffic in the isolated lab).
+    Point 3 is new: it quantifies Mitigation 6 independently.
+    A cloud WAF should reduce the reachable socket count to near
+    zero even before the backend's own defences take effect —
+    because it never forwards incomplete connections.
+
+    Writes graph3_slowloris_data.json with all three data points.
     """
     _check_root()
-    print("\n[defense] ── Before/After Measurement ──────────────────────")
+    print("\n[defense] ── Three-point Measurement ───────────────────────")
 
-    def _connlimit_snapshot(label: str) -> dict:
-        """SSH to C2 VM and run slowloris.py --connlimit-test."""
-        print(f"\n[defense] [{label}] Running connlimit-test from C2 VM ({c2_ip})...")
+    def _connlimit_snapshot(label: str, port: int) -> dict:
+        """SSH to C2 VM and run slowloris.py --connlimit-test against port."""
+        print(f"\n[defense] [{label}] connlimit-test → {c2_ip} port {port}...")
         cmd = [
             "ssh",
             "-o", "StrictHostKeyChecking=no",
@@ -372,83 +577,97 @@ def measure(c2_ip: str = "192.168.100.10",
             f"{ssh_user}@{c2_ip}",
             f"cd ~/lab && python3 slowloris.py "
             f"--connlimit-test --sockets {num_sockets} "
-            f"192.168.100.20 2>/dev/null",
+            f"-p {port} 192.168.100.20 2>/dev/null",
         ]
         result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=30,
+            cmd, capture_output=True, text=True, timeout=30,
         )
-
-        # Parse the [SLOWLORIS_STATS] line from stdout
         for line in result.stdout.splitlines():
             if line.startswith("[SLOWLORIS_STATS]"):
                 try:
                     data = json.loads(line[len("[SLOWLORIS_STATS] "):])
                     data["label"] = label
-                    print(f"[defense]   Succeeded: {data['succeeded']}/{data['attempted']} "
+                    print(f"[defense]   succeeded={data['succeeded']}/{data['attempted']} "
                           f"({data['pct_open']}%)")
                     return data
                 except (json.JSONDecodeError, KeyError):
                     pass
-
-        # Fallback: couldn't parse
         print(f"[defense]   WARNING: could not parse connlimit-test output.")
-        print(f"[defense]   stdout: {result.stdout[:200]}")
         return {"label": label, "succeeded": -1, "attempted": num_sockets,
-                "pct_open": -1.0, "error": "parse_failed"}
+                "pct_open": -1.0, "port": port, "error": "parse_failed"}
 
-    # ── Step 1: baseline (mitigations OFF) ────────────────────
-    # Ensure mitigations are off for a clean baseline
+    # ── Point 1: baseline, no mitigations ─────────────────────
     disable()
     time.sleep(2)
-    before = _connlimit_snapshot("BEFORE mitigation")
+    point1 = _connlimit_snapshot("BASELINE (no mitigation)", BACKEND_PORT)
 
-    # ── Step 2: enable mitigations ────────────────────────────
+    # ── Points 2 + 3: enable mitigations and WAF proxy ────────
     enable()
-    time.sleep(3)   # give Apache time to fully reload
+    time.sleep(3)
 
-    # ── Step 3: post-mitigation snapshot ──────────────────────
-    after = _connlimit_snapshot("AFTER mitigation")
+    point2 = _connlimit_snapshot("AFTER mitigation (direct :80)", BACKEND_PORT)
+    point3 = _connlimit_snapshot(f"AFTER mitigation + WAF (:{PROXY_PORT})", PROXY_PORT)
 
-    # ── Step 4: comparison table ───────────────────────────────
-    b_suc = before.get("succeeded", 0)
-    a_suc = after.get("succeeded",  0)
-    if b_suc > 0:
-        reduction_pct = max(0.0, (b_suc - a_suc) / b_suc * 100)
-    else:
-        reduction_pct = 0.0
+    # ── Comparison table ───────────────────────────────────────
+    def _pct(p: dict) -> str:
+        v = p.get("pct_open", -1)
+        return f"{v:.1f}%" if v >= 0 else "error"
+
+    def _suc(p: dict) -> int:
+        return p.get("succeeded", 0)
+
+    b = _suc(point1)
+
+    def _reduction(n: int) -> str:
+        if b <= 0:
+            return "n/a"
+        return f"{max(0, (b - n) / b * 100):.1f}%"
 
     print("\n[defense] ── Comparison Table ───────────────────────────────")
-    print(f"  {'Metric':<30} {'Before':>10} {'After':>10}")
-    print(f"  {'─'*30} {'─'*10} {'─'*10}")
-    print(f"  {'Sockets attempted':<30} {before['attempted']:>10} {after['attempted']:>10}")
-    print(f"  {'Sockets succeeded':<30} {b_suc:>10} {a_suc:>10}")
-    print(f"  {'Success %':<30} {before.get('pct_open', -1):>9.1f}% "
-          f"{after.get('pct_open', -1):>9.1f}%")
-    print(f"\n  Mitigation factor: {reduction_pct:.1f}% reduction in reachable sockets")
+    print(f"  {'Measurement':<36} {'Succeeded':>10} {'% Open':>8} {'Reduction':>10}")
+    print("  " + "─" * 68)
+    for p in (point1, point2, point3):
+        n = _suc(p)
+        print(f"  {p['label']:<36} {n:>10} {_pct(p):>8} "
+              f"{_reduction(n) if p is not point1 else '(baseline)':>10}")
+
+    print()
+    if _suc(point3) < _suc(point2):
+        print(
+            f"  WafProxy (:8081) reduced reachable sockets further than\n"
+            f"  server-side mitigations alone (:80), confirming that a WAF\n"
+            f"  layer intercepts Slowloris connections before they ever\n"
+            f"  reach Apache — the core value of Mitigation 6."
+        )
     print("[defense] ────────────────────────────────────────────────────")
 
-    # ── Step 5: write graph data ───────────────────────────────
+    # ── Write graph data ───────────────────────────────────────
     output = {
         "timestamp":       datetime.now().isoformat(),
-        "before":          before,
-        "after":           after,
-        "reduction_pct":   round(reduction_pct, 1),
+        "baseline":        point1,
+        "after_mitigation": point2,
+        "after_waf":       point3,
+        "reduction_server_pct": round(
+            max(0, (_suc(point1) - _suc(point2)) / max(_suc(point1), 1) * 100), 1
+        ),
+        "reduction_waf_pct": round(
+            max(0, (_suc(point1) - _suc(point3)) / max(_suc(point1), 1) * 100), 1
+        ),
         "mitigations": {
             "reqtimeout_header_min_sec":  REQ_TIMEOUT_HEADER_MIN,
             "reqtimeout_header_max_sec":  REQ_TIMEOUT_HEADER_MAX,
             "reqtimeout_minrate_bps":     REQ_TIMEOUT_MINRATE,
             "connlimit_per_ip":           CONNLIMIT_ABOVE,
             "hashlimit_new_syn_per_sec":  HASHLIMIT_RATE,
+            "waf_max_conn_per_ip":        WAF_MAX_CONN_PER_IP,
+            "waf_header_timeout_sec":     WAF_HEADER_TIMEOUT_SEC,
         },
     }
     out_path = "graph3_slowloris_data.json"
     with open(out_path, "w") as f:
         json.dump(output, f, indent=2)
     print(f"\n[defense] Data saved: {out_path}")
-    print("[defense] Run: python3 generate_graphs.py to include in Graph 3\n")
+    print("[defense] Run: python3 generate_graphs.py to plot Graph 3\n")
     return output
 
 
@@ -462,32 +681,36 @@ def main() -> None:
     )
     grp = p.add_mutually_exclusive_group(required=True)
     grp.add_argument(
-        "--enable",  action="store_true",
-        help="Apply all six article mitigations (mod_reqtimeout + iptables)",
+        "--enable", action="store_true",
+        help="Apply all six mitigations (mod_reqtimeout + iptables + WafProxy)",
     )
     grp.add_argument(
         "--disable", action="store_true",
         help="Remove all mitigations and restore the clean-room baseline",
     )
     grp.add_argument(
-        "--status",  action="store_true",
+        "--status", action="store_true",
         help="Report which mitigations are currently active",
     )
     grp.add_argument(
         "--measure", action="store_true",
         help=(
-            "Run a full before→enable→after experiment and write "
-            "graph3_slowloris_data.json"
+            "Run a three-point experiment: baseline → server mitigations "
+            "→ server + WAF proxy. Writes graph3_slowloris_data.json."
         ),
     )
-    p.add_argument(
-        "--c2-ip", default="192.168.100.10",
-        help="IP of the C2 VM (for SSH connlimit-test) (default: 192.168.100.10)",
+    grp.add_argument(
+        "--waf-start", action="store_true",
+        help=f"Start the WafProxy on :{PROXY_PORT} (Mitigation 6 standalone)",
     )
-    p.add_argument(
-        "--sockets", type=int, default=150,
-        help="Socket count for connlimit-test (default: 150)",
+    grp.add_argument(
+        "--waf-stop", action="store_true",
+        help="Stop the WafProxy",
     )
+    p.add_argument("--c2-ip", default="192.168.100.10",
+                   help="IP of the C2 VM for SSH connlimit-test (default: 192.168.100.10)")
+    p.add_argument("--sockets", type=int, default=150,
+                   help="Socket count for connlimit-test (default: 150)")
     args = p.parse_args()
 
     if args.enable:
@@ -498,6 +721,19 @@ def main() -> None:
         status()
     elif args.measure:
         measure(c2_ip=args.c2_ip, num_sockets=args.sockets)
+    elif args.waf_start:
+        if not start_waf_proxy():
+            sys.exit(1)
+        print("[waf-proxy] Running. Ctrl-C to stop.")
+        try:
+            while True:
+                time.sleep(10)
+                if _waf_proxy:
+                    print(f"[waf-proxy] Stats: {_waf_proxy.get_stats()}")
+        except KeyboardInterrupt:
+            stop_waf_proxy()
+    elif args.waf_stop:
+        stop_waf_proxy()
 
 
 if __name__ == "__main__":

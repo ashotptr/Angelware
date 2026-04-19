@@ -3,45 +3,69 @@
  ids_engine_slowloris.py
  AUA CS 232/337 — IDS Engine 16: Slowloris Detector
 
- Gap closed: ids_detector.py had no engine that inspects
- HTTP request *content* for Slowloris signatures. The
- existing firewall_dpi.py detects Slowloris via connection
- *duration* (TCP open >30s to port 80), which is a lagging
- indicator — the connection must already be old before it
- fires. This engine fires earlier, on the structural
- property of the attack: headers arriving but the request
- never being terminated.
+ Gap closed (original): ids_detector.py had no engine that
+ inspects HTTP request *content* for Slowloris signatures.
+ firewall_dpi.py detects Slowloris via connection *duration*
+ (TCP open >30s to port 80), which is a lagging indicator.
+ This engine fires earlier, on the structural property of the
+ attack: headers arriving but the request never terminating.
 
- Detection method (from the Indusface article §"How to Detect"):
+ Gap closed (THIS revision) — Distributed Slowloris detection:
+   The article (Signs of Slowloris Attack section) states:
+     "Analyzing network traffic patterns may reveal an abnormal
+      increase in the number of simultaneous connections from
+      *different IP addresses*, especially if these connections
+      are not completing typical HTTP requests."
+
+   The original engine's _check_concurrent() only detected
+   >= HALF_OPEN_PER_IP connections from a *single* source IP.
+   A coordinated Slowloris attack where each of N IPs opens
+   only a few connections — staying below the per-IP threshold
+   — would be completely invisible to the original engine even
+   while the total half-open connection count was exhausting
+   the server.
+
+   This revision adds:
+
+   1. _check_distributed() — fires a MED or HIGH alert when:
+        total half-open connections across ALL IPs > DISTRIBUTED_TOTAL_THRESHOLD
+        AND at least DISTRIBUTED_MIN_IPS distinct source IPs
+        AND NO single IP exceeds HALF_OPEN_PER_IP
+              (if a single IP did, _check_concurrent already fires)
+      This is the "coordinated low-volume" pattern: each bot stays
+      quiet, but together they overwhelm the server.
+
+   2. Time-windowed IP tracking for distributed detection:
+      Connections are bucketed into DISTRIBUTED_WINDOW_SEC windows.
+      An IP contributes to the distributed count only if it has
+      active half-open connections NOW (not just historically).
+
+   3. _get_global_half_open() — returns per-IP half-open counts
+      as a dict, shared between _check_concurrent and
+      _check_distributed to avoid double-counting.
+
+ Original detection method (from the Indusface article §"How to Detect"):
    "Connection tracking — connections open >N seconds without
     completing requests."
    "Monitor server logs for open connections without completed
-    requests" → translated here to packet-level inspection of
-    HTTP payload content.
+    requests" → packet-level inspection of HTTP payload content.
 
- Two alert conditions:
-   HIGH — ≥ HALF_OPEN_PER_IP concurrent half-open HTTP
-           connections from a single source IP
-           (article: "numerous incomplete connections from
-            various IP addresses")
+ Two original alert conditions (preserved):
+   HIGH — >= HALF_OPEN_PER_IP concurrent half-open HTTP
+          connections from a single source IP
    MED  — any single connection has been half-open for more
-           than STALE_CONNECTION_SEC seconds
-           (article: "connection tracking … without completing
-            requests")
+          than STALE_CONNECTION_SEC seconds
 
- Integration into ids_detector.py (two lines):
- ──────────────────────────────────────────────
-   # At the top, with the other engine imports:
+ New alert condition:
+   MED/HIGH — distributed: total half-open connections >
+          DISTRIBUTED_TOTAL_THRESHOLD from >= DISTRIBUTED_MIN_IPS
+          distinct IPs, each staying below HALF_OPEN_PER_IP
+
+ Integration into ids_detector.py (unchanged from original):
    import ids_engine_slowloris as _e16
    _e16.register(alert)
-
-   # In packet_handler(), alongside the other process_* calls:
+   # In packet_handler():
    _e16.process_packet(pkt)
-
-   # Optional: add the maintenance tick to the sniff callback
-   # or let _e16's background thread handle it automatically
-   # (it starts on register()).
- ──────────────────────────────────────────────
 ====================================================
 """
 
@@ -57,12 +81,17 @@ except ImportError:
     _SCAPY_OK = False
 
 
-# ── Tunable thresholds ─────────────────────────────────────────
-MONITORED_PORT       = 80       # HTTP port to watch
-HALF_OPEN_PER_IP     = 10       # concurrent half-open connections → HIGH alert
-STALE_CONNECTION_SEC = 30       # single conn half-open longer than this → MED
-PRUNE_INTERVAL_SEC   = 15       # background maintenance frequency
-ALERT_COOLDOWN_SEC   = 60       # minimum seconds between repeated alerts per IP
+# ── Thresholds ─────────────────────────────────────────────────
+MONITORED_PORT       = 80    # HTTP port to watch
+HALF_OPEN_PER_IP     = 10   # concurrent half-open from one IP → HIGH alert
+STALE_CONNECTION_SEC = 30   # single conn half-open > this → MED alert
+PRUNE_INTERVAL_SEC   = 15   # background maintenance frequency
+ALERT_COOLDOWN_SEC   = 60   # min seconds between repeated alerts per IP
+
+# Distributed detection thresholds (new)
+DISTRIBUTED_TOTAL_THRESHOLD = 30   # total half-open across ALL IPs → alert
+DISTRIBUTED_MIN_IPS         = 3    # minimum distinct contributing source IPs
+DISTRIBUTED_COOLDOWN_SEC    = 45   # cooldown for the global distributed alert
 
 
 # ══════════════════════════════════════════════════════════════
@@ -75,22 +104,45 @@ class _ConnState:
                  "terminated", "alerted_stale")
 
     def __init__(self, ts: float):
-        self.first_seen    = ts
+        self.first_seen     = ts
         self.last_header_ts = ts
-        self.headers_seen  = 0    # count of X-a: keep-alive lines received
-        self.terminated    = False
-        self.alerted_stale = False
+        self.headers_seen   = 0    # count of keep-alive header drips received
+        self.terminated     = False
+        self.alerted_stale  = False
 
 
-# key: (src_ip, sport, dst_ip, dport)
+# key: (src_ip, sport, dst_ip, dport) → _ConnState
 _connections: dict[tuple, _ConnState] = {}
 _lock = threading.Lock()
 
-# Per-source alert cooldowns
+# Per-source alert cooldowns (original)
 _last_high_alert: dict[str, float] = defaultdict(float)
 _last_med_alert:  dict[str, float] = defaultdict(float)
 
+# Global distributed alert cooldown (new)
+_last_distributed_alert: float = 0.0
+
 _alert_fn: Callable | None = None
+
+
+# ══════════════════════════════════════════════════════════════
+#  SHARED HALF-OPEN COUNTER (new)
+# ══════════════════════════════════════════════════════════════
+
+def _get_global_half_open() -> dict[str, int]:
+    """
+    Returns {src_ip: half_open_count} for all IPs that currently
+    have at least one active half-open connection (headers received,
+    request not terminated).  Must be called while _lock is held.
+
+    Shared by _check_concurrent() and _check_distributed() to avoid
+    iterating _connections twice per packet.
+    """
+    per_ip: dict[str, int] = defaultdict(int)
+    for (sip, _, _, _), conn in _connections.items():
+        if not conn.terminated and conn.headers_seen > 0:
+            per_ip[sip] += 1
+    return dict(per_ip)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -100,7 +152,7 @@ _alert_fn: Callable | None = None
 def process_packet(pkt) -> None:
     """
     Call this from ids_detector.py's packet_handler() for every
-    captured packet.
+    captured packet.  Thread-safe.
     """
     if not _SCAPY_OK:
         return
@@ -124,13 +176,12 @@ def process_packet(pkt) -> None:
             return
 
         # ── FIN or RST: connection closing ─────────────────────
-        if flags & 0x01 or flags & 0x04:          # FIN or RST
+        if flags & 0x01 or flags & 0x04:
             conn = _connections.pop(key, None)
             if conn:
                 conn.terminated = True
             return
 
-        # ── Data packet: inspect HTTP payload ──────────────────
         if key not in _connections:
             return
         conn = _connections[key]
@@ -138,38 +189,35 @@ def process_packet(pkt) -> None:
         if pkt.haslayer(Raw):
             payload = bytes(pkt[Raw].load)
 
-            # A Slowloris keep-alive drip looks like:
-            #   b"X-a: 1234\r\n"
-            # It is a valid HTTP header line — the attack's trick is
-            # that \r\n\r\n (the request terminator) is NEVER sent.
             if b"\r\n\r\n" in payload:
-                # This is a completed HTTP request — not Slowloris.
+                # Completed HTTP request — not Slowloris.
                 conn.terminated = True
                 _connections.pop(key, None)
                 return
 
-            # Header data without terminator = keep-alive drip
             if b"\r\n" in payload or b"X-a:" in payload:
+                # Keep-alive drip: header data without terminator.
                 conn.headers_seen   += 1
                 conn.last_header_ts  = now
 
-        # ── Per-IP concurrent half-open count check (HIGH) ────
-        _check_concurrent(src_ip, now)
+        # ── Compute global half-open map once per packet ───────
+        half_open_map = _get_global_half_open()
+
+        # ── Per-IP check (original) ────────────────────────────
+        _check_concurrent(src_ip, now, half_open_map)
+
+        # ── Distributed check (new) ────────────────────────────
+        _check_distributed(now, half_open_map)
 
 
-def _check_concurrent(src_ip: str, now: float) -> None:
+def _check_concurrent(src_ip: str, now: float,
+                       half_open_map: dict[str, int]) -> None:
     """
-    Count concurrent half-open connections from this source.
+    Original detection: fire HIGH if a single source IP has
+    >= HALF_OPEN_PER_IP concurrent half-open connections.
     Must be called while _lock is held.
     """
-    half_open = sum(
-        1
-        for (sip, _, _, _), conn in _connections.items()
-        if sip == src_ip
-        and not conn.terminated
-        and conn.headers_seen > 0          # at least one header drip seen
-    )
-
+    half_open = half_open_map.get(src_ip, 0)
     if half_open >= HALF_OPEN_PER_IP:
         last = _last_high_alert[src_ip]
         if now - last >= ALERT_COOLDOWN_SEC:
@@ -177,20 +225,91 @@ def _check_concurrent(src_ip: str, now: float) -> None:
             _fire_alert(
                 "HIGH",
                 f"SLOWLORIS DETECTED (concurrent half-open): {src_ip}\n"
-                f"  {half_open} simultaneous HTTP connections to :{MONITORED_PORT}\n"
-                f"  that have received header drips but never sent \\r\\n\\r\\n.\n"
-                f"  Threshold: >={HALF_OPEN_PER_IP} concurrent half-open connections.\n"
+                f"  {half_open} simultaneous HTTP connections to "
+                f":{MONITORED_PORT}\n"
+                f"  that have received header drips but never sent "
+                f"\\r\\n\\r\\n.\n"
+                f"  Threshold: >={HALF_OPEN_PER_IP} concurrent per IP.\n"
                 f"  Apache's thread pool is being exhausted — each open\n"
                 f"  connection blocks one worker thread indefinitely.\n"
-                f"  MITRE: T1499.002 (Service Exhaustion Flood — HTTP)",
+                f"  MITRE: T1499.002 (Service Exhaustion Flood — HTTP)"
             )
 
 
+def _check_distributed(now: float, half_open_map: dict[str, int]) -> None:
+    """
+    NEW: Distributed Slowloris detection.
+
+    Fires when the total half-open connection count across ALL IPs
+    exceeds DISTRIBUTED_TOTAL_THRESHOLD, and at least
+    DISTRIBUTED_MIN_IPS distinct source IPs are contributing,
+    but NO single IP exceeds HALF_OPEN_PER_IP (which would already
+    trigger _check_concurrent).
+
+    This catches the coordinated low-volume pattern described in
+    the article's Signs section:
+      "an abnormal increase in the number of simultaneous connections
+       from *different IP addresses*"
+
+    Example: 5 bots each holding 8 connections → total 40 half-open,
+    each bot stays under the per-IP threshold of 10, but together
+    they exhaust a 40-connection thread pool.
+
+    Must be called while _lock is held.
+    """
+    global _last_distributed_alert
+
+    if not half_open_map:
+        return
+
+    total_half_open = sum(half_open_map.values())
+    num_ips         = len(half_open_map)
+    max_per_ip      = max(half_open_map.values()) if half_open_map else 0
+
+    # Only fire if total exceeds threshold AND multiple IPs are involved
+    # AND no single IP is already triggering the per-IP alert
+    # (avoiding duplicate/redundant alerts for the obvious single-source case)
+    if (total_half_open >= DISTRIBUTED_TOTAL_THRESHOLD
+            and num_ips >= DISTRIBUTED_MIN_IPS
+            and max_per_ip < HALF_OPEN_PER_IP):
+
+        if now - _last_distributed_alert >= DISTRIBUTED_COOLDOWN_SEC:
+            _last_distributed_alert = now
+
+            # Rank IPs by contribution for the alert message
+            top_ips = sorted(half_open_map.items(), key=lambda x: -x[1])[:5]
+            ip_summary = ", ".join(
+                f"{ip}({n})" for ip, n in top_ips
+            )
+
+            _fire_alert(
+                "HIGH",
+                f"SLOWLORIS DETECTED (distributed / multi-source):\n"
+                f"  Total half-open connections: {total_half_open} "
+                f"across {num_ips} distinct source IPs.\n"
+                f"  No single IP exceeds the per-IP threshold "
+                f"({max_per_ip} < {HALF_OPEN_PER_IP}).\n"
+                f"  This is a coordinated low-volume attack where each\n"
+                f"  bot stays below detection thresholds individually,\n"
+                f"  but collectively exhausts the server's thread pool.\n"
+                f"  Top contributors: {ip_summary}\n"
+                f"  Thresholds: total>={DISTRIBUTED_TOTAL_THRESHOLD}, "
+                f"IPs>={DISTRIBUTED_MIN_IPS}.\n"
+                f"  Article ref: 'unusual network traffic patterns'\n"
+                f"  (Signs of Slowloris Attack section)\n"
+                f"  MITRE: T1499.002 (Service Exhaustion Flood — HTTP)"
+            )
+
+
+# ══════════════════════════════════════════════════════════════
+#  STALE CONNECTION CHECK (background thread, original)
+# ══════════════════════════════════════════════════════════════
+
 def _check_stale(now: float) -> None:
     """
-    Called periodically by the background thread.
-    Fires MED alerts for connections that have been half-open too long.
-    Prunes terminated and timed-out entries.
+    Fires MED alerts for connections that have been half-open
+    longer than STALE_CONNECTION_SEC.  Prunes old entries.
+    Called by the background maintenance thread.
     """
     stale_threshold = now - STALE_CONNECTION_SEC
     to_delete: list[tuple] = []
@@ -202,8 +321,7 @@ def _check_stale(now: float) -> None:
                 continue
 
             if conn.headers_seen == 0:
-                # No header drips yet — might be a legitimate slow client,
-                # or a connection mid-handshake. Give it STALE_CONNECTION_SEC.
+                # No drips yet — wait for STALE_CONNECTION_SEC before pruning
                 if conn.first_seen < stale_threshold:
                     to_delete.append(key)
                 continue
@@ -219,17 +337,17 @@ def _check_stale(now: float) -> None:
                         "MED",
                         f"SLOWLORIS SUSPECTED (stale half-open conn): {src_ip}\n"
                         f"  Connection to :{MONITORED_PORT} open for {age:.0f}s\n"
-                        f"  without sending HTTP request terminator (\\r\\n\\r\\n).\n"
+                        f"  without sending HTTP request terminator "
+                        f"(\\r\\n\\r\\n).\n"
                         f"  Threshold: >{STALE_CONNECTION_SEC}s.\n"
                         f"  Keep-alive drips seen: {conn.headers_seen}\n"
                         f"  Half-open connections mimic slow-but-legitimate\n"
                         f"  clients, making them hard to distinguish by\n"
-                        f"  volume-based engines (Engines 1 and 11) alone.\n"
-                        f"  MITRE: T1499.002 (Service Exhaustion Flood — HTTP)",
+                        f"  volume-based engines alone.\n"
+                        f"  MITRE: T1499.002"
                     )
 
-            # Prune very old connections that were never terminated cleanly
-            # (e.g. the TCP FIN was not captured on this interface)
+            # Prune very old connections not cleanly terminated
             if age > STALE_CONNECTION_SEC * 6:
                 to_delete.append(key)
 
@@ -246,7 +364,17 @@ def _maintenance_loop() -> None:
     while True:
         time.sleep(PRUNE_INTERVAL_SEC)
         try:
-            _check_stale(time.time())
+            now = time.time()
+            _check_stale(now)
+
+            # Also re-evaluate distributed alert in maintenance pass,
+            # in case the packet rate is low and _check_distributed
+            # is not being called often enough via process_packet().
+            with _lock:
+                if _connections:
+                    half_open_map = _get_global_half_open()
+                    _check_distributed(now, half_open_map)
+
         except Exception as exc:
             print(f"[E16-Slowloris] maintenance error: {exc}")
 
@@ -257,7 +385,7 @@ def _maintenance_loop() -> None:
 
 def register(alert_callback: Callable) -> None:
     """
-    Call once at ids_detector.py startup to wire the engine in.
+    Call once at ids_detector.py startup.
 
         import ids_engine_slowloris as _e16
         _e16.register(alert)
@@ -274,22 +402,25 @@ def register(alert_callback: Callable) -> None:
     t.start()
     print(
         f"[IDS] Slowloris content detector: ENABLED (Engine 16)\n"
-        f"[IDS]   Half-open concurrent alert: >={HALF_OPEN_PER_IP} connections\n"
-        f"[IDS]   Stale connection alert:     >{STALE_CONNECTION_SEC}s without terminator\n"
+        f"[IDS]   Single-IP alert:           >= {HALF_OPEN_PER_IP} half-open "
+        f"connections\n"
+        f"[IDS]   Stale connection alert:     > {STALE_CONNECTION_SEC}s without "
+        f"terminator\n"
+        f"[IDS]   Distributed alert (new):    >= {DISTRIBUTED_TOTAL_THRESHOLD} "
+        f"total half-open from >= {DISTRIBUTED_MIN_IPS} IPs\n"
         f"[IDS]   Complements firewall_dpi.py (duration-based) with "
-        f"payload-content-based detection."
+        f"payload-content + distributed detection."
     )
 
 
 def _fire_alert(severity: str, msg: str) -> None:
-    """Thread-safe alert dispatch to ids_detector.py's alert() function."""
+    """Thread-safe alert dispatch."""
     if _alert_fn is not None:
         try:
             _alert_fn("Slowloris/E16", severity, msg)
         except Exception:
             pass
     else:
-        # Fallback if used standalone
         print(f"\n[E16-ALERT/{severity}] {msg}\n")
 
 
@@ -300,23 +431,24 @@ def _fire_alert(severity: str, msg: str) -> None:
 def get_status() -> dict:
     """Return current engine state — useful for test assertions."""
     with _lock:
-        tracked = len(_connections)
-        half_open = sum(
-            1 for c in _connections.values()
-            if not c.terminated and c.headers_seen > 0
-        )
-        per_ip: dict[str, int] = defaultdict(int)
-        for (sip, _, _, _), c in _connections.items():
-            if not c.terminated and c.headers_seen > 0:
-                per_ip[sip] += 1
+        tracked   = len(_connections)
+        half_open_map = _get_global_half_open()
+        total_half_open = sum(half_open_map.values())
 
     return {
-        "engine":         "E16/Slowloris",
-        "tracked_conns":  tracked,
-        "half_open":      half_open,
-        "per_ip":         dict(per_ip),
-        "threshold_high": HALF_OPEN_PER_IP,
-        "threshold_stale_sec": STALE_CONNECTION_SEC,
+        "engine":               "E16/Slowloris",
+        "tracked_conns":        tracked,
+        "half_open_total":      total_half_open,
+        "half_open_per_ip":     dict(half_open_map),
+        "distinct_ips":         len(half_open_map),
+        "threshold_high":       HALF_OPEN_PER_IP,
+        "threshold_stale_sec":  STALE_CONNECTION_SEC,
+        "distributed_threshold": DISTRIBUTED_TOTAL_THRESHOLD,
+        "distributed_min_ips":  DISTRIBUTED_MIN_IPS,
+        "distributed_active": (
+            total_half_open >= DISTRIBUTED_TOTAL_THRESHOLD
+            and len(half_open_map) >= DISTRIBUTED_MIN_IPS
+        ),
     }
 
 
@@ -325,25 +457,24 @@ def get_status() -> dict:
 # ══════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    print("ids_engine_slowloris.py — Engine 16")
-    print("Integration instructions:")
+    print("ids_engine_slowloris.py — Engine 16 (with distributed detection)")
     print()
-    print("  # In ids_detector.py, with the other engine imports:")
+    print("Integration in ids_detector.py:")
     print("  import ids_engine_slowloris as _e16")
+    print("  _e16.register(alert)          # after alert() is defined")
+    print("  # In packet_handler():")
+    print("  _e16.process_packet(pkt)      # alongside other process_* calls")
     print()
-    print("  # After the alert() function is defined:")
-    print("  _e16.register(alert)")
-    print()
-    print("  # In packet_handler(), alongside the other process_* calls:")
-    print("  _e16.process_packet(pkt)")
-    print()
-    print(f"Thresholds:")
-    print(f"  HIGH alert: >={HALF_OPEN_PER_IP} concurrent half-open HTTP "
-          f"connections from one IP")
-    print(f"  MED  alert: any connection half-open >{STALE_CONNECTION_SEC}s "
+    print("Thresholds:")
+    print(f"  HIGH (single-IP):   >= {HALF_OPEN_PER_IP} half-open connections "
+          f"from one source IP")
+    print(f"  MED  (stale):       any connection half-open > {STALE_CONNECTION_SEC}s "
           f"without \\r\\n\\r\\n")
-    print(f"  Cooldown:   {ALERT_COOLDOWN_SEC}s between repeated alerts per IP")
+    print(f"  HIGH (distributed): >= {DISTRIBUTED_TOTAL_THRESHOLD} total half-open "
+          f"from >= {DISTRIBUTED_MIN_IPS} distinct IPs,")
+    print(f"                      each staying below the per-IP threshold ({HALF_OPEN_PER_IP})")
     print()
-    print("This engine complements firewall_dpi.py's duration-based check with")
-    print("earlier payload-content detection — it fires as soon as the concurrent")
-    print("threshold is reached, not after waiting 30s for a connection to age out.")
+    print("The distributed alert closes the gap identified in the Indusface article:")
+    print("  'an abnormal increase in the number of simultaneous connections")
+    print("   from *different IP addresses*'")
+    print("  (Signs of Slowloris Attack section)")
