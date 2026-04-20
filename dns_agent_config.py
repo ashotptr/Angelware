@@ -1,9 +1,7 @@
 """
-====================================================
  AUA CS 232/337 — Botnet Research Project
  Component: DNS Agent Config Builder + Validator
  Environment: ISOLATED VM LAB ONLY
-====================================================
 
 Teaching points implemented here:
 
@@ -274,10 +272,11 @@ def write_embedded_config(cfg: Dict, output_path: str) -> None:
     Write a validated config as a locked-down Python module.
     Fixes Spinnekop: mirrors cmd/build/main.go generateEmbeddedConfig().
     """
+    import pprint
     ts   = datetime.now().isoformat()
     body = EMBEDDED_CONFIG_TEMPLATE.format(
         timestamp   = ts,
-        config_repr = json.dumps(cfg, indent=4),
+        config_repr = pprint.pformat(cfg, indent=4),
     )
     with open(output_path, "w") as f:
         f.write(body)
@@ -297,9 +296,7 @@ DNS_REQUEST_OPTS_DOC = """
 # This document maps every config field to its valid values,
 # constraints, and wire-format meaning.
 
-==============================================================
 SECTION: resolver
-==============================================================
 
 Field: use_system_defaults (bool)
   true   — Auto-discover OS DNS resolver (reads /etc/resolv.conf
@@ -314,9 +311,7 @@ Field: port (integer, required if use_system_defaults=false)
   Valid: 1–65535
   DNS standard: 53
 
-==============================================================
 SECTION: header
-==============================================================
 
 Field: id (integer)
   Valid: 0–65535
@@ -388,9 +383,7 @@ Field: rcode (integer)
    11–15 = Reserved (encodable, no standard meaning)
   Wire: bits 3–0 of flags field
 
-==============================================================
 SECTION: question
-==============================================================
 
 Field: name (string, FQDN)
   Must end with '.' (trailing dot = absolute FQDN)
@@ -430,9 +423,7 @@ Field: custom_class (integer, used when std_class=false)
   Any uint16 value. Non-standard classes (e.g. 67) are
   a detection signal — see analyzer RDATA class warnings.
 
-==============================================================
 SECTION: http
-==============================================================
 
 Field: server_url (string)
   Base URL of the HTTP exfil server.
@@ -447,9 +438,7 @@ Field: chunk_size (integer)
   Base64 chunk size in bytes (before encoding).
   Default: 1048576 (1 MB)
 
-==============================================================
 SECTION: answers  (optional, for response-mode testing)
-==============================================================
 
 Field: answers (array of resource records)
   Each record:

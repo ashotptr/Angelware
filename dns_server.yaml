@@ -1,0 +1,191 @@
+# ================================================================
+# DNS Z-Flag C2 Server — Full Configuration
+# AUA CS 232/337 Botnet Research Project
+# Environment: ISOLATED VM LAB ONLY
+#
+# Mirrors Spinnekop configs/server.yaml.
+# Load with: dns_zone_system.ZoneSystem.from_yaml(path)
+#            or dns_zflag_server.py --config this_file.yaml
+#
+# Edit zone_ip below to match your C2 server IP before starting.
+# ================================================================
+
+server:
+  bind_address: "0.0.0.0"           # Listen on all interfaces
+  port: 53                           # Standard DNS port (requires root)
+  max_workers: 4                     # Concurrent query-handler goroutines
+  worker_channel_buffer_size: 10     # Per-worker request queue depth
+  read_timeout: 5.0                  # UDP read deadline (seconds)
+  write_timeout: 3.0                 # UDP write deadline (seconds)
+  max_packet_size: 512               # Max incoming UDP packet size (bytes)
+
+logging:
+  level: "DEBUG"       # DEBUG | INFO | WARN | ERROR
+  format: "TEXT"       # TEXT (key=value) | JSON
+  output: "STDOUT"     # STDOUT | STDERR | /path/to/server.log
+  log_queries: true    # Log every incoming DNS query
+  log_responses: true  # Log every outgoing response
+  packet_dump: false   # Include full hex dumps (very verbose)
+
+# ── DNS Zone Configuration ────────────────────────────────────
+#
+# Add one entry per zone. The server is authoritative for all listed zones.
+# The wildcard A record (*.zone.) is ESSENTIAL: it lets the server respond
+# to any subdomain, including the Base64-encoded enumeration labels sent
+# by agents when Z=2 (ENUMERATE) is active.
+
+zones:
+  - name: "timeserversync.com."
+    description: "Primary C2 zone — mimics a time-server sync domain"
+    ttl: 300                         # Default TTL for records (seconds)
+
+    soa:
+      primary: "ns1.timeserversync.com."
+      admin:   "admin.timeserversync.com."   # maps to admin@timeserversync.com
+      serial:  2024012001            # Zone version: YYYYMMDDNN
+      refresh: 3600                  # Secondary refresh interval (s)
+      retry:   1800                  # Retry after failed transfer (s)
+      expire:  604800                # Secondary data expires after (s)
+      minimum: 86400                 # Negative-caching TTL (s)
+
+    nameservers:
+      - name: "ns1.timeserversync.com."
+        ip:   "127.0.0.1"            # Change to your C2 server IP
+      - name: "ns2.timeserversync.com."
+        ip:   "127.0.0.1"
+
+    # ── A records (IPv4) ───────────────────────────────────────
+    a_records:
+      # Glue records: every nameserver must have a matching A record
+      - name: "ns1.timeserversync.com."
+        ip:   "127.0.0.1"
+        ttl:  300
+      - name: "ns2.timeserversync.com."
+        ip:   "127.0.0.1"
+        ttl:  300
+      # Standard hostname record
+      - name: "www.timeserversync.com."
+        ip:   "127.0.0.1"
+        ttl:  300
+      # Zone apex
+      - name: "timeserversync.com."
+        ip:   "127.0.0.1"
+        ttl:  300
+      # WILDCARD — resolves ANY subdomain to the C2 IP.
+      # Required for Z=2 (ENUMERATE) subdomain encoding.
+      # Any base64-encoded label will resolve here.
+      - name: "*.timeserversync.com."
+        ip:   "127.0.0.1"
+        ttl:  60                     # Short TTL: encoded labels change per beacon
+
+    # ── AAAA records (IPv6) ────────────────────────────────────
+    aaaa_records:
+      - name: "timeserversync.com."
+        ip:   "::1"                  # Change to your IPv6 if applicable
+        ttl:  300
+
+    # ── CNAME records (aliases) ────────────────────────────────
+    cname_records:
+      - name:   "mail.timeserversync.com."
+        target: "timeserversync.com."
+        ttl:    300
+      - name:   "api.timeserversync.com."
+        target: "www.timeserversync.com."
+        ttl:    300
+
+    # ── MX records (mail exchange) ─────────────────────────────
+    mx_records:
+      - name:     "timeserversync.com."
+        priority: 10
+        target:   "mail.timeserversync.com."
+        ttl:      300
+
+    # ── TXT records (text / SPF / DMARC) ──────────────────────
+    txt_records:
+      - name: "timeserversync.com."
+        text: "v=spf1 include:_spf.timeserversync.com ~all"
+        ttl:  300
+      - name: "_dmarc.timeserversync.com."
+        text: "v=DMARC1; p=none; rua=mailto:admin@timeserversync.com"
+        ttl:  300
+      # Example: TXT exfil test record for demo purposes
+      - name: "data.timeserversync.com."
+        text: "48656c6c6f20576f726c6421"   # hex: "Hello World!"
+        ttl:  60
+
+# ── Security Settings ─────────────────────────────────────────
+
+security:
+
+  rate_limiting:
+    enabled: true
+    max_queries_per_second: 20     # Per source IP
+    max_queries_per_minute: 200    # Sliding-window per source IP
+    blacklist_duration: 30.0       # Blacklist duration in seconds
+
+  query_filtering:
+    # Query types the server will answer.
+    # Everything else gets NOTIMP (RCODE=4).
+    allowed_types:
+      - "A"
+      - "AAAA"
+      - "CNAME"
+      - "MX"
+      - "TXT"
+      - "NS"
+      - "SOA"
+      - "ANY"
+
+    blocked_ips: []                # Never respond to these IPs
+    allowed_ips: []                # If non-empty, only respond to these IPs
+
+  response_policies:
+    refuse_recursion: true         # We are authoritative-only
+    case_sensitive:   false        # DNS names are case-insensitive (RFC 1034)
+    minimum_ttl:      60           # Clamp TTL floor
+    maximum_ttl:      86400        # Clamp TTL ceiling
+
+# ── Monitoring / HTTP Control Plane ──────────────────────────
+#
+# Endpoints (started automatically if metrics.enabled = true):
+#   GET  :<metrics.port>/metrics   → JSON stats + agent list
+#   GET  :<health.port>/health     → JSON health status
+#   GET  :<metrics.port>/agents    → JSON per-agent queue state
+#   POST :<metrics.port>/command   → Queue Z-command for agent(s)
+#     Body: {"agent_id": "AGENT-ABCD1234", "z_value": 2}
+#     Body: {"agent_id": "*",              "z_value": 1}  (broadcast)
+#   POST :<metrics.port>/upload    → Receive exfil chunks (agent → server)
+
+monitoring:
+  metrics:
+    enabled: true
+    port:    8080
+    path:    "/metrics"
+
+  health_check:
+    enabled: true
+    port:    8081
+    path:    "/health"
+
+  statistics:
+    enabled:        true
+    reset_interval: 3600           # Reset counters every N seconds
+
+# ── Development / Debug Settings ─────────────────────────────
+
+development:
+
+  # Expose /debug endpoint (NEVER enable in production)
+  enable_debug_endpoints: false
+
+  # Randomly drop a fraction of requests to test agent resilience
+  simulate_failures:
+    enabled:      false
+    failure_rate: 0.0              # 0.0 = off, 0.05 = drop 5% of requests
+
+  # Save raw DNS packets to a .pcap file for offline analysis
+  # Use with: python3 dns_pcap_analyzer.py -pcap /tmp/dns_captures/...
+  packet_capture:
+    enabled:   false
+    directory: "/tmp/dns_captures"
+    max_files: 1000
