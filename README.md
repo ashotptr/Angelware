@@ -589,6 +589,7 @@ sudo apt install -y openssh-server python3 python3-pip gcc make \
     libpcap-dev libssl-dev nmap wireshark-common tcpdump net-tools \
     apache2 sshpass
 pip3 install flask scapy psutil requests pycryptodome matplotlib
+pip3 install psutil flask scapy requests pycryptodome
 ```
 
 *Victim VM only:*

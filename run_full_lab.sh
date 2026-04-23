@@ -628,6 +628,43 @@ case "$PHASE" in
         # ── Offline C2 analysis on captured traffic (NEW) ──────
         run_c2_analysis
 
+        # System profiling (after bot registration)
+        echo '[Lab] Testing system profiling...'
+        curl -s -X POST http://192.168.100.10:5000/task \
+            -H "Content-Type: application/json" \
+            -H "X-Auth-Token: aw" \
+            -d '{"bot_id":"all","type":"system_profile","duration":10}'
+        sleep 15
+
+        # Sandbox detection
+        echo '[Lab] Testing sandbox detection...'
+        python3 sandbox_evasion_sim.py --check
+
+        # Persistence planting + detection
+        echo '[Lab] Testing persistence detection...'
+        python3 persistence_sim.py --plant --method cron
+        sleep 35   # wait for IDS Engine 18 scan interval
+        python3 persistence_sim.py --remove
+
+        # Lateral movement chain
+        echo '[Lab] Testing lateral movement detection...'
+        python3 lateral_movement_sim.py --detect
+        sleep 10
+
+        # File exfiltration
+        echo '[Lab] Testing exfiltration detection...'
+        python3 file_transfer.py --detect
+        sleep 10
+
+        # Polymorphic execution
+        echo '[Lab] Testing polymorphic detection...'
+        python3 polymorphic_engine.py --variants 4 --detect
+        sleep 5
+
+        # Endpoint behavioral IDS
+        echo '[Lab] Testing endpoint IDS...'
+        python3 ids_engine_endpoint.py --demo
+
         echo ""
         echo -e "${GRN}╔══════════════════════════════════════════════════════╗${NC}"
         echo -e "${GRN}║   FULL LAB COMPLETE                                  ║${NC}"

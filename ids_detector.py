@@ -61,6 +61,36 @@ import json
 import psutil
 import ids_detector_patch_e14 as _e14
 _e14.apply(globals())
+# Engine 17 — System Enumeration
+import system_profiler as _e17
+_e17.get_detector().register_alert_fn(alert)
+_e17.get_detector().start_background_monitor(interval=15)
+
+# Engine 18 — Persistence Detection
+import persistence_sim as _e18
+_e18_det = _e18.PersistenceDetector()
+_e18_det.start_monitoring()
+
+# Engine 19 — Exfiltration Detection
+import file_transfer as _e19
+_exfil_det = _e19.ExfiltrationDetector()
+_exfil_det.register_alert_fn(alert)
+
+# Engine 20 — Lateral Movement Detection
+import lateral_movement_sim as _e20
+_lat_det = _e20.LateralMovementDetector()
+_lat_det.register_alert_fn(alert)
+# Feed from packet_handler: _lat_det.observe_connection(src, dst, port)
+
+# Engine 21 — Polymorphism Detection
+import polymorphic_engine as _e21
+_poly_det = _e21.PolymorphismDetector()
+_poly_det.register_alert_fn(alert)
+
+# Engine 22 — Endpoint Behavioral IDS
+import ids_engine_endpoint as _e22
+_e22.get_engine().register_alert_fn(alert)
+_e22.get_engine().start(scan_interval=30)
 from collections import defaultdict, deque
 from datetime import datetime
 
@@ -1566,6 +1596,12 @@ def packet_handler(pkt):
     process_e11_dns(pkt)            # Engine 11 — DNS cross-protocol anomaly
     if E15_OK and _e15_mod:
         _e15_mod.process_flow_packet(pkt)   # Engine 15 — flow-level detection
+    
+    if pkt.haslayer(IP) and pkt.haslayer(TCP):
+        src = pkt[IP].src
+        dst = pkt[IP].dst
+        dport = pkt[TCP].dport
+        _lat_det.observe_connection(src, dst, dport)
 
 
 # ══════════════════════════════════════════════════════════════

