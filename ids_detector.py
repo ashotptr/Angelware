@@ -59,67 +59,16 @@ import subprocess
 import urllib.request
 import json
 import psutil
-import ids_detector_patch_e14 as _e14
-_e14.apply(globals())
-# ── Engines 17–22: new modules ─────────────────────────────────
+from collections import defaultdict, deque
+from datetime import datetime
 
-# Engine 17 — System Enumeration
 try:
-    import system_profiler as _e17
-    _e17.register_alert_fn(alert)
-    _e17.get_detector().start_background_monitor(interval=15)
-    print("[IDS] System enumeration detector: ENABLED (Engine 17)")
+    import ids_engine_slowloris as _e16
+    _e16.register(alert)
+    E16_OK = True
 except ImportError:
-    print("[IDS] INFO: system_profiler.py not found -- Engine 17 disabled")
-
-# Engine 18 — Persistence Detection (FIM)
-try:
-    import persistence_sim as _e18_mod
-    _e18_det = _e18_mod.PersistenceDetector(scan_interval=30)
-    _e18_mod.register_alert_fn(alert)
-    _e18_det.start_monitoring()
-    print("[IDS] Persistence FIM: ENABLED (Engine 18)")
-except ImportError:
-    print("[IDS] INFO: persistence_sim.py not found -- Engine 18 disabled")
-
-# Engine 19 — Exfiltration Detection
-try:
-    import file_transfer as _e19_mod
-    _e19_det = _e19_mod.ExfiltrationDetector()
-    _e19_mod.register_alert_fn(alert)
-    print("[IDS] Exfiltration detector: ENABLED (Engine 19)")
-except ImportError:
-    print("[IDS] INFO: file_transfer.py not found -- Engine 19 disabled")
-
-# Engine 20 — Lateral Movement Detection
-try:
-    import lateral_movement_sim as _e20_mod
-    _lat_det = _e20_mod.LateralMovementDetector()
-    _e20_mod.register_alert_fn(alert)
-    print("[IDS] Lateral movement detector: ENABLED (Engine 20)")
-except ImportError:
-    _lat_det = None
-    print("[IDS] INFO: lateral_movement_sim.py not found -- Engine 20 disabled")
-
-# Engine 21 — Polymorphism Detection
-try:
-    import polymorphic_engine as _e21_mod
-    _poly_det = _e21_mod.PolymorphismDetector()
-    _e21_mod.register_alert_fn(alert)
-    print("[IDS] Polymorphism detector: ENABLED (Engine 21)")
-except ImportError:
-    print("[IDS] INFO: polymorphic_engine.py not found -- Engine 21 disabled")
-
-# Engine 22 — Endpoint Behavioral IDS (A–E)
-try:
-    import ids_engine_endpoint as _e22_mod
-    _e22_mod.register_alert_fn(alert)
-    _e22_mod.get_engine().start(scan_interval=30)
-    print("[IDS] Endpoint Behavioral IDS: ENABLED (Engine 22 A-E)")
-    print("[IDS]   22A Keylogger  22B CredTheft  22C Ransomware")
-    print("[IDS]   22D AntiForensics  22E PrivEsc")
-except ImportError:
-    print("[IDS] INFO: ids_engine_endpoint.py not found -- Engine 22 disabled")
+    E16_OK = False
+    print("[IDS] INFO: ids_engine_slowloris.py not found -- Engine 16 disabled")
 
 try:
     from scapy.all import sniff, IP, TCP, UDP, DNS, DNSQR, DNSRR, Raw, get_if_list
@@ -205,10 +154,10 @@ try:
     _e15_mod.get_engine().register_alert_fn(alert)
     E15_OK = True
     print("[IDS] Flow-Level Detection: ENABLED (Engine 15)")
-    print(f"[IDS]   Port scan rule: packet_size<{flow_analyzer.SIG_PORT_SCAN_PKT_SIZE}B "
-          f"AND packet_rate>{flow_analyzer.SIG_PORT_SCAN_RATE} pkt/s")
-    print(f"[IDS]   JSON alert log: {flow_analyzer.JSON_ALERT_LOG}")
-    if flow_analyzer._SKLEARN_OK:
+    print(f"[IDS]   Port scan rule: packet_size<{_e15_mod.SIG_PORT_SCAN_PKT_SIZE}B "
+          f"AND packet_rate>{_e15_mod.SIG_PORT_SCAN_RATE} pkt/s")
+    print(f"[IDS]   JSON alert log: {_e15_mod.JSON_ALERT_LOG}")
+    if _e15_mod._SKLEARN_OK:
         print(f"[IDS]   IsolationForest: ENABLED (sklearn available)")
     else:
         print(f"[IDS]   IsolationForest: DISABLED (pip install scikit-learn)")
@@ -335,6 +284,47 @@ def alert(engine, severity, msg):
                     _log_fh.flush()
                 except OSError:
                     pass
+
+
+# ── Engines 14 and 17–22 wiring ───────────────────────────────────────
+# CRASH-FIXED: was at module top before alert() was defined.
+# Moved here so alert() exists when register_alert_fn() is called.
+# Previously all 8 engines silently received None as the alert callback.
+
+import ids_detector_patch_e14 as _e14
+_e14.apply(globals())
+
+# Engine 17 — System Enumeration
+import system_profiler as _e17
+_e17.get_detector().register_alert_fn(alert)
+_e17.get_detector().start_background_monitor(interval=15)
+
+# Engine 18 — Persistence Detection
+import persistence_sim as _e18
+_e18_det = _e18.PersistenceDetector()
+_e18_det.start_monitoring()
+_e18_det.register_alert_fn(alert)   # ADDED: was missing, Engine 18 never alerted
+
+# Engine 19 — Exfiltration Detection
+import file_transfer as _e19
+_exfil_det = _e19.ExfiltrationDetector()
+_exfil_det.register_alert_fn(alert)
+
+# Engine 20 — Lateral Movement Detection
+import lateral_movement_sim as _e20
+_lat_det = _e20.LateralMovementDetector()
+_lat_det.register_alert_fn(alert)
+# Feed from packet_handler: _lat_det.observe_connection(src, dst, port)
+
+# Engine 21 — Polymorphism Detection
+import polymorphic_engine as _e21
+_poly_det = _e21.PolymorphismDetector()
+_poly_det.register_alert_fn(alert)
+
+# Engine 22 — Endpoint Behavioral IDS
+import ids_engine_endpoint as _e22
+_e22.get_engine().register_alert_fn(alert)
+_e22.get_engine().start(scan_interval=30)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -1606,31 +1596,19 @@ def packet_handler(pkt):
     process_credential_stuffing(pkt)
     process_dns(pkt)
     process_covert_channel(pkt)
-    process_tls_fingerprint(pkt)
-    process_e11_rst_syn(pkt)
-    process_e11_dns(pkt)
+    process_tls_fingerprint(pkt)    # Engine 7
+    process_e11_rst_syn(pkt)        # Engine 11 — RST/SYN scanner (infosec article)
+    process_e11_dns(pkt)            # Engine 11 — DNS cross-protocol anomaly
     if E15_OK and _e15_mod:
-        _e15_mod.process_flow_packet(pkt)
-
-    # Engine 20 — Lateral movement
-    if _lat_det and pkt.haslayer(IP) and pkt.haslayer(TCP):
-        _lat_det.observe_connection(
-            pkt[IP].src, pkt[IP].dst,
-            pkt[TCP].dport,
-            len(pkt),
-        )
-
-    # Engine 17 — External IP lookup via DPI
-    if pkt.haslayer(IP) and pkt.haslayer(TCP) and pkt.haslayer(Raw):
-        try:
-            raw = pkt[Raw].load.decode(errors="ignore")
-            for domain in _e17.SystemEnumerationDetector.EXTERNAL_IP_DOMAINS:
-                if domain in raw:
-                    _e17.get_detector().observe_network_request(
-                        domain, src_process="unknown"
-                    )
-        except Exception:
-            pass
+        _e15_mod.process_flow_packet(pkt)   # Engine 15 — flow-level detection
+    if E16_OK:
+        _e16.process_packet(pkt)            # Engine 16 — Slowloris (CRASH-FIXED)
+    
+    if pkt.haslayer(IP) and pkt.haslayer(TCP):
+        src = pkt[IP].src
+        dst = pkt[IP].dst
+        dport = pkt[TCP].dport
+        _lat_det.observe_connection(src, dst, dport)
 
 
 # ══════════════════════════════════════════════════════════════

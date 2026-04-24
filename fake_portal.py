@@ -72,8 +72,6 @@ import json
 import random
 import logging
 import threading
-import fake_portal_biometrics as _bio
-_bio.apply(app, globals())
 from datetime import datetime
 from collections import defaultdict, deque
 from flask import Flask, request, jsonify, render_template_string
@@ -161,6 +159,12 @@ except ImportError as _ext_err:
 
 
 app = Flask(__name__)
+
+# ── Biometrics integration ────────────────────────────────────
+# CRASH-FIXED: was at module top (line 75) before app existed.
+# Moved here so app is defined when _bio.apply(app, ...) runs.
+import fake_portal_biometrics as _bio
+_bio.apply(app, globals())
 logging.basicConfig(
     level=logging.INFO,
     format="[PORTAL %(asctime)s] %(message)s",
